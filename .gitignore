@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+out/
+
+# Mobile / Native wrappers
+.capacitor/
+android/app/build/
+android/.gradle/
+android/local.properties
+ios/App/Pods/
+ios/DerivedData/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Test & debug artifacts
+coverage/
+playwright-report/
+test-results/
+*.log
+npm-debug.log*
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
