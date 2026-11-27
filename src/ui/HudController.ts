@@ -147,10 +147,29 @@ export class HudController {
             </div>
           </div>
           <div class="setting-row">
-            <span>Audio</span>
+            <span>Era Score</span>
             <div class="seg-track" id="seg-era">
-              <button type="button" data-era="1980s">Warfield</button>
-              <button type="button" data-era="1970s">Brass</button>
+              <button type="button" data-era="1980s">1980s Synth</button>
+              <button type="button" data-era="1970s">1970s Brass</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <span>Music</span>
+            <input type="range" class="bus-slider" id="slider-music" min="0" max="100" step="5" value="85" aria-label="Music Bus Volume" />
+          </div>
+          <div class="setting-row">
+            <span>SFX</span>
+            <input type="range" class="bus-slider" id="slider-sfx" min="0" max="100" step="5" value="95" aria-label="SFX Bus Volume" />
+          </div>
+          <div class="setting-row">
+            <span>Ambiance</span>
+            <input type="range" class="bus-slider" id="slider-ambiance" min="0" max="100" step="5" value="75" aria-label="Ambiance Bus Volume" />
+          </div>
+          <div class="setting-row">
+            <span>Haptics</span>
+            <div class="seg-track" id="seg-haptics">
+              <button type="button" data-haptics="true">On</button>
+              <button type="button" data-haptics="false">Off</button>
             </div>
           </div>
           <div class="setting-row">
@@ -168,7 +187,7 @@ export class HudController {
             </div>
           </div>
           <div class="setting-row">
-            <span>Sound</span>
+            <span>Master</span>
             <div class="seg-track" id="seg-mute">
               <button type="button" data-mute="false">On</button>
               <button type="button" data-mute="true">Mute</button>
@@ -299,9 +318,17 @@ export class HudController {
     this.syncSeg('#seg-fullscreen button', 'fs', String(this.fullscreenActive));
     this.syncSeg('#seg-view button', 'view', options.boardView);
     this.syncSeg('#seg-era button', 'era', options.eraMode);
+    this.syncSeg('#seg-haptics button', 'haptics', String(options.hapticsEnabled));
     this.syncSeg('#seg-speed button', 'speed', options.arbiterSpeed);
     this.syncSeg('#seg-quality button', 'quality', options.renderQuality);
     this.syncSeg('#seg-mute button', 'mute', String(options.audioMuted));
+
+    const mSlider = this.root.querySelector<HTMLInputElement>('#slider-music');
+    if (mSlider) mSlider.value = String(Math.round(options.musicVolume * 100));
+    const sSlider = this.root.querySelector<HTMLInputElement>('#slider-sfx');
+    if (sSlider) sSlider.value = String(Math.round(options.sfxVolume * 100));
+    const aSlider = this.root.querySelector<HTMLInputElement>('#slider-ambiance');
+    if (aSlider) aSlider.value = String(Math.round(options.ambianceVolume * 100));
   }
 
   private setFullscreenState(desired: boolean): void {
@@ -342,26 +369,26 @@ export class HudController {
 
   private bindEvents(): void {
     this.showcaseOrb.addEventListener('click', () => {
-      this.sound.playSelect();
       this.showcaseOpen = !this.showcaseOpen;
       if (this.showcaseOpen) this.optionsOpen = false;
+      this.sound.playDrawerSlide(this.showcaseOpen);
       this.render(this.store.getVisibleView(), this.store.getOptions());
     });
 
     this.viewOrb.addEventListener('click', () => {
-      this.sound.playSelect();
+      this.sound.playUiClick();
       this.store.cycleBoardView();
     });
 
     this.fullscreenOrb.addEventListener('click', () => {
-      this.sound.playSelect();
+      this.sound.playUiClick();
       this.setFullscreenState(!this.fullscreenActive);
     });
 
     this.optionsOrb.addEventListener('click', () => {
-      this.sound.playSelect();
       this.optionsOpen = !this.optionsOpen;
       if (this.optionsOpen) this.showcaseOpen = false;
+      this.sound.playDrawerSlide(this.optionsOpen);
       this.render(this.store.getVisibleView(), this.store.getOptions());
     });
 
@@ -464,10 +491,34 @@ export class HudController {
       b.addEventListener('click', () => {
         const muted = b.dataset['mute'] === 'true';
         this.sound.setMuted(muted);
-        if (!muted) this.sound.playSelect();
+        if (!muted) this.sound.playUiClick();
         this.store.updateOptions({ audioMuted: muted });
       });
     });
+
+    this.root.querySelectorAll<HTMLButtonElement>('#seg-haptics button').forEach((b) => {
+      b.addEventListener('click', () => {
+        const hapticsEnabled = b.dataset['haptics'] === 'true';
+        this.store.updateOptions({ hapticsEnabled });
+        if (hapticsEnabled) this.sound.playUiClick();
+      });
+    });
+
+    const bindBusSlider = (id: string, key: 'musicVolume' | 'sfxVolume' | 'ambianceVolume') => {
+      const el = this.root.querySelector<HTMLInputElement>(id);
+      if (!el) return;
+      el.addEventListener('input', () => {
+        const val = Math.max(0, Math.min(1, Number(el.value) / 100));
+        this.sound.unlock();
+        this.store.updateOptions({ [key]: val });
+      });
+      el.addEventListener('change', () => {
+        this.sound.playUiClick();
+      });
+    };
+    bindBusSlider('#slider-music', 'musicVolume');
+    bindBusSlider('#slider-sfx', 'sfxVolume');
+    bindBusSlider('#slider-ambiance', 'ambianceVolume');
   }
 
   private syncSeg(selector: string, dataKey: string, expected: string): void {

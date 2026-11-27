@@ -245,11 +245,16 @@ export class ArbiterStage3D {
   private readonly bulletTimeShellGroup = new THREE.Group();
   private readonly machConeMat: THREE.MeshBasicMaterial;
 
-  // Bunker Tactical Comms & ECG Heartbeat Monitor (`512x192`)
+  // Bunker Tactical Comms CRT (`512x192`) + 8 Physical 3D Vacuum-Tube Equalizer Columns (@ 60 FPS!)
   private readonly crtCanvas: HTMLCanvasElement;
   private readonly crtCtx: CanvasRenderingContext2D;
   private readonly crtTexture: THREE.CanvasTexture;
-  private readonly waveformSample = new Float32Array(256);
+  private readonly timeDomainBytes = new Uint8Array(new ArrayBuffer(256));
+  private readonly frequencyBytes = new Uint8Array(new ArrayBuffer(256));
+  private readonly vacuumTubes: Array<{
+    readonly filament: THREE.Mesh;
+    readonly mat: THREE.MeshBasicMaterial;
+  }> = [];
 
   private readonly leftMuzzleStar: THREE.Group;
   private readonly rightMuzzleStar: THREE.Group;
@@ -469,7 +474,7 @@ export class ArbiterStage3D {
     this.scorchDecalRight.visible = false;
     this.root.add(this.scorchDecalLeft, this.scorchDecalRight);
 
-    // Rear Bunker Tactical CRT + ECG Heartbeat Scope
+    // Rear Bunker Tactical CRT + 8 Physical 3D Vacuum-Tube Equalizer Bars (`fftSize = 512` @ 60 FPS!)
     this.crtCanvas = document.createElement('canvas');
     this.crtCanvas.width = 512;
     this.crtCanvas.height = 192;
@@ -482,6 +487,49 @@ export class ArbiterStage3D {
     );
     crtMesh.position.set(0, 0.08, -0.37);
     this.root.add(crtMesh);
+
+    const tubeSocketGeo = new THREE.CylinderGeometry(0.044, 0.05, 0.032, 16);
+    const tubeGlassGeo = new THREE.CylinderGeometry(0.036, 0.036, 0.21, 16);
+    const tubeCapGeo = new THREE.SphereGeometry(0.036, 14, 10);
+    const tubeGlassMat = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color('#2a221b'),
+      transparent: true,
+      opacity: 0.36,
+      roughness: 0.12,
+      metalness: 0.05,
+      clearcoat: 1.0,
+    });
+    const filGeo = new THREE.CylinderGeometry(0.018, 0.02, 0.17, 12);
+    filGeo.translate(0, 0.085, 0);
+
+    for (let i = 0; i < 8; i++) {
+      const tx = -0.525 + (i / 7) * 1.05;
+      const tz = -0.45;
+      const baseY = 0.255;
+
+      const socket = new THREE.Mesh(tubeSocketGeo, this.factory.materials.brassTrim);
+      socket.position.set(tx, baseY, tz);
+      socket.castShadow = true;
+
+      const glass = new THREE.Mesh(tubeGlassGeo, tubeGlassMat);
+      glass.position.set(tx, baseY + 0.115, tz);
+
+      const cap = new THREE.Mesh(tubeCapGeo, this.factory.materials.brassTrim);
+      cap.scale.set(1, 0.45, 1);
+      cap.position.set(tx, baseY + 0.22, tz);
+
+      const filMat = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(1.8, 1.05, 0.28),
+        toneMapped: false,
+      });
+      const filament = new THREE.Mesh(filGeo, filMat);
+      filament.position.set(tx, baseY + 0.015, tz);
+      filament.scale.y = 0.14;
+
+      this.root.add(socket, glass, cap, filament);
+      this.vacuumTubes.push({ filament, mat: filMat });
+    }
+
     this.renderBunkerRadarStandby();
 
     this.muzzleFlashLight = new THREE.PointLight(0xffa838, 0, 7.5, 1.5);
@@ -1603,6 +1651,45 @@ export class ArbiterStage3D {
     ctx.lineTo(w - 16, h * 0.5);
     ctx.stroke();
     this.crtTexture.needsUpdate = true;
+
+    for (const tb of this.vacuumTubes) {
+      tb.filament.scale.y = 0.14;
+      tb.mat.color.setRGB(0.85, 0.48, 0.14);
+    }
+  }
+
+  private updateVacuumTubeEqualizer(
+    hasFreqData: boolean,
+    mode: string,
+    clockSec: number
+  ): void {
+    for (let i = 0; i < this.vacuumTubes.length; i++) {
+      const tb = this.vacuumTubes[i]!;
+      // Sample 8 perceptual frequency bands (`bins 2 .. 96` of 256-bin spectrum)
+      const binStart = Math.floor(2 + Math.pow(i / 8, 1.55) * 76);
+      const binEnd = Math.min(120, binStart + 4 + i * 2);
+      let sum = 0;
+      if (hasFreqData) {
+        for (let b = binStart; b < binEnd; b++) {
+          sum += this.frequencyBytes[b]!;
+        }
+      }
+      const avgNorm = hasFreqData ? sum / ((binEnd - binStart) * 255) : 0;
+      const fallback =
+        mode === 'FLATLINE'
+          ? 0.06
+          : mode === 'HEARTBEAT_VACUUM'
+            ? 0.16 + 0.35 * Math.pow(Math.max(0, Math.sin(clockSec * 8.2)), 6)
+            : 0.2 + 0.45 * Math.abs(Math.sin(clockSec * 19 + i * 1.1));
+      const level = THREE.MathUtils.clamp(Math.max(avgNorm * 1.25, fallback), 0.08, 1.0);
+      tb.filament.scale.y = 0.12 + level * 0.88;
+
+      if (mode === 'HEARTBEAT_VACUUM') {
+        tb.mat.color.setRGB(2.4 * level + 0.4, 0.32 * level, 0.36 * level);
+      } else {
+        tb.mat.color.setRGB(1.1 + 1.85 * level, 0.55 + 1.15 * level, 0.18 + 0.35 * level);
+      }
+    }
   }
 
   private renderBunkerScope(
@@ -1616,13 +1703,35 @@ export class ArbiterStage3D {
     const w = this.crtCanvas.width;
     const h = this.crtCanvas.height;
 
+    const hasTimeAudio = this.sound.readBattleTimeDomainBytes(this.timeDomainBytes);
+    const hasFreqAudio = this.sound.readBattleFrequencyBytes(this.frequencyBytes);
+    this.updateVacuumTubeEqualizer(hasFreqAudio, mode, clockSec);
+
     ctx.fillStyle = mode === 'HEARTBEAT_VACUUM' ? '#070304' : '#040908';
     ctx.fillRect(0, 0, w, h);
 
-    const midY = h * 0.54;
+    const midY = h * 0.56;
+
+    // 1. Background 16-Band Vacuum-Tube Equalizer Spectrum Bars (`getByteFrequencyData`)
+    const eqBands = 16;
+    const barW = (w - 56) / eqBands;
+    for (let b = 0; b < eqBands; b++) {
+      const bin = Math.min(120, 2 + b * 6);
+      const raw = hasFreqAudio ? this.frequencyBytes[bin]! / 255 : 0;
+      const syn =
+        mode === 'FLATLINE' || mode === 'HEARTBEAT_VACUUM'
+          ? 0.04
+          : 0.15 + 0.35 * Math.abs(Math.sin(clockSec * 16 + b * 0.9));
+      const lvl = Math.min(1, Math.max(raw, syn));
+      const bh = lvl * (h * 0.68);
+      ctx.fillStyle =
+        mode === 'HEARTBEAT_VACUUM'
+          ? 'rgba(255, 68, 86, 0.18)'
+          : 'rgba(235, 178, 72, 0.19)';
+      ctx.fillRect(28 + b * barW + 2, h - 10 - bh, barW - 4, bh);
+    }
 
     if (mode === 'HEARTBEAT_VACUUM') {
-      // High-Contrast Hospital / Submarine ECG Heartbeat Trace (`LUB-DUB` QRS Complex!)
       const sweepX = ((vacProgress * 2.0) % 1.0) * w;
       ctx.strokeStyle = verdict.stakes?.defcon === 1 ? '#ff4e5e' : '#58f29c';
       ctx.lineWidth = 3.2;
@@ -1652,7 +1761,7 @@ export class ArbiterStage3D {
       return;
     }
 
-    const hasLiveAudio = this.sound.sampleLiveWaveform(this.waveformSample);
+    // 2. Foreground 60 FPS Oscilloscope Waveform (`getByteTimeDomainData`)
     const grad = ctx.createLinearGradient(16, 0, w - 16, 0);
     if (mode === 'SUPPRESSION' || mode === 'LOCK_IN') {
       grad.addColorStop(0.0, '#49c6ff');
@@ -1665,23 +1774,24 @@ export class ArbiterStage3D {
     }
 
     ctx.strokeStyle = grad;
-    ctx.lineWidth = 2.4;
+    ctx.lineWidth = 2.6;
     ctx.beginPath();
-    ctx.moveTo(14, midY);
-    ctx.lineTo(w - 14, midY);
-
-    if (mode !== 'FLATLINE') {
-      const spikes = 84;
-      for (let i = 0; i <= spikes; i++) {
-        const u = i / spikes;
-        const sIdx = Math.floor(u * (this.waveformSample.length - 1));
-        const live = hasLiveAudio ? Math.abs(this.waveformSample[sIdx]!) * 2.2 : 0;
-        const syn =
-          0.22 + 0.65 * Math.abs(Math.sin(i * 17.3 + clockSec * 32)) * Math.sin(u * Math.PI);
-        const hh = Math.min(h * 0.42, Math.max(live, syn) * h * 0.4);
-        const x = 14 + u * (w - 28);
-        ctx.moveTo(x, midY - hh);
-        ctx.lineTo(x, midY + hh);
+    if (mode === 'FLATLINE') {
+      ctx.moveTo(14, midY);
+      ctx.lineTo(w - 14, midY);
+    } else {
+      const samples = 96;
+      for (let i = 0; i <= samples; i++) {
+        const u = i / samples;
+        const sIdx = Math.floor(u * (this.timeDomainBytes.length - 1));
+        const byteCentered = hasTimeAudio ? (this.timeDomainBytes[sIdx]! - 128) / 128 : 0;
+        const synWave =
+          0.42 * Math.sin(i * 0.65 + clockSec * 34) * Math.sin(u * Math.PI);
+        const amp = Math.abs(byteCentered) > 0.025 ? byteCentered * 1.65 : synWave;
+        const x = 16 + u * (w - 32);
+        const y = THREE.MathUtils.clamp(midY + amp * (h * 0.38), 38, h - 8);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
       }
     }
     ctx.stroke();

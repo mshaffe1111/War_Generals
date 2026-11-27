@@ -19,8 +19,7 @@ const hud = new HudController(hudRoot, store, sound, (verdict) => {
 });
 
 store.subscribe((view, options) => {
-  sound.setEraMode(options.eraMode);
-  sound.setMuted(options.audioMuted);
+  sound.syncOptions(options);
   sceneManager.syncFromStore(view, options);
   hud.render(view, options);
 });

@@ -115,6 +115,10 @@ export class GameStore {
 
   private options: AppOptions = {
     audioMuted: false,
+    musicVolume: 0.85,
+    sfxVolume: 0.95,
+    ambianceVolume: 0.75,
+    hapticsEnabled: true,
     eraMode: '1980s',
     arbiterSpeed: '1x',
     renderQuality: 'ULTRA',

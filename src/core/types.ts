@@ -108,6 +108,10 @@ export type RenderQualityMode = 'ULTRA' | 'BALANCED';
 
 export interface AppOptions {
   audioMuted: boolean;
+  musicVolume: number; // 0..1 independent Music bus gain
+  sfxVolume: number; // 0..1 independent SFX bus gain
+  ambianceVolume: number; // 0..1 independent War-Room Ambiance bus gain
+  hapticsEnabled: boolean; // Mobile `navigator.vibrate` tactile pulses
   eraMode: AudioEraMode;
   arbiterSpeed: ArbiterSpeedMode;
   renderQuality: RenderQualityMode;

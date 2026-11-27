@@ -83,6 +83,7 @@ export class SceneManager {
 
   private readonly clock = new THREE.Clock();
   private totalElapsed = 0;
+  private idleTurnElapsed = 0;
   private rafId = 0;
   private resizeObserver: ResizeObserver;
 
@@ -346,6 +347,15 @@ export class SceneManager {
     this.arbiterStage.update(dt, elapsed);
     this.indicatorLayer.update(elapsed);
 
+    // 10-second turn-warning pocket-watch escapement escalation after 20s of idle contemplation
+    if (this.cameraMode === 'PLAY' && !this.arbiterStage.isBusy) {
+      this.idleTurnElapsed += dt;
+      this.sound.setTurnWarningUrgent(this.idleTurnElapsed >= 20.0);
+    } else {
+      this.idleTurnElapsed = 0;
+      this.sound.setTurnWarningUrgent(false);
+    }
+
     // Tactile hover levitation + tracking Hero Spotlight on the selected/moving Command Monolith!
     const pieceSlide = 1 - Math.exp(-dt * 14.0);
     let foundSelPos: THREE.Vector3 | null = null;
@@ -602,6 +612,8 @@ export class SceneManager {
 
     this.renderer.domElement.addEventListener('pointerdown', (ev: PointerEvent) => {
       this.sound.unlock();
+      this.idleTurnElapsed = 0;
+      this.sound.setTurnWarningUrgent(false);
       if (this.arbiterStage.isBusy) {
         // Diegetic Press-and-Hold Overdrive (`2.15x` fast-march during routine skirmishes!)
         this.arbiterStage.setOverdriveHeld(true);
@@ -683,7 +695,12 @@ export class SceneManager {
           );
           const chosenId = tilePlayerPiece?.id ?? hitPieceId;
           if (chosenId) {
-            this.sound.playSelect();
+            const deselecting = view.selectedPieceId === chosenId;
+            if (deselecting) {
+              this.sound.playUiClick();
+            } else {
+              this.sound.playPiecePickup();
+            }
             this.store.selectPiece(chosenId);
             return;
           }
@@ -691,7 +708,12 @@ export class SceneManager {
       }
 
       if (hitPieceId) {
-        this.sound.playSelect();
+        const view = this.store.getVisibleView();
+        if (view.selectedPieceId === hitPieceId) {
+          this.sound.playUiClick();
+        } else {
+          this.sound.playPiecePickup();
+        }
         this.store.selectPiece(hitPieceId);
       } else {
         this.store.selectPiece(null);
@@ -721,5 +743,7 @@ export class SceneManager {
 
     const dpr = this.renderer.getPixelRatio();
     (this.tiltShiftPass.uniforms['uResolution']!.value as THREE.Vector2).set(w * dpr, h * dpr);
+    this.snapCameraImmediately();
+    this.composer.render();
   }
 }

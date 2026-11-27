@@ -73,8 +73,8 @@ body.is-fullscreen #app-chassis {
   box-shadow: none;
 }
 
-/* Compact spatial padding on short Mobile Landscape screens so HUD never crowds the board */
-@media (orientation: landscape) and (max-height: 599px) {
+/* Compact spatial padding & 2-column zero-scroll Settings grid on Mobile Landscape screens */
+@media (orientation: landscape) and (max-height: 640px) {
   #hud-root {
     padding: calc(var(--safe-top) + 8px) 18px calc(var(--safe-bottom) + 8px) 18px;
   }
@@ -84,6 +84,16 @@ body.is-fullscreen #app-chassis {
   }
   .hud-dynamic-island {
     padding: 5px 15px;
+  }
+  #drawer-options:not([hidden]) {
+    width: min(94vw, 590px);
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 7px 18px;
+    padding: 11px 16px;
+  }
+  .bus-slider {
+    width: 118px;
   }
 }
 
@@ -256,12 +266,15 @@ body.is-fullscreen #app-chassis {
 .hud-sheet {
   pointer-events: auto;
   width: min(100%, 356px);
+  max-height: calc(100dvh - 122px);
+  overflow-y: auto;
+  scrollbar-width: none;
   border-radius: 24px;
   padding: 12px 14px;
   background: radial-gradient(
     130% 130% at 50% 0%,
-    rgba(44, 38, 34, 0.78) 0%,
-    rgba(16, 14, 13, 0.88) 100%
+    rgba(44, 38, 34, 0.84) 0%,
+    rgba(16, 14, 13, 0.92) 100%
   );
   backdrop-filter: blur(26px) saturate(150%);
   -webkit-backdrop-filter: blur(26px) saturate(150%);
@@ -270,7 +283,43 @@ body.is-fullscreen #app-chassis {
     inset 0 1px 0 rgba(255, 248, 236, 0.16);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 7px;
+}
+
+.hud-sheet::-webkit-scrollbar {
+  display: none;
+}
+
+.bus-slider {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 148px;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 248, 236, 0.16);
+  outline: none;
+  cursor: pointer;
+}
+
+.bus-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--gold-accent);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.55);
+  cursor: pointer;
+}
+
+.bus-slider::-moz-range-thumb {
+  width: 15px;
+  height: 15px;
+  border: none;
+  border-radius: 50%;
+  background: var(--gold-accent);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.55);
+  cursor: pointer;
 }
 
 .hud-sheet[hidden] {
@@ -407,7 +456,7 @@ body.is-fullscreen #app-chassis {
   flex-direction: column;
   align-items: center;
   gap: 2px;
-  padding: 8px 18px;
+  padding: 7px 16px;
   border-radius: 999px;
   background: radial-gradient(
     120% 140% at 50% 0%,
@@ -419,7 +468,7 @@ body.is-fullscreen #app-chassis {
   box-shadow:
     0 10px 28px rgba(0, 0, 0, 0.52),
     inset 0 1px 0 rgba(255, 248, 236, 0.18);
-  max-width: 265px;
+  max-width: min(334px, calc(100% - 76px));
   text-align: center;
   transition: opacity 0.2s ease, transform 0.2s ease;
 }
@@ -454,11 +503,8 @@ body.is-fullscreen #app-chassis {
 }
 
 .island-rule {
-  font-size: 10px;
+  font-size: 9.8px;
   font-weight: 500;
-  color: rgba(235, 228, 218, 0.74);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 235px;
+  line-height: 1.25;
+  color: rgba(235, 228, 218, 0.76);
 }
