@@ -1,4 +1,5 @@
-import { RANK_SPECS, type Faction, type RankId } from '../core/ranks';
+import { type Faction, type RankId } from '../core/ranks';
+import { resolveClash, type ClashPairOutcome } from '../core/RulesEngine';
 import type { ArbiterVerdict, BattleResolutionKind, GridCoord } from '../core/types';
 
 export interface ArbiterChallengeInput {
@@ -11,42 +12,11 @@ export interface ArbiterChallengeInput {
   readonly defenderTrueRank: RankId;
 }
 
-type PairOutcome = 'ATTACKER' | 'DEFENDER' | 'SPLIT';
-
 /**
- * Pure official War Generals (Salpakan) rank comparison.
- * Executed strictly inside the Electronic Arbiter vault.
+ * Delegates directly to `RulesEngine.resolveClash` (Single Canonical Resolution Contract).
  */
-export function compareSalpakanRanks(attacker: RankId, defender: RankId): PairOutcome {
-  // Rule 5: Flag interactions
-  if (defender === 'FLAG') {
-    // Any piece challenging the enemy Flag captures it—including an aggressor Flag!
-    return 'ATTACKER';
-  }
-  if (attacker === 'FLAG') {
-    // Moving Flag challenging any non-Flag enemy piece is eliminated
-    return 'DEFENDER';
-  }
-
-  // Rule 4: Equal ranks eliminate both (including Spy vs Spy and Private vs Private)
-  if (attacker === defender) {
-    return 'SPLIT';
-  }
-
-  // Rule 2 & 3: Spy vs Private and Spy vs Officers
-  if (attacker === 'SPY') {
-    return defender === 'PRIVATE' ? 'DEFENDER' : 'ATTACKER';
-  }
-  if (defender === 'SPY') {
-    return attacker === 'PRIVATE' ? 'ATTACKER' : 'DEFENDER';
-  }
-
-  // Rule 1: Standard Officer / Private seniority comparison
-  const attSeniority = RANK_SPECS[attacker].seniority;
-  const defSeniority = RANK_SPECS[defender].seniority;
-  if (attSeniority > defSeniority) return 'ATTACKER';
-  if (defSeniority > attSeniority) return 'DEFENDER';
-  return 'SPLIT';
+export function compareSalpakanRanks(attacker: RankId, defender: RankId): ClashPairOutcome {
+  return resolveClash(attacker, defender);
 }
 
 export function resolveArbiterChallenge(input: ArbiterChallengeInput): ArbiterVerdict {

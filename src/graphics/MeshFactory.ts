@@ -1,6 +1,14 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { BOARD_COLS, BOARD_ROWS, ORDERED_RANKS, type Faction, type RankId } from '../core/ranks';
+import {
+  BOARD_COLS,
+  BOARD_ROWS,
+  ORDERED_RANKS,
+  RANK_SPECS,
+  type Faction,
+  type RankId,
+} from '../core/ranks';
+import type { SuspectTag } from '../core/types';
 import {
   buildAttackMedallionMesh,
   buildRankEmblemMesh,
@@ -817,7 +825,8 @@ export class MeshFactory {
   public createCommandWedge(
     faction: Faction,
     visibleRank: RankId | 'UNKNOWN',
-    publicKills = 0
+    publicKills = 0,
+    suspectTag: SuspectTag | null = null
   ): THREE.Group {
     const root = new THREE.Group();
     const isPlayer = faction === 'PLAYER';
@@ -901,8 +910,192 @@ export class MeshFactory {
       root.rotation.y = Math.PI;
     }
 
+    // Floating Amber Holographic Suspect Tag (`SPY?`, `GEN?`, `PVT?`, `OFF?`, `FLAG?`)
+    if (suspectTag) {
+      const badge = this.createHolographicPillSprite(suspectTag, 'AMBER');
+      badge.position.set(0, 1.18, 0);
+      root.add(badge);
+    }
+
     root.scale.setScalar(HERO_WEDGE_SCALE);
     return root;
+  }
+
+  /**
+   * Lifted `+28px` Cyan Holographic Projection Wedge for Thumb Dragging (Deployment & Active Play)!
+   */
+  public createHologramGhostWedge(rank: RankId): THREE.Group {
+    const root = new THREE.Group();
+    const srcGeo = this.monolithGeos.body ?? this.fallbackWedgeGeo;
+
+    const holoMat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(0.18, 1.45, 2.25),
+      transparent: true,
+      opacity: 0.34,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    const shell = new THREE.Mesh(srcGeo, holoMat);
+    root.add(shell);
+
+    const wire = new THREE.LineSegments(
+      new THREE.EdgesGeometry(srcGeo, 22),
+      new THREE.LineBasicMaterial({
+        color: new THREE.Color(0.55, 1.95, 2.6),
+        transparent: true,
+        opacity: 0.85,
+        blending: THREE.AdditiveBlending,
+        toneMapped: false,
+      })
+    );
+    root.add(wire);
+
+    const emblem = buildRankEmblemMesh(rank, this.materials.emblemPalette);
+    emblem.scale.setScalar(0.86);
+    emblem.position.set(0, 0.456, 0.126);
+    emblem.rotation.x = -THREE.MathUtils.degToRad(22.0);
+    root.add(emblem);
+
+    const label = this.createHolographicPillSprite(RANK_SPECS[rank].shortLabel, 'CYAN');
+    label.position.set(0, 1.14, 0);
+    root.add(label);
+
+    root.scale.setScalar(HERO_WEDGE_SCALE);
+    return root;
+  }
+
+  /**
+   * Post-Match "Declassified" X-Ray Hologram Wireframe Monolith (`ref_declassified_replay.jpg`):
+   * Renders BOTH Player (Electric Cyan) and Opponent (Laser Red-Crimson) pieces as translucent
+   * X-Ray wireframes with true 3D rank insignias facing forward + floating holographic rank labels!
+   */
+  public createXRayReplayWedge(faction: Faction, trueRank: RankId, kills = 0): THREE.Group {
+    const root = new THREE.Group();
+    const isPlayer = faction === 'PLAYER';
+    const srcGeo = this.monolithGeos.body ?? this.fallbackWedgeGeo;
+
+    const shellMat = new THREE.MeshBasicMaterial({
+      color: isPlayer ? new THREE.Color(0.08, 0.72, 1.18) : new THREE.Color(1.18, 0.14, 0.24),
+      transparent: true,
+      opacity: 0.26,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    root.add(new THREE.Mesh(srcGeo, shellMat));
+
+    const wireMat = new THREE.LineBasicMaterial({
+      color: isPlayer ? new THREE.Color(0.35, 1.85, 2.55) : new THREE.Color(2.55, 0.36, 0.48),
+      transparent: true,
+      opacity: 0.92,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
+    root.add(new THREE.LineSegments(new THREE.EdgesGeometry(srcGeo, 20), wireMat));
+
+    // Declassified: ALL 42 pieces face their true 3D rank emblem clearly toward the camera!
+    const emblem = buildRankEmblemMesh(trueRank, this.materials.emblemPalette);
+    emblem.scale.setScalar(0.86);
+    emblem.position.set(0, 0.456, 0.126);
+    emblem.rotation.x = -THREE.MathUtils.degToRad(22.0);
+    root.add(emblem);
+
+    // Compact tactical military codes so adjacent X-Ray pills never overlap in 9-wide formations!
+    const XRAY_CODE: Readonly<Record<RankId, string>> = {
+      GEN_5: '5★',
+      GEN_4: '4★',
+      GEN_3: '3★',
+      GEN_2: '2★',
+      GEN_1: '1★',
+      COLONEL: 'COL',
+      LT_COLONEL: 'LTC',
+      MAJOR: 'MAJ',
+      CAPTAIN: 'CPT',
+      LT_1ST: '1LT',
+      LT_2ND: '2LT',
+      SERGEANT: 'SGT',
+      PRIVATE: 'PVT',
+      SPY: 'SPY',
+      FLAG: 'FLAG',
+    };
+    const tagLabel =
+      kills > 0 ? `${XRAY_CODE[trueRank]} ★${kills}` : XRAY_CODE[trueRank];
+    const pill = this.createHolographicPillSprite(tagLabel, isPlayer ? 'CYAN' : 'CRIMSON', true);
+    pill.position.set(0, 1.05, 0);
+    root.add(pill);
+
+    root.scale.setScalar(HERO_WEDGE_SCALE);
+    return root;
+  }
+
+  private createHolographicPillSprite(
+    text: string,
+    tone: 'AMBER' | 'CYAN' | 'CRIMSON',
+    compact = false
+  ): THREE.Sprite {
+    const canvas = document.createElement('canvas');
+    canvas.width = compact ? 184 : 256;
+    canvas.height = 76;
+    const ctx = canvas.getContext('2d')!;
+
+    const borderCol =
+      tone === 'AMBER' ? '#ffc44d' : tone === 'CYAN' ? '#4de8ff' : '#ff5e72';
+    const bgCol =
+      tone === 'AMBER'
+        ? 'rgba(30, 18, 5, 0.94)'
+        : tone === 'CYAN'
+          ? 'rgba(6, 22, 36, 0.9)'
+          : 'rgba(36, 8, 14, 0.9)';
+    const textCol =
+      tone === 'AMBER' ? '#ffebad' : tone === 'CYAN' ? '#e2fbff' : '#ffd8de';
+
+    const boxW = canvas.width - 16;
+    const midX = canvas.width * 0.5;
+
+    ctx.fillStyle = bgCol;
+    ctx.strokeStyle = borderCol;
+    ctx.lineWidth = compact ? 3.5 : 4.2;
+    ctx.beginPath();
+    ctx.roundRect(8, 8, boxW, 50, 25);
+    ctx.fill();
+    ctx.stroke();
+
+    // Crisp bottom holographic pointer chevron
+    ctx.fillStyle = borderCol;
+    ctx.beginPath();
+    ctx.moveTo(midX - 8, 58);
+    ctx.lineTo(midX + 8, 58);
+    ctx.lineTo(midX, 71);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = textCol;
+    ctx.font = compact
+      ? '800 27px "Plus Jakarta Sans", system-ui, sans-serif'
+      : '800 30px "Plus Jakarta Sans", system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, midX, 34);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    const mat = new THREE.SpriteMaterial({
+      map: tex,
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+    });
+    const sprite = new THREE.Sprite(mat);
+    if (compact) {
+      sprite.scale.set(0.62, 0.22, 1);
+    } else if (tone === 'AMBER') {
+      sprite.scale.set(1.06, 0.31, 1);
+    } else {
+      sprite.scale.set(0.88, 0.26, 1);
+    }
+    sprite.renderOrder = 25;
+    return sprite;
   }
 
   public createAttackMedallion(): THREE.Group {

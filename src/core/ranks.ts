@@ -47,7 +47,7 @@ export const RANK_SPECS: Readonly<Record<RankId, RankSpec>> = {
     metal: 'BRASS',
     seniority: 13,
     countPerArmy: 1,
-    tacticalRule: 'Outranks 3★ General & below • Vulnerable to 5★ & Spy',
+    tacticalRule: 'Outranks 3★ & below • Vulnerable to 5★ & Spy',
   },
   GEN_3: {
     id: 'GEN_3',
@@ -56,7 +56,7 @@ export const RANK_SPECS: Readonly<Record<RankId, RankSpec>> = {
     metal: 'BRASS',
     seniority: 12,
     countPerArmy: 1,
-    tacticalRule: 'Outranks 2★ General & below • Vulnerable to 4★–5★ & Spy',
+    tacticalRule: 'Outranks 2★ & below • Vulnerable to 4★–5★ & Spy',
   },
   GEN_2: {
     id: 'GEN_2',
@@ -65,7 +65,7 @@ export const RANK_SPECS: Readonly<Record<RankId, RankSpec>> = {
     metal: 'BRASS',
     seniority: 11,
     countPerArmy: 1,
-    tacticalRule: 'Outranks 1★ General & below • Vulnerable to 3★–5★ & Spy',
+    tacticalRule: 'Outranks 1★ & below • Vulnerable to 3★–5★ & Spy',
   },
   GEN_1: {
     id: 'GEN_1',

@@ -1,12 +1,38 @@
 import type { SoundDirector } from '../audio/SoundDirector';
-import { RANK_SPECS } from '../core/ranks';
-import type { AppOptions, ArbiterVerdict, BoardViewAngle, PlayerVisibleView } from '../core/types';
+import { ORDERED_RANKS, RANK_SPECS, type RankId } from '../core/ranks';
+import { ARMY_PIECE_TOTAL } from '../core/RulesEngine';
+import type {
+  AppOptions,
+  ArbiterVerdict,
+  BoardViewAngle,
+  DeploymentPresetId,
+  PlayerVisibleView,
+  SuspectTag,
+} from '../core/types';
 import type { GameStore, ShowcasePreset } from '../state/GameStore';
 
 const VIEW_DEGREE_BADGE: Readonly<Record<BoardViewAngle, string>> = {
   COMMAND: '40°',
   TACTICAL: '32°',
   OVERHEAD: '62°',
+};
+
+const COMPACT_CHIP_LABEL: Readonly<Record<RankId, string>> = {
+  GEN_5: '5★',
+  GEN_4: '4★',
+  GEN_3: '3★',
+  GEN_2: '2★',
+  GEN_1: '1★',
+  COLONEL: 'COL',
+  LT_COLONEL: 'LTC',
+  MAJOR: 'MAJ',
+  CAPTAIN: 'CPT',
+  LT_1ST: '1LT',
+  LT_2ND: '2LT',
+  SERGEANT: 'SGT',
+  PRIVATE: 'PVT',
+  SPY: 'SPY',
+  FLAG: 'FLG',
 };
 
 const ICON_FULLSCREEN_ENTER = `
@@ -36,15 +62,22 @@ interface WebkitHTMLElement extends HTMLElement {
   webkitRequestFullscreen?: () => Promise<void> | void;
 }
 
+export interface HudCallbacks {
+  readonly onTriggerVerdict: (verdict: ArbiterVerdict) => void;
+  readonly onStartCrateDrag: (rank: RankId, clientX: number, clientY: number) => void;
+}
+
 export class HudController {
   private readonly root: HTMLElement;
   private readonly store: GameStore;
   private readonly sound: SoundDirector;
-  private readonly onTriggerVerdict: (verdict: ArbiterVerdict) => void;
+  private readonly callbacks: HudCallbacks;
 
   private showcaseOpen = false;
   private optionsOpen = false;
   private fullscreenActive = false;
+  private saveSlotArmed = false;
+  private suspectTargetPieceId: string | null = null;
 
   private readonly spatialHeader: HTMLElement;
   private readonly spatialTitle: HTMLElement;
@@ -55,6 +88,27 @@ export class HudController {
   private readonly optionsOrb: HTMLButtonElement;
   private readonly showcaseSheet: HTMLElement;
   private readonly optionsSheet: HTMLElement;
+
+  // Deployment Crate Drawer Elements
+  private readonly mobilizationDrawer: HTMLElement;
+  private readonly deployCountBadge: HTMLElement;
+  private readonly saveModeBtn: HTMLButtonElement;
+  private readonly rankChipContainer: HTMLElement;
+  private readonly launchBattleBtn: HTMLButtonElement;
+
+  // Radial Suspect Wheel
+  private readonly suspectWheel: HTMLElement;
+
+  // Game Over & Declassified Replay Scrubber
+  private readonly gameOverBar: HTMLElement;
+  private readonly gameOverReason: HTMLElement;
+  private readonly replayBar: HTMLElement;
+  private readonly replayTicker: HTMLElement;
+  private readonly replayTurnLabel: HTMLElement;
+  private readonly replaySlider: HTMLInputElement;
+  private readonly replayPlayBtn: HTMLButtonElement;
+
+  // Active Play Bottom Dynamic Island & Tallies
   private readonly bottomZone: HTMLElement;
   private readonly islandEl: HTMLElement;
   private readonly islandNameEl: HTMLElement;
@@ -66,18 +120,53 @@ export class HudController {
     root: HTMLElement,
     store: GameStore,
     sound: SoundDirector,
-    onTriggerVerdict: (verdict: ArbiterVerdict) => void
+    callbacks: HudCallbacks
   ) {
     this.root = root;
     this.store = store;
     this.sound = sound;
-    this.onTriggerVerdict = onTriggerVerdict;
+    this.callbacks = callbacks;
+
+    const chipsHtml = ORDERED_RANKS.map((r) => {
+      const spec = RANK_SPECS[r];
+      return `
+        <button type="button" class="crate-rank-chip" data-rank="${r}" title="${spec.name}">
+          <span class="chip-metal-dot" data-metal="${spec.metal}"></span>
+          <span class="chip-code">${COMPACT_CHIP_LABEL[r]}</span>
+          <span class="chip-qty" data-qty-for="${r}">×${spec.countPerArmy}</span>
+        </button>
+      `;
+    }).join('');
+
+    const suspectOptions: Array<{ label: string; tag: SuspectTag | '' }> = [
+      { label: 'SPY?', tag: 'SPY?' },
+      { label: 'GEN?', tag: 'GEN?' },
+      { label: 'OFF?', tag: 'OFF?' },
+      { label: 'PVT?', tag: 'PVT?' },
+      { label: 'FLAG?', tag: 'FLAG?' },
+      { label: '✕', tag: '' },
+    ];
+    const wheelButtonsHtml = suspectOptions
+      .map((opt, idx) => {
+        const ang = (idx / suspectOptions.length) * Math.PI * 2 - Math.PI / 2;
+        const rx = Math.round(Math.cos(ang) * 58);
+        const ry = Math.round(Math.sin(ang) * 58);
+        return `
+          <button
+            type="button"
+            class="suspect-orb"
+            data-suspect="${opt.tag}"
+            style="transform: translate(calc(-50% + ${rx}px), calc(-50% + ${ry}px));"
+          >${opt.label}</button>
+        `;
+      })
+      .join('');
 
     this.root.innerHTML = `
       <div class="hud-top-stack">
         <div class="hud-top-row">
           <div class="hud-orb-cluster">
-            <button type="button" class="hud-orb" id="btn-showcase" aria-label="Battle Arena Showcase" title="Battle Showcase & Rank Gallery">
+            <button type="button" class="hud-orb" id="btn-showcase" aria-label="Battle Arena Showcase" title="Battle Showcase, Replay & Rank Gallery">
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M14.5 17.5 3 6V3h3l11.5 11.5" />
                 <path d="m13 19 6-6" />
@@ -125,8 +214,9 @@ export class HudController {
             <button type="button" class="pill-action" data-preset="SPY_INTERCEPT" data-tone="cyan">Spy Intercept!</button>
             <button type="button" class="pill-action" data-preset="MUTUAL_SPLIT" data-tone="crimson">Delayed Double-KO</button>
             <button type="button" class="pill-action" data-preset="FLAG_CAPTURE" data-tone="gold">Flag Unmasking</button>
+            <button type="button" class="pill-action" id="btn-xray-replay" data-tone="cyan">Declassified X-Ray</button>
             <button type="button" class="pill-action" id="btn-inspect-16" data-tone="cyan">16-Rank Gallery</button>
-            <button type="button" class="pill-action" id="btn-reset-board">Reset Formation</button>
+            <button type="button" class="pill-action" id="btn-reset-board">New Deployment</button>
           </div>
         </div>
 
@@ -196,20 +286,98 @@ export class HudController {
         </div>
       </div>
 
-      <div class="hud-bottom-zone" id="hud-bottom-zone">
-        <div class="hud-corner-tally" title="Navy Forces Remaining">
-          <span class="tally-dot navy"></span>
-          <span id="tally-navy-val">21</span>
+      <!-- Radial Brass Deduction Wheel (320ms Long-Press or Double-Tap on Enemy Wedge) -->
+      <div class="suspect-wheel" id="suspect-wheel" hidden>
+        <div class="suspect-wheel-hub">TAG</div>
+        ${wheelButtonsHtml}
+      </div>
+
+      <div class="hud-bottom-stack">
+        <!-- Pre-Match Velvet Mobilization Crate Drawer -->
+        <div class="mobilization-drawer" id="mobilization-drawer" hidden>
+          <div class="mob-top-bar">
+            <div class="mob-title-group">
+              <span class="mob-label">MOBILIZATION</span>
+              <span class="mob-count-pill" id="mob-count-pill">0 / 21</span>
+            </div>
+            <div class="mob-util-group">
+              <button type="button" class="mob-mini-pill" id="btn-dep-auto" data-tone="cyan">Auto</button>
+              <button type="button" class="mob-mini-pill" id="btn-dep-mirror">Mirror ⇄</button>
+              <button type="button" class="mob-mini-pill" id="btn-dep-clear">Clear</button>
+            </div>
+          </div>
+
+          <div class="mob-toolbar-rows">
+            <div class="mob-preset-row">
+              <button type="button" class="mob-preset-pill" data-dep-preset="VACCINATION">Vaccination</button>
+              <button type="button" class="mob-preset-pill" data-dep-preset="MOTHERSHIP">Mothership</button>
+              <button type="button" class="mob-preset-pill" data-dep-preset="IRON_BLITZ">Iron Blitz</button>
+              <button type="button" class="mob-preset-pill" data-dep-preset="MIRAGE_DECOY">Mirage</button>
+            </div>
+            <div class="mob-blueprint-row">
+              <span class="mob-sub-label">SLOTS</span>
+              <div class="mob-slot-group">
+                <button type="button" class="mob-slot-save-toggle" id="btn-arm-save" title="Save current 21/21 formation into Slot 1–5">Save</button>
+                <button type="button" class="mob-slot-pill" data-slot="0">S1</button>
+                <button type="button" class="mob-slot-pill" data-slot="1">S2</button>
+                <button type="button" class="mob-slot-pill" data-slot="2">S3</button>
+                <button type="button" class="mob-slot-pill" data-slot="3">S4</button>
+                <button type="button" class="mob-slot-pill" data-slot="4">S5</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="mob-chip-grid" id="mob-chip-grid">
+            ${chipsHtml}
+          </div>
+
+          <button type="button" class="mob-launch-btn" id="btn-launch-battle" disabled>
+            DEPLOY 21 UNITS TO LAUNCH
+          </button>
         </div>
 
-        <div class="hud-dynamic-island" id="hud-island" data-empty="true">
-          <div class="island-rank-name" id="island-rank-name">SERGEANT</div>
-          <div class="island-rule" id="island-rule">Outranks Private</div>
+        <!-- Post-Match Outcome Capsule -->
+        <div class="gameover-capsule" id="gameover-bar" hidden>
+          <div class="gameover-reason" id="gameover-reason">Enemy Flag eliminated in combat</div>
+          <div class="gameover-actions">
+            <button type="button" class="pill-action" id="btn-gameover-replay" data-tone="cyan">Declassified X-Ray Replay</button>
+            <button type="button" class="pill-action" id="btn-gameover-new" data-tone="gold">New Deployment</button>
+          </div>
         </div>
 
-        <div class="hud-corner-tally" title="Crimson Forces Remaining">
-          <span id="tally-crimson-val">21</span>
-          <span class="tally-dot crimson"></span>
+        <!-- Post-Match Declassified X-Ray Replay Theater Scrubber -->
+        <div class="replay-capsule" id="replay-bar" hidden>
+          <div class="replay-top-row">
+            <span class="replay-turn-badge" id="replay-turn-label">PLY 0 / 0</span>
+            <span class="replay-ticker" id="replay-ticker">T0: Armies Deployed</span>
+          </div>
+          <input type="range" class="bus-slider replay-scrubber" id="replay-slider" min="0" max="1" step="1" value="0" aria-label="Replay Timeline Scrubber" />
+          <div class="replay-controls-row">
+            <button type="button" class="hud-orb replay-orb" id="btn-rep-start" title="First Turn">|&lt;</button>
+            <button type="button" class="hud-orb replay-orb" id="btn-rep-prev" title="Previous Turn">&lt;</button>
+            <button type="button" class="hud-orb replay-orb" id="btn-rep-play" data-active="false" title="Play / Pause">▶</button>
+            <button type="button" class="hud-orb replay-orb" id="btn-rep-next" title="Next Turn">&gt;</button>
+            <button type="button" class="hud-orb replay-orb" id="btn-rep-end" title="Final Turn">&gt;|</button>
+            <button type="button" class="pill-action" id="btn-rep-exit" data-tone="gold">New Match</button>
+          </div>
+        </div>
+
+        <!-- Active Play Bottom Dynamic Island + Corner Tallies -->
+        <div class="hud-bottom-zone" id="hud-bottom-zone">
+          <div class="hud-corner-tally" title="Navy Forces Remaining">
+            <span class="tally-dot navy"></span>
+            <span id="tally-navy-val">21</span>
+          </div>
+
+          <div class="hud-dynamic-island" id="hud-island" data-empty="true">
+            <div class="island-rank-name" id="island-rank-name">SERGEANT</div>
+            <div class="island-rule" id="island-rule">Outranks Private</div>
+          </div>
+
+          <div class="hud-corner-tally" title="Crimson Forces Remaining">
+            <span id="tally-crimson-val">21</span>
+            <span class="tally-dot crimson"></span>
+          </div>
         </div>
       </div>
     `;
@@ -223,6 +391,23 @@ export class HudController {
     this.optionsOrb = this.root.querySelector('#btn-options')!;
     this.showcaseSheet = this.root.querySelector('#drawer-showcase')!;
     this.optionsSheet = this.root.querySelector('#drawer-options')!;
+
+    this.mobilizationDrawer = this.root.querySelector('#mobilization-drawer')!;
+    this.deployCountBadge = this.root.querySelector('#mob-count-pill')!;
+    this.saveModeBtn = this.root.querySelector('#btn-arm-save')!;
+    this.rankChipContainer = this.root.querySelector('#mob-chip-grid')!;
+    this.launchBattleBtn = this.root.querySelector('#btn-launch-battle')!;
+
+    this.suspectWheel = this.root.querySelector('#suspect-wheel')!;
+
+    this.gameOverBar = this.root.querySelector('#gameover-bar')!;
+    this.gameOverReason = this.root.querySelector('#gameover-reason')!;
+    this.replayBar = this.root.querySelector('#replay-bar')!;
+    this.replayTicker = this.root.querySelector('#replay-ticker')!;
+    this.replayTurnLabel = this.root.querySelector('#replay-turn-label')!;
+    this.replaySlider = this.root.querySelector('#replay-slider')!;
+    this.replayPlayBtn = this.root.querySelector('#btn-rep-play')!;
+
     this.bottomZone = this.root.querySelector('#hud-bottom-zone')!;
     this.islandEl = this.root.querySelector('#hud-island')!;
     this.islandNameEl = this.root.querySelector('#island-rank-name')!;
@@ -233,14 +418,34 @@ export class HudController {
     this.bindEvents();
   }
 
+  public openSuspectWheel(pieceId: string, clientX: number, clientY: number): void {
+    this.suspectTargetPieceId = pieceId;
+    const hostRect = this.root.getBoundingClientRect();
+    const localX = THREE.ClampCoord(clientX - hostRect.left, 82, Math.max(82, hostRect.width - 82));
+    const localY = THREE.ClampCoord(clientY - hostRect.top, 82, Math.max(82, hostRect.height - 82));
+    this.suspectWheel.style.left = `${localX}px`;
+    this.suspectWheel.style.top = `${localY}px`;
+    this.suspectWheel.hidden = false;
+  }
+
+  public closeSuspectWheel(): void {
+    this.suspectTargetPieceId = null;
+    this.suspectWheel.hidden = true;
+  }
+
   public render(view: PlayerVisibleView, options: Readonly<AppOptions>): void {
     const inArbiter = view.cameraMode === 'ARBITER';
+    const inInspect = view.cameraMode === 'INSPECT_16';
+    const inDeploy = view.phase === 'DEPLOY' && !inInspect && !inArbiter;
+    const inReplay = view.phase === 'REPLAY' && !inInspect;
+    const inGameOver = view.phase === 'GAME_OVER' && !inInspect && !inArbiter;
 
-    // Keep top spatial title refined & atmospheric during normal play; dramatic during Warfield clashes!
     if (view.banner === 'TACTICAL COMMAND' || view.banner === 'SELECT TARGET') {
       this.spatialTitle.textContent = 'WAR GENERALS';
     } else if (view.banner === 'ARBITRATING') {
       this.spatialTitle.textContent = 'LIVE FIRE EXCHANGE';
+    } else if (view.banner === 'DECLASSIFIED X-RAY REPLAY') {
+      this.spatialTitle.textContent = 'DECLASSIFIED REPLAY';
     } else {
       this.spatialTitle.textContent = view.banner;
     }
@@ -248,7 +453,8 @@ export class HudController {
     if (
       view.banner === 'BATTLE WINNER' ||
       view.banner === 'SPY INTERCEPTED — VICTORY' ||
-      view.banner === 'FLAG CAPTURED — VICTORY'
+      view.banner === 'FLAG CAPTURED — VICTORY' ||
+      view.banner === 'FLAG TRAVERSE — VICTORY'
     ) {
       this.spatialHeader.dataset['alert'] = 'gold';
     } else if (
@@ -271,12 +477,15 @@ export class HudController {
     if (inArbiter) {
       this.showcaseOpen = false;
       this.optionsOpen = false;
+      this.closeSuspectWheel();
     }
 
     this.viewBadge.textContent = VIEW_DEGREE_BADGE[options.boardView];
-    this.showcaseOrb.dataset['active'] = String(this.showcaseOpen || view.cameraMode === 'INSPECT_16');
+    this.showcaseOrb.dataset['active'] = String(this.showcaseOpen || inInspect || inReplay);
     this.fullscreenOrb.dataset['active'] = String(this.fullscreenActive);
-    this.fullscreenOrb.innerHTML = this.fullscreenActive ? ICON_FULLSCREEN_EXIT : ICON_FULLSCREEN_ENTER;
+    this.fullscreenOrb.innerHTML = this.fullscreenActive
+      ? ICON_FULLSCREEN_EXIT
+      : ICON_FULLSCREEN_ENTER;
     this.fullscreenOrb.setAttribute(
       'aria-label',
       this.fullscreenActive ? 'Exit Fullscreen' : 'Enter Fullscreen'
@@ -285,13 +494,71 @@ export class HudController {
     this.showcaseSheet.hidden = !this.showcaseOpen;
     this.optionsSheet.hidden = !this.optionsOpen;
 
-    this.bottomZone.dataset['hidden'] = String(inArbiter);
-    const navyAlive = Math.max(0, 21 - view.playerCasualties.length);
-    const crimsonAlive = Math.max(0, 21 - view.enemyCasualties.length);
+    // 1. Sync Pre-Match Mobilization Crate Drawer
+    this.mobilizationDrawer.hidden = !inDeploy;
+    if (inDeploy) {
+      const ready = view.deployedCount === ARMY_PIECE_TOTAL;
+      this.deployCountBadge.textContent = `${view.deployedCount} / ${ARMY_PIECE_TOTAL}`;
+      this.deployCountBadge.dataset['ready'] = String(ready);
+
+      if (!ready) this.saveSlotArmed = false;
+      this.saveModeBtn.dataset['armed'] = String(this.saveSlotArmed);
+      this.saveModeBtn.disabled = !ready;
+
+      this.mobilizationDrawer
+        .querySelectorAll<HTMLButtonElement>('.mob-slot-pill')
+        .forEach((btn) => {
+          const idx = Number(btn.dataset['slot'] ?? 0);
+          btn.dataset['saved'] = String(Boolean(view.savedBlueprintSlots[idx]));
+        });
+
+      this.rankChipContainer
+        .querySelectorAll<HTMLButtonElement>('.crate-rank-chip')
+        .forEach((chip) => {
+          const r = chip.dataset['rank'] as RankId;
+          const rem = view.unplacedCounts[r] ?? 0;
+          chip.dataset['selected'] = String(view.selectedDeployRank === r && rem > 0);
+          chip.dataset['depleted'] = String(rem <= 0);
+          const qtyEl = chip.querySelector<HTMLElement>(`[data-qty-for="${r}"]`);
+          if (qtyEl) qtyEl.textContent = `×${rem}`;
+        });
+
+      this.launchBattleBtn.disabled = !ready;
+      this.launchBattleBtn.textContent = ready
+        ? 'READY TO LAUNCH — ENGAGE'
+        : `DEPLOY ${ARMY_PIECE_TOTAL - view.deployedCount} MORE TO LAUNCH`;
+    }
+
+    // 2. Sync Post-Match Outcome Capsule
+    this.gameOverBar.hidden = !inGameOver;
+    if (inGameOver) {
+      this.gameOverReason.textContent = view.winReason ?? 'Match Concluded';
+    }
+
+    // 3. Sync Declassified X-Ray Replay Scrubber
+    this.replayBar.hidden = !inReplay || !view.replay;
+    if (inReplay && view.replay) {
+      const rep = view.replay;
+      const curEntry = rep.plies[rep.currentPly];
+      this.replayTurnLabel.textContent = `PLY ${rep.currentPly} / ${rep.maxPly}`;
+      this.replayTicker.textContent = curEntry?.summary ?? 'Declassified Log';
+      this.replaySlider.max = String(Math.max(1, rep.maxPly));
+      this.replaySlider.value = String(rep.currentPly);
+      this.replayPlayBtn.textContent = rep.playing ? '❚❚' : '▶';
+      this.replayPlayBtn.dataset['active'] = String(rep.playing);
+    }
+
+    // 4. Sync Active Play Bottom Zone
+    const showPlayBottom = !inArbiter && !inDeploy && !inReplay && !inGameOver;
+    this.bottomZone.hidden = !showPlayBottom;
+    this.bottomZone.dataset['hidden'] = String(!showPlayBottom);
+
+    const navyAlive = Math.max(0, ARMY_PIECE_TOTAL - view.playerCasualties.length);
+    const crimsonAlive = Math.max(0, ARMY_PIECE_TOTAL - view.enemyCasualties.length);
     this.tallyNavyVal.textContent = String(navyAlive);
     this.tallyCrimsonVal.textContent = String(crimsonAlive);
 
-    if (view.cameraMode === 'INSPECT_16') {
+    if (inInspect) {
       this.islandEl.dataset['empty'] = 'false';
       this.islandNameEl.innerHTML = `<span class="island-metal-pip" data-metal="BRASS"></span> 16 RANK RELIEFS`;
       this.islandRuleEl.textContent = '4-Angle Wedge Turnaround & Insignias';
@@ -311,8 +578,7 @@ export class HudController {
 
     const inspectBtn = this.root.querySelector<HTMLButtonElement>('#btn-inspect-16');
     if (inspectBtn) {
-      inspectBtn.textContent =
-        view.cameraMode === 'INSPECT_16' ? 'Back to Board' : '16-Rank Gallery';
+      inspectBtn.textContent = inInspect ? 'Back to Board' : '16-Rank Gallery';
     }
 
     this.syncSeg('#seg-fullscreen button', 'fs', String(this.fullscreenActive));
@@ -342,15 +608,12 @@ export class HudController {
     if (desired && !osFsElement) {
       try {
         if (typeof docEl.requestFullscreen === 'function') {
-          void docEl.requestFullscreen().catch(() => {
-            // In embedded webviews / iOS Safari where OS fullscreen is restricted,
-            // `body.is-fullscreen` still expands `#app-chassis` to 100vw x 100dvh edge-to-edge!
-          });
+          void docEl.requestFullscreen().catch(() => {});
         } else if (typeof docEl.webkitRequestFullscreen === 'function') {
           void docEl.webkitRequestFullscreen();
         }
       } catch {
-        // Fallback to full-viewport CSS expansion already active
+        // Fallback CSS full-bleed already active
       }
     } else if (!desired && osFsElement) {
       try {
@@ -371,6 +634,7 @@ export class HudController {
     this.showcaseOrb.addEventListener('click', () => {
       this.showcaseOpen = !this.showcaseOpen;
       if (this.showcaseOpen) this.optionsOpen = false;
+      this.closeSuspectWheel();
       this.sound.playDrawerSlide(this.showcaseOpen);
       this.render(this.store.getVisibleView(), this.store.getOptions());
     });
@@ -388,14 +652,183 @@ export class HudController {
     this.optionsOrb.addEventListener('click', () => {
       this.optionsOpen = !this.optionsOpen;
       if (this.optionsOpen) this.showcaseOpen = false;
+      this.closeSuspectWheel();
       this.sound.playDrawerSlide(this.optionsOpen);
       this.render(this.store.getVisibleView(), this.store.getOptions());
+    });
+
+    // Dismiss Radial Suspect Wheel when tapping outside it
+    window.addEventListener('pointerdown', (ev) => {
+      if (!this.suspectWheel.hidden && !this.suspectWheel.contains(ev.target as Node)) {
+        this.closeSuspectWheel();
+      }
+    });
+
+    this.suspectWheel.querySelectorAll<HTMLButtonElement>('.suspect-orb').forEach((btn) => {
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const raw = btn.dataset['suspect'] ?? '';
+        const tag = raw ? (raw as SuspectTag) : null;
+        if (this.suspectTargetPieceId) {
+          this.sound.playMagneticSnap();
+          this.sound.vibrate(10);
+          this.store.setEnemySuspectTag(this.suspectTargetPieceId, tag);
+        }
+        this.closeSuspectWheel();
+      });
+    });
+
+    // Mobilization Crate Drawer Controls & Drag-Out Gesture!
+    this.root.querySelector('#btn-dep-auto')?.addEventListener('click', () => {
+      this.sound.playDrawerSlide(true);
+      this.store.autoDeployPlayer();
+    });
+
+    this.root.querySelector('#btn-dep-mirror')?.addEventListener('click', () => {
+      this.sound.playMagneticSnap();
+      this.sound.vibrate(10);
+      this.store.mirrorPlayerDeployment();
+    });
+
+    this.root.querySelector('#btn-dep-clear')?.addEventListener('click', () => {
+      this.sound.playDrawerSlide(false);
+      this.store.clearPlayerDeployment();
+    });
+
+    this.mobilizationDrawer
+      .querySelectorAll<HTMLButtonElement>('[data-dep-preset]')
+      .forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const preset = btn.dataset['depPreset'] as DeploymentPresetId;
+          this.sound.playDrawerSlide(true);
+          this.store.applyDeploymentPreset(preset);
+        });
+      });
+
+    this.saveModeBtn.addEventListener('click', () => {
+      this.sound.playUiClick();
+      this.saveSlotArmed = !this.saveSlotArmed;
+      this.render(this.store.getVisibleView(), this.store.getOptions());
+    });
+
+    this.mobilizationDrawer.querySelectorAll<HTMLButtonElement>('.mob-slot-pill').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const slotIdx = Number(btn.dataset['slot'] ?? 0);
+        const view = this.store.getVisibleView();
+        // Save if Save mode is armed OR if 21/21 deployed and tapping an empty slot!
+        if (this.saveSlotArmed || (view.deployedCount === ARMY_PIECE_TOTAL && !view.savedBlueprintSlots[slotIdx])) {
+          if (this.store.saveBlueprintToSlot(slotIdx)) {
+            this.saveSlotArmed = false;
+            this.sound.playMagneticSnap();
+            this.sound.vibrate(18);
+            this.render(this.store.getVisibleView(), this.store.getOptions());
+          }
+        } else if (this.store.loadBlueprintFromSlot(slotIdx)) {
+          this.sound.playDrawerSlide(true);
+        }
+      });
+    });
+
+    // Rank Chip Tap + Direct Upward Drag-Out into 3D Hologram!
+    this.rankChipContainer
+      .querySelectorAll<HTMLButtonElement>('.crate-rank-chip')
+      .forEach((chip) => {
+        let chipDownId: number | null = null;
+        let sx = 0;
+        let sy = 0;
+        let dragStarted = false;
+
+        chip.addEventListener('pointerdown', (ev: PointerEvent) => {
+          const rank = chip.dataset['rank'] as RankId;
+          const rem = this.store.getVisibleView().unplacedCounts[rank] ?? 0;
+          if (rem <= 0) return;
+          this.sound.unlock();
+          chipDownId = ev.pointerId;
+          sx = ev.clientX;
+          sy = ev.clientY;
+          dragStarted = false;
+        });
+
+        window.addEventListener('pointermove', (ev: PointerEvent) => {
+          if (chipDownId !== ev.pointerId || dragStarted) return;
+          if (Math.hypot(ev.clientX - sx, ev.clientY - sy) > 9) {
+            dragStarted = true;
+            chipDownId = null;
+            const rank = chip.dataset['rank'] as RankId;
+            this.callbacks.onStartCrateDrag(rank, ev.clientX, ev.clientY);
+          }
+        });
+
+        const endChipTouch = (ev: PointerEvent) => {
+          if (chipDownId !== ev.pointerId) return;
+          chipDownId = null;
+          if (!dragStarted) {
+            const rank = chip.dataset['rank'] as RankId;
+            this.sound.playPiecePickup();
+            this.store.selectDeployRank(rank);
+          }
+        };
+        window.addEventListener('pointerup', endChipTouch);
+        window.addEventListener('pointercancel', () => {
+          chipDownId = null;
+        });
+      });
+
+    this.launchBattleBtn.addEventListener('click', () => {
+      if (this.store.launchBattleFromDeployment()) {
+        this.sound.playDrawerSlide(false);
+        this.sound.vibrate([25, 30, 45]);
+      }
+    });
+
+    // Game-Over & Declassified X-Ray Replay Controls
+    const openReplay = () => {
+      this.showcaseOpen = false;
+      this.optionsOpen = false;
+      this.sound.playDrawerSlide(true);
+      this.store.enterDeclassifiedReplay();
+    };
+    this.root.querySelector('#btn-xray-replay')?.addEventListener('click', openReplay);
+    this.root.querySelector('#btn-gameover-replay')?.addEventListener('click', openReplay);
+
+    const startFreshDeploy = () => {
+      this.showcaseOpen = false;
+      this.optionsOpen = false;
+      this.sound.playDrawerSlide(true);
+      this.store.startNewDeployment();
+    };
+    this.root.querySelector('#btn-gameover-new')?.addEventListener('click', startFreshDeploy);
+    this.root.querySelector('#btn-rep-exit')?.addEventListener('click', startFreshDeploy);
+
+    this.replaySlider.addEventListener('input', () => {
+      this.sound.playUiClick();
+      this.store.setReplayPly(Number(this.replaySlider.value));
+    });
+    this.root.querySelector('#btn-rep-start')?.addEventListener('click', () => {
+      this.sound.playUiClick();
+      this.store.setReplayPly(0);
+    });
+    this.root.querySelector('#btn-rep-prev')?.addEventListener('click', () => {
+      this.sound.playUiClick();
+      this.store.stepReplay(-1);
+    });
+    this.replayPlayBtn.addEventListener('click', () => {
+      this.sound.playUiClick();
+      this.store.toggleReplayAutoPlay();
+    });
+    this.root.querySelector('#btn-rep-next')?.addEventListener('click', () => {
+      this.sound.playUiClick();
+      this.store.stepReplay(1);
+    });
+    this.root.querySelector('#btn-rep-end')?.addEventListener('click', () => {
+      this.sound.playUiClick();
+      const maxPly = this.store.getVisibleView().replay?.maxPly ?? 0;
+      this.store.setReplayPly(maxPly);
     });
 
     const onFsChange = () => {
       const doc = document as WebkitDocument;
       const osActive = Boolean(doc.fullscreenElement ?? doc.webkitFullscreenElement);
-      // If user exited OS fullscreen via Esc key, sync state back to framed cleanly
       if (!osActive && this.fullscreenActive) {
         this.fullscreenActive = false;
         document.body.classList.remove('is-fullscreen');
@@ -412,17 +845,18 @@ export class HudController {
     window.addEventListener('keydown', (ev) => {
       if (ev.repeat || ev.ctrlKey || ev.metaKey || ev.altKey) return;
       if (ev.key === 'f' || ev.key === 'F') {
-        this.sound.playSelect();
+        this.sound.playUiClick();
         this.setFullscreenState(!this.fullscreenActive);
-      } else if (ev.key === 'Escape' && this.fullscreenActive) {
-        this.setFullscreenState(false);
+      } else if (ev.key === 'Escape') {
+        this.closeSuspectWheel();
+        if (this.fullscreenActive) this.setFullscreenState(false);
       }
     });
 
     this.root.querySelectorAll<HTMLButtonElement>('#seg-fullscreen button').forEach((b) => {
       b.addEventListener('click', () => {
         const wantFs = b.dataset['fs'] === 'true';
-        this.sound.playSelect();
+        this.sound.playUiClick();
         this.setFullscreenState(wantFs);
       });
     });
@@ -433,28 +867,24 @@ export class HudController {
         this.showcaseOpen = false;
         const verdict = this.store.triggerShowcaseClash(preset);
         if (verdict) {
-          this.onTriggerVerdict(verdict);
+          this.callbacks.onTriggerVerdict(verdict);
         }
       });
     });
 
     this.root.querySelector('#btn-inspect-16')?.addEventListener('click', () => {
-      this.sound.playSelect();
+      this.sound.playUiClick();
       this.showcaseOpen = false;
       const cur = this.store.getVisibleView().cameraMode;
       this.store.setCameraMode(cur === 'INSPECT_16' ? 'PLAY' : 'INSPECT_16');
     });
 
-    this.root.querySelector('#btn-reset-board')?.addEventListener('click', () => {
-      this.sound.playSelect();
-      this.showcaseOpen = false;
-      this.store.resetSandbox();
-    });
+    this.root.querySelector('#btn-reset-board')?.addEventListener('click', startFreshDeploy);
 
     this.root.querySelectorAll<HTMLButtonElement>('#seg-view button').forEach((b) => {
       b.addEventListener('click', () => {
         const boardView = b.dataset['view'] as BoardViewAngle;
-        this.sound.playSelect();
+        this.sound.playUiClick();
         if (this.store.getVisibleView().cameraMode === 'INSPECT_16') {
           this.store.setCameraMode('PLAY');
         }
@@ -466,7 +896,7 @@ export class HudController {
       b.addEventListener('click', () => {
         const era = b.dataset['era'] as AppOptions['eraMode'];
         this.sound.setEraMode(era);
-        this.sound.playSelect();
+        this.sound.playUiClick();
         this.store.updateOptions({ eraMode: era });
       });
     });
@@ -474,7 +904,7 @@ export class HudController {
     this.root.querySelectorAll<HTMLButtonElement>('#seg-speed button').forEach((b) => {
       b.addEventListener('click', () => {
         const speed = b.dataset['speed'] as AppOptions['arbiterSpeed'];
-        this.sound.playSelect();
+        this.sound.playUiClick();
         this.store.updateOptions({ arbiterSpeed: speed });
       });
     });
@@ -482,7 +912,7 @@ export class HudController {
     this.root.querySelectorAll<HTMLButtonElement>('#seg-quality button').forEach((b) => {
       b.addEventListener('click', () => {
         const quality = b.dataset['quality'] as AppOptions['renderQuality'];
-        this.sound.playSelect();
+        this.sound.playUiClick();
         this.store.updateOptions({ renderQuality: quality });
       });
     });
@@ -527,3 +957,7 @@ export class HudController {
     });
   }
 }
+
+const THREE = {
+  ClampCoord: (v: number, min: number, max: number) => Math.max(min, Math.min(max, v)),
+};
