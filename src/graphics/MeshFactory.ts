@@ -816,7 +816,8 @@ export class MeshFactory {
 
   public createCommandWedge(
     faction: Faction,
-    visibleRank: RankId | 'UNKNOWN'
+    visibleRank: RankId | 'UNKNOWN',
+    publicKills = 0
   ): THREE.Group {
     const root = new THREE.Group();
     const isPlayer = faction === 'PLAYER';
@@ -860,6 +861,40 @@ export class MeshFactory {
       emblem.position.set(0, 0.456, 0.126);
       emblem.rotation.x = -THREE.MathUtils.degToRad(22.0);
       root.add(emblem);
+    }
+
+    // PUBLIC VETERAN "GHOST ACE" BATTLE NOTCHES (`publicKills >= 1` — 0% Rank Leak!):
+    // Stamps gleaming 3D diamond kill-pips atop the monolith crown + a menacing crimson/gold
+    // veteran induction ring on `2+` kill survivors so unmarked Enemy Aces become dreaded board bosses!
+    if (publicKills > 0) {
+      const pipCount = Math.min(3, publicKills);
+      const pipGeo = new THREE.OctahedronGeometry(0.042, 0);
+      pipGeo.scale(1.0, 1.35, 0.75);
+      const pipMat = new THREE.MeshBasicMaterial({
+        color: isPlayer ? new THREE.Color(2.3, 1.75, 0.55) : new THREE.Color(2.5, 0.52, 0.38),
+        toneMapped: false,
+      });
+      for (let k = 0; k < pipCount; k++) {
+        const offset = (k - (pipCount - 1) * 0.5) * 0.115;
+        const pip = new THREE.Mesh(pipGeo, pipMat);
+        pip.position.set(offset, 0.935, -0.085);
+        root.add(pip);
+      }
+
+      if (publicKills >= 2) {
+        const aceHaloMat = new THREE.MeshBasicMaterial({
+          color: isPlayer ? new THREE.Color(1.9, 1.45, 0.42) : new THREE.Color(2.3, 0.32, 0.38),
+          transparent: true,
+          opacity: publicKills >= 3 ? 0.72 : 0.45,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          toneMapped: false,
+        });
+        const aceHalo = new THREE.Mesh(new THREE.RingGeometry(0.39, 0.445, 32), aceHaloMat);
+        aceHalo.rotation.x = -Math.PI / 2;
+        aceHalo.position.set(0, 0.012, 0);
+        root.add(aceHalo);
+      }
     }
 
     if (faction === 'ENEMY') {

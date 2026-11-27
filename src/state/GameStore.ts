@@ -12,8 +12,11 @@ import type {
   ArbiterVerdict,
   CameraMode,
   CasualtyView,
+  ClashPublicStakes,
+  DefconTier,
   HudBannerState,
   MoveDirection,
+  PlayerCombatDoctrine,
   PlayerVisibleView,
   TruthPieceRecord,
   ValidMoveTarget,
@@ -22,7 +25,73 @@ import type {
 
 export type StoreListener = (view: PlayerVisibleView, options: Readonly<AppOptions>) => void;
 
-export type ShowcasePreset = 'PLAYER_WIN' | 'ENEMY_WIN' | 'MUTUAL_SPLIT' | 'FLAG_CAPTURE';
+export type ShowcasePreset =
+  | 'PLAYER_WIN'
+  | 'ENEMY_WIN'
+  | 'SPY_INTERCEPT'
+  | 'MUTUAL_SPLIT'
+  | 'FLAG_CAPTURE';
+
+function computePublicClashStakes(
+  playerPiece: Pick<TruthPieceRecord, 'trueRank' | 'challengesWon' | 'row'>,
+  enemyPiece: Pick<TruthPieceRecord, 'challengesWon' | 'hasMoved' | 'row'>,
+  attackerFaction: Faction,
+  totalAlivePieces: number
+): ClashPublicStakes {
+  // ZERO access to `enemyPiece.trueRank`! Purely public & player-owned facts:
+  const pRank = playerPiece.trueRank;
+  const playerDoctrine: PlayerCombatDoctrine =
+    pRank === 'FLAG'
+      ? 'FLAG_LAST_STAND'
+      : pRank === 'SPY'
+        ? 'COVERT_SPY'
+        : pRank === 'GEN_5' ||
+            pRank === 'GEN_4' ||
+            pRank === 'GEN_3' ||
+            pRank === 'GEN_2' ||
+            pRank === 'GEN_1' ||
+            pRank === 'COLONEL'
+          ? 'HIGH_COMMAND'
+          : 'INFANTRY';
+
+  const isEnemyInitiatedAmbush = attackerFaction === 'ENEMY';
+  const enemyUnmovedBackRow = !enemyPiece.hasMoved && enemyPiece.row <= 1;
+
+  let defcon: DefconTier = 3;
+  if (
+    pRank === 'GEN_5' ||
+    pRank === 'GEN_4' ||
+    pRank === 'GEN_3' ||
+    pRank === 'FLAG' ||
+    enemyPiece.challengesWon >= 2 ||
+    enemyUnmovedBackRow ||
+    playerPiece.row >= 7 ||
+    (isEnemyInitiatedAmbush && playerDoctrine === 'HIGH_COMMAND')
+  ) {
+    defcon = 1;
+  } else if (
+    pRank === 'SPY' ||
+    pRank === 'GEN_2' ||
+    pRank === 'GEN_1' ||
+    pRank === 'COLONEL' ||
+    pRank === 'LT_COLONEL' ||
+    pRank === 'MAJOR' ||
+    enemyPiece.challengesWon >= 1 ||
+    isEnemyInitiatedAmbush ||
+    totalAlivePieces <= 16
+  ) {
+    defcon = 2;
+  }
+
+  return {
+    defcon,
+    playerDoctrine,
+    isEnemyInitiatedAmbush,
+    playerPublicKills: playerPiece.challengesWon,
+    enemyPublicKills: enemyPiece.challengesWon,
+    enemyUnmovedBackRow,
+  };
+}
 
 /**
  * Encapsulated State Vault.
@@ -287,7 +356,12 @@ export class GameStore {
     const defender = valid.targetPieceId ? this.#truthPieces.get(valid.targetPieceId) : undefined;
     if (!defender || !defender.alive) return null;
 
-    const verdict = resolveArbiterChallenge({
+    const totalAlive = Array.from(this.#truthPieces.values()).filter((p) => p.alive).length;
+    const playerRec = mover.faction === 'PLAYER' ? mover : defender;
+    const enemyRec = mover.faction === 'ENEMY' ? mover : defender;
+    const stakes = computePublicClashStakes(playerRec, enemyRec, mover.faction, totalAlive);
+
+    const baseVerdict = resolveArbiterChallenge({
       contestedCoord: { col, row },
       attackerId: mover.id,
       attackerFaction: mover.faction,
@@ -296,20 +370,28 @@ export class GameStore {
       defenderFaction: defender.faction,
       defenderTrueRank: defender.trueRank,
     });
+    const verdict: ArbiterVerdict = { ...baseVerdict, stakes };
 
     this.interactionLocked = true;
     this.selectedPieceId = null;
     this.activeClash = verdict;
     this.cameraMode = 'ARBITER';
-    this.banner = 'CLASH LOCK-IN';
+    this.banner =
+      stakes.defcon === 1
+        ? 'DEFCON 1 — HIGH COMMAND ALERT'
+        : stakes.playerDoctrine === 'COVERT_SPY'
+          ? 'OPERATION STILETTO — COVERT STRIKE'
+          : stakes.isEnemyInitiatedAmbush
+            ? 'ENEMY AMBUSH — BRACE!'
+            : 'CLASH LOCK-IN';
     this.emit();
 
     return { kind: 'CLASH', verdict };
   }
 
   /**
-   * Showcase trigger from the collapsible Director Pill so all 4 Arbiter outcomes
-   * (Player Win, Enemy Win, Mutual Split, Flag Capture) can be tested in 1 tap.
+   * Showcase trigger from the collapsible Director Pill so all 5 dramatic Battle Archetypes
+   * (Artillery Win, Enemy Ambush Reversal, Spy Intercept, Delayed Double-KO, Flag Unmasking) can be tested in 1 tap.
    */
   public triggerShowcaseClash(preset: ShowcasePreset): ArbiterVerdict | null {
     if (this.interactionLocked) return null;
@@ -317,7 +399,6 @@ export class GameStore {
       this.cameraMode = 'PLAY';
     }
 
-    // Ensure at least one alive Player piece and one alive Enemy piece exist; reset if depleted
     let playerPiece =
       Array.from(this.#truthPieces.values()).find(
         (p) => p.alive && p.faction === 'PLAYER' && p.trueRank === 'SERGEANT'
@@ -334,20 +415,42 @@ export class GameStore {
       enemyPiece = this.#truthPieces.get('e_00')!;
     }
 
+    let attackerFaction: Faction = 'PLAYER';
+
     if (preset === 'PLAYER_WIN') {
-      playerPiece.trueRank; // keep visible rank authentic
-      // Set enemy truth rank temporarily to a rank defeated by playerPiece (or upgrade player if Flag)
-      const pRank = playerPiece.trueRank === 'FLAG' ? 'SERGEANT' : playerPiece.trueRank;
+      const pRank = playerPiece.trueRank === 'FLAG' ? 'GEN_4' : playerPiece.trueRank;
       (playerPiece as { trueRank: RankId }).trueRank = pRank;
       (enemyPiece as { trueRank: RankId }).trueRank = pRank === 'PRIVATE' ? 'SPY' : 'PRIVATE';
+      attackerFaction = 'PLAYER';
     } else if (preset === 'ENEMY_WIN') {
-      const pRank = playerPiece.trueRank === 'GEN_5' ? 'SERGEANT' : playerPiece.trueRank;
-      (playerPiece as { trueRank: RankId }).trueRank = pRank;
-      (enemyPiece as { trueRank: RankId }).trueRank = pRank === 'SPY' ? 'PRIVATE' : 'GEN_5';
+      // Stage a palm-sweating DEFCON 1 False-Victory Brick-Wall Reversal (Your High Officer walks into a Blooded Enemy Ambush/Counter!)
+      const pOfficer =
+        Array.from(this.#truthPieces.values()).find(
+          (p) => p.alive && p.faction === 'PLAYER' && (p.trueRank === 'GEN_4' || p.trueRank === 'COLONEL')
+        ) ?? playerPiece;
+      playerPiece = pOfficer;
+      if (playerPiece.trueRank === 'GEN_5') {
+        (enemyPiece as { trueRank: RankId }).trueRank = 'SPY';
+      } else {
+        (enemyPiece as { trueRank: RankId }).trueRank = 'GEN_5';
+      }
+      enemyPiece.challengesWon = Math.max(2, enemyPiece.challengesWon);
+      attackerFaction = 'PLAYER'; // Player attacks -> shoves to 84% -> Brick-Wall No-Sell -> Enemy Counter-Obliteration!
+    } else if (preset === 'SPY_INTERCEPT') {
+      const pPvt =
+        Array.from(this.#truthPieces.values()).find(
+          (p) => p.alive && p.faction === 'PLAYER' && p.trueRank === 'PRIVATE'
+        ) ?? playerPiece;
+      playerPiece = pPvt;
+      (playerPiece as { trueRank: RankId }).trueRank = 'PRIVATE';
+      (enemyPiece as { trueRank: RankId }).trueRank = 'SPY';
+      enemyPiece.challengesWon = Math.max(2, enemyPiece.challengesWon);
+      attackerFaction = 'ENEMY'; // Enemy Ghost-Ace Spy ambushes your humble Private -> Brick-Wall Reversal -> SPY INTERCEPTED!
     } else if (preset === 'MUTUAL_SPLIT') {
-      const pRank = playerPiece.trueRank === 'FLAG' ? 'SERGEANT' : playerPiece.trueRank;
+      const pRank = playerPiece.trueRank === 'FLAG' ? 'COLONEL' : playerPiece.trueRank;
       (playerPiece as { trueRank: RankId }).trueRank = pRank;
       (enemyPiece as { trueRank: RankId }).trueRank = pRank;
+      attackerFaction = 'PLAYER';
     } else if (preset === 'FLAG_CAPTURE') {
       const enemyFlag =
         Array.from(this.#truthPieces.values()).find(
@@ -355,24 +458,41 @@ export class GameStore {
         ) ?? enemyPiece;
       (enemyFlag as { trueRank: RankId }).trueRank = 'FLAG';
       enemyPiece = enemyFlag;
+      attackerFaction = 'PLAYER';
     }
 
-    const contestedCoord = { col: enemyPiece.col, row: enemyPiece.row };
-    const verdict = resolveArbiterChallenge({
+    const totalAlive = Array.from(this.#truthPieces.values()).filter((p) => p.alive).length;
+    const stakes = computePublicClashStakes(playerPiece, enemyPiece, attackerFaction, totalAlive);
+
+    const contestedCoord =
+      attackerFaction === 'PLAYER'
+        ? { col: enemyPiece.col, row: enemyPiece.row }
+        : { col: playerPiece.col, row: playerPiece.row };
+
+    const attacker = attackerFaction === 'PLAYER' ? playerPiece : enemyPiece;
+    const defender = attackerFaction === 'PLAYER' ? enemyPiece : playerPiece;
+
+    const baseVerdict = resolveArbiterChallenge({
       contestedCoord,
-      attackerId: playerPiece.id,
-      attackerFaction: 'PLAYER',
-      attackerTrueRank: playerPiece.trueRank,
-      defenderId: enemyPiece.id,
-      defenderFaction: 'ENEMY',
-      defenderTrueRank: enemyPiece.trueRank,
+      attackerId: attacker.id,
+      attackerFaction,
+      attackerTrueRank: attacker.trueRank,
+      defenderId: defender.id,
+      defenderFaction: defender.faction,
+      defenderTrueRank: defender.trueRank,
     });
+    const verdict: ArbiterVerdict = { ...baseVerdict, stakes };
 
     this.interactionLocked = true;
     this.selectedPieceId = null;
     this.activeClash = verdict;
     this.cameraMode = 'ARBITER';
-    this.banner = 'CLASH LOCK-IN';
+    this.banner =
+      stakes.defcon === 1
+        ? 'DEFCON 1 — HIGH COMMAND ALERT'
+        : stakes.isEnemyInitiatedAmbush
+          ? 'ENEMY AMBUSH — BRACE!'
+          : 'CLASH LOCK-IN';
     this.emit();
     return verdict;
   }
@@ -438,6 +558,8 @@ export class GameStore {
         col: record.col,
         row: record.row,
         alive: record.alive,
+        publicKills: record.challengesWon,
+        hasMoved: record.hasMoved,
       });
     }
 

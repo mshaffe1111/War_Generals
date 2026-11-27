@@ -295,7 +295,12 @@ export class SceneManager {
     this.updateCameraTargets('ARBITER');
   }
 
+  public updateCameraForCurrentState(): void {
+    this.updateCameraTargets(this.cameraMode);
+  }
+
   public snapCameraImmediately(): void {
+    this.updateCameraTargets(this.cameraMode);
     this.camCurrentPos.copy(this.camTargetPos);
     this.camCurrentLook.copy(this.camTargetLook);
     this.roomDimFactor = this.targetRoomDimFactor;
@@ -338,9 +343,6 @@ export class SceneManager {
       0.52 * flickerL
     );
 
-    const damp = 1 - Math.exp(-dt * 7.0);
-    this.roomDimFactor = THREE.MathUtils.lerp(this.roomDimFactor, this.targetRoomDimFactor, damp);
-
     this.arbiterStage.update(dt, elapsed);
     this.indicatorLayer.update(elapsed);
 
@@ -365,8 +367,28 @@ export class SceneManager {
       this.selectedPieceLight.intensity = THREE.MathUtils.lerp(this.selectedPieceLight.intensity, 0, pieceSlide);
     }
 
-    const speed = this.cameraMode === 'INSPECT_16' ? 12.0 : 8.5;
-    const camDamp = 1 - Math.exp(-dt * speed);
+    let desiredCamSpeed = this.cameraMode === 'INSPECT_16' ? 12.0 : 8.5;
+    if (this.cameraMode === 'ARBITER') {
+      const rect = this.host.getBoundingClientRect();
+      const aspect = Math.max(0.38, (rect.width || 412) / Math.max(1, rect.height || 915));
+      const shot = this.arbiterStage.getBattleCameraPose(aspect >= 0.88, aspect);
+      this.camTargetPos.copy(shot.pos);
+      this.camTargetLook.copy(shot.look);
+      if (Math.abs(this.camera.fov - shot.fov) > 0.05) {
+        this.camera.fov = THREE.MathUtils.lerp(this.camera.fov, shot.fov, 1 - Math.exp(-dt * 12));
+        this.camera.updateProjectionMatrix();
+      }
+      this.targetRoomDimFactor = shot.roomDim;
+      this.arbiterHeroSpot.color.setHex(shot.redAlertGlow > 0.8 ? 0xff6e54 : 0xffe0b2);
+      desiredCamSpeed = shot.dampSpeed;
+    } else {
+      this.arbiterHeroSpot.color.setHex(0xffe0b2);
+    }
+
+    const damp = 1 - Math.exp(-dt * 9.5);
+    this.roomDimFactor = THREE.MathUtils.lerp(this.roomDimFactor, this.targetRoomDimFactor, damp);
+
+    const camDamp = 1 - Math.exp(-dt * desiredCamSpeed);
     this.camCurrentPos.lerp(this.camTargetPos, camDamp);
     this.camCurrentLook.lerp(this.camTargetLook, camDamp);
 
@@ -405,21 +427,13 @@ export class SceneManager {
     const isLandscape = aspect >= 0.88;
 
     if (mode === 'ARBITER') {
-      const fov = isLandscape
-        ? 39
-        : aspect < 0.52
-          ? THREE.MathUtils.clamp(56 * (0.49 / aspect), 55, 62)
-          : 50;
-      this.camera.fov = fov;
+      const shot = this.arbiterStage.getBattleCameraPose(isLandscape, aspect);
+      this.camera.fov = shot.fov;
       this.camera.updateProjectionMatrix();
-      if (isLandscape) {
-        this.camTargetPos.set(0, 2.75, 1.55);
-        this.camTargetLook.set(0, 0.12, ARBITER_BAY_CENTER_Z - 0.18);
-      } else {
-        this.camTargetPos.set(0, 3.05, 1.95);
-        this.camTargetLook.set(0, 0.14, ARBITER_BAY_CENTER_Z - 0.12);
-      }
-      (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.04, 0.78);
+      this.camTargetPos.copy(shot.pos);
+      this.camTargetLook.copy(shot.look);
+      this.targetRoomDimFactor = shot.roomDim;
+      (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.04, 0.86);
     } else if (mode === 'INSPECT_16') {
       const fov = isLandscape ? 34 : aspect < 0.52 ? 42 : 38;
       this.camera.fov = fov;
@@ -510,26 +524,26 @@ export class SceneManager {
   }
 
   private getOrCreatePieceVisual(p: VisiblePieceView): PieceVisualInstance {
-    const key = `${p.faction}:${p.visibleRank}`;
+    const key = `${p.faction}:${p.visibleRank}:k${p.publicKills}`;
     const existing = this.pieceVisuals.get(p.id);
     if (existing && existing.renderedKey === key) {
       return existing;
     }
+    const prevPos = existing ? existing.group.position.clone() : gridToWorld(p.col, p.row);
     if (existing) {
       this.boardPiecesRoot.remove(existing.group);
     }
 
-    const group = this.factory.createCommandWedge(p.faction, p.visibleRank);
+    const group = this.factory.createCommandWedge(p.faction, p.visibleRank, p.publicKills);
     group.userData['pieceId'] = p.id;
-    const worldPos = gridToWorld(p.col, p.row);
-    group.position.copy(worldPos);
+    group.position.copy(prevPos);
     this.boardPiecesRoot.add(group);
 
     const inst: PieceVisualInstance = {
       id: p.id,
       group,
       renderedKey: key,
-      targetPos: worldPos.clone(),
+      targetPos: gridToWorld(p.col, p.row),
     };
     this.pieceVisuals.set(p.id, inst);
     return inst;
@@ -588,7 +602,12 @@ export class SceneManager {
 
     this.renderer.domElement.addEventListener('pointerdown', (ev: PointerEvent) => {
       this.sound.unlock();
-      if (this.arbiterStage.isBusy || this.cameraMode !== 'PLAY') return;
+      if (this.arbiterStage.isBusy) {
+        // Diegetic Press-and-Hold Overdrive (`2.15x` fast-march during routine skirmishes!)
+        this.arbiterStage.setOverdriveHeld(true);
+        return;
+      }
+      if (this.cameraMode !== 'PLAY') return;
       pointerIdDown = ev.pointerId;
       downX = ev.clientX;
       downY = ev.clientY;
@@ -612,6 +631,7 @@ export class SceneManager {
     });
 
     const clearPointer = (ev: PointerEvent) => {
+      this.arbiterStage.setOverdriveHeld(false);
       if (pointerIdDown !== ev.pointerId) return;
       const wasDrag = draggedCamera;
       pointerIdDown = null;
@@ -647,7 +667,10 @@ export class SceneManager {
           const outcome = this.store.executeMoveOrChallenge(col, row);
           if (outcome) {
             if (outcome.kind === 'MOVED') {
-              this.sound.playMoveSlide();
+              const movedPiece = this.store
+                .getVisibleView()
+                .pieces.find((p) => p.col === col && p.row === row);
+              this.sound.playMoveSlide(movedPiece?.publicKills ?? 0);
             } else {
               this.triggerArbiterSequence(outcome.verdict);
             }
@@ -677,6 +700,7 @@ export class SceneManager {
 
     this.renderer.domElement.addEventListener('pointerup', clearPointer);
     this.renderer.domElement.addEventListener('pointercancel', () => {
+      this.arbiterStage.setOverdriveHeld(false);
       pointerIdDown = null;
       draggedCamera = false;
     });

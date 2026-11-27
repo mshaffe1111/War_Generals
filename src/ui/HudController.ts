@@ -121,9 +121,10 @@ export class HudController {
         <div class="hud-sheet" id="drawer-showcase" hidden>
           <div class="pill-grid">
             <button type="button" class="pill-action" data-preset="PLAYER_WIN" data-tone="gold">Artillery Win</button>
-            <button type="button" class="pill-action" data-preset="ENEMY_WIN" data-tone="crimson">Enemy Strike</button>
-            <button type="button" class="pill-action" data-preset="MUTUAL_SPLIT" data-tone="cyan">Twin Detonation</button>
-            <button type="button" class="pill-action" data-preset="FLAG_CAPTURE" data-tone="gold">Flag Barrage</button>
+            <button type="button" class="pill-action" data-preset="ENEMY_WIN" data-tone="crimson">Ambush Reversal!</button>
+            <button type="button" class="pill-action" data-preset="SPY_INTERCEPT" data-tone="cyan">Spy Intercept!</button>
+            <button type="button" class="pill-action" data-preset="MUTUAL_SPLIT" data-tone="crimson">Delayed Double-KO</button>
+            <button type="button" class="pill-action" data-preset="FLAG_CAPTURE" data-tone="gold">Flag Unmasking</button>
             <button type="button" class="pill-action" id="btn-inspect-16" data-tone="cyan">16-Rank Gallery</button>
             <button type="button" class="pill-action" id="btn-reset-board">Reset Formation</button>
           </div>
@@ -225,9 +226,20 @@ export class HudController {
       this.spatialTitle.textContent = view.banner;
     }
 
-    if (view.banner === 'BATTLE WINNER' || view.banner === 'FLAG CAPTURED — VICTORY') {
+    if (
+      view.banner === 'BATTLE WINNER' ||
+      view.banner === 'SPY INTERCEPTED — VICTORY' ||
+      view.banner === 'FLAG CAPTURED — VICTORY'
+    ) {
       this.spatialHeader.dataset['alert'] = 'gold';
-    } else if (view.banner === 'MUTUAL ELIMINATION' || view.banner === 'FLAG LOST — DEFEAT') {
+    } else if (
+      view.banner === 'MUTUAL ELIMINATION' ||
+      view.banner === 'FLAG LOST — DEFEAT' ||
+      view.banner === 'DEFCON 1 — HIGH COMMAND ALERT' ||
+      view.banner === 'ENEMY AMBUSH — BRACE!' ||
+      view.banner === 'ARMOR DEFLECTED — COUNTER!' ||
+      view.banner === 'TARGET LOCKED — HEARTBEAT'
+    ) {
       this.spatialHeader.dataset['alert'] = 'crimson';
     } else {
       delete this.spatialHeader.dataset['alert'];

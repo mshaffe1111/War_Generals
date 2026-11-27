@@ -33,6 +33,7 @@ export interface TruthPieceRecord {
 /**
  * PLAYER-VISIBLE PIECE PROJECTION.
  * Enemy wedges ALWAYS carry visibleRank: 'UNKNOWN' during active play.
+ * `publicKills` and `hasMoved` are 100% public board history witnessed by both players (0% rank leak).
  */
 export interface VisiblePieceView {
   readonly id: string;
@@ -41,6 +42,8 @@ export interface VisiblePieceView {
   readonly col: number;
   readonly row: number;
   readonly alive: boolean;
+  readonly publicKills: number;
+  readonly hasMoved: boolean;
 }
 
 export interface CasualtyView {
@@ -56,6 +59,26 @@ export type BattleResolutionKind =
   | 'MUTUAL_SPLIT'
   | 'FLAG_CAPTURED_BY_PLAYER'
   | 'FLAG_CAPTURED_BY_ENEMY';
+
+export type DefconTier = 1 | 2 | 3;
+export type PlayerCombatDoctrine =
+  | 'HIGH_COMMAND'
+  | 'COVERT_SPY'
+  | 'INFANTRY'
+  | 'FLAG_LAST_STAND';
+
+/**
+ * 100% Cheat-Proof Public Stakes Metadata (`0.0` bits of `enemy.trueRank`!).
+ * Computed strictly from Player-known rank + public board/kill history BEFORE consulting verdict.
+ */
+export interface ClashPublicStakes {
+  readonly defcon: DefconTier;
+  readonly playerDoctrine: PlayerCombatDoctrine;
+  readonly isEnemyInitiatedAmbush: boolean;
+  readonly playerPublicKills: number;
+  readonly enemyPublicKills: number;
+  readonly enemyUnmovedBackRow: boolean;
+}
 
 /**
  * Rank-blind verdict emitted by the Electronic Arbiter.
@@ -73,6 +96,7 @@ export interface ArbiterVerdict {
   readonly enemyPieceId: string;
   readonly survivorId: string | null;
   readonly survivorFaction: Faction | null;
+  readonly stakes?: ClashPublicStakes;
 }
 
 export type CameraMode = 'PLAY' | 'ARBITER' | 'INSPECT_16';
@@ -94,8 +118,15 @@ export type HudBannerState =
   | 'TACTICAL COMMAND'
   | 'SELECT TARGET'
   | 'CLASH LOCK-IN'
+  | 'DEFCON 1 — HIGH COMMAND ALERT'
+  | 'OPERATION STILETTO — COVERT STRIKE'
+  | 'ENEMY AMBUSH — BRACE!'
   | 'ARBITRATING'
+  | 'TARGET LOCKED — HEARTBEAT'
+  | 'ARMOR DEFLECTED — COUNTER!'
+  | 'TARGET HIT...'
   | 'BATTLE WINNER'
+  | 'SPY INTERCEPTED — VICTORY'
   | 'MUTUAL ELIMINATION'
   | 'FLAG CAPTURED — VICTORY'
   | 'FLAG LOST — DEFEAT'

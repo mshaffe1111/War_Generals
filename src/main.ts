@@ -57,8 +57,9 @@ window.__WAR_GENERALS_STAGE__ = {
     const verdict = store.triggerShowcaseClash(preset);
     if (verdict) {
       sceneManager.triggerArbiterSequence(verdict);
-      sceneManager.snapCameraImmediately();
       sceneManager.arbiterStage.scrubToActTime(actSeconds);
+      sceneManager.updateCameraForCurrentState();
+      sceneManager.snapCameraImmediately();
     }
   },
 };
