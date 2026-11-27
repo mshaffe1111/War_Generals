@@ -37,6 +37,69 @@ interface PieceVisualInstance {
   targetPos: THREE.Vector3;
 }
 
+/**
+ * Full-Viewport Clean-Plate Background Quad (`war_room_backdrop.jpg`, 571x1024):
+ * - Preserves exact `object-fit: cover` aspect framing on `412x915` through `9:16`.
+ * - Smoothly dims cleanly to `35%` brightness (`uBrightness = 0.35`) during Arbiter clashes!
+ */
+function createBackdropPlateMesh(): {
+  mesh: THREE.Mesh;
+  mat: THREE.ShaderMaterial;
+} {
+  const loader = new THREE.TextureLoader();
+  const tex = loader.load('./textures/war_room_backdrop.jpg');
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uMap: { value: tex },
+      uViewAspect: { value: 412 / 915 },
+      uImgAspect: { value: 571 / 1024 },
+      uBrightness: { value: 1.0 },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = vec4(position.xy, 0.9999, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D uMap;
+      uniform float uViewAspect;
+      uniform float uImgAspect;
+      uniform float uBrightness;
+      varying vec2 vUv;
+
+      void main() {
+        vec2 uv = vUv;
+        if (uViewAspect < uImgAspect) {
+          float scale = uViewAspect / uImgAspect;
+          uv.x = (uv.x - 0.5) * scale + 0.5;
+        } else {
+          float scale = uImgAspect / uViewAspect;
+          uv.y = (uv.y - 0.5) * scale + 0.5;
+        }
+
+        vec4 srgb = texture2D(uMap, uv);
+        // Subtle vignette toward extreme corners + pre-exposure scaling for OutputPass ACESFilmic
+        float vig = 1.0 - 0.16 * dot(vUv - 0.5, vUv - 0.5) * 2.0;
+        vec3 linearCol = pow(srgb.rgb, vec3(2.2)) * uBrightness * vig * 0.82;
+        gl_FragColor = vec4(linearCol, 1.0);
+      }
+    `,
+    depthTest: false,
+    depthWrite: false,
+  });
+
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = -1000;
+  return { mesh, mat };
+}
+
 export class SceneManager {
   public readonly renderer: THREE.WebGLRenderer;
   public readonly scene: THREE.Scene;
@@ -51,9 +114,11 @@ export class SceneManager {
   private readonly composer: EffectComposer;
   private readonly bloomPass: UnrealBloomPass;
   private readonly tiltShiftPass: ReturnType<typeof createTabletopTiltShiftPass>;
+  private readonly backdropMat: THREE.ShaderMaterial;
 
-  private readonly keyLight: THREE.DirectionalLight;
-  private readonly rimLight: THREE.DirectionalLight;
+  private readonly tabletopKeySpot: THREE.SpotLight;
+  private readonly slateFrontFill: THREE.DirectionalLight;
+  private readonly warmBackRim: THREE.DirectionalLight;
   private readonly ambientFill: THREE.HemisphereLight;
   private readonly arbiterHeroSpot: THREE.SpotLight;
   private readonly warRoom: WarRoomEnvironmentRefs;
@@ -67,12 +132,14 @@ export class SceneManager {
   private readonly casualtyVisuals = new Map<string, THREE.Group>();
 
   private cameraMode: CameraMode = 'PLAY';
-  private readonly camCurrentPos = new THREE.Vector3(0, 17.6, 15.8);
-  private readonly camCurrentLook = new THREE.Vector3(0, -0.25, -0.75);
-  private readonly camTargetPos = new THREE.Vector3(0, 17.6, 15.8);
-  private readonly camTargetLook = new THREE.Vector3(0, -0.25, -0.75);
+  private readonly camCurrentPos = new THREE.Vector3(0, 21.5, 11.2);
+  private readonly camCurrentLook = new THREE.Vector3(0, -0.2, -0.45);
+  private readonly camTargetPos = new THREE.Vector3(0, 21.5, 11.2);
+  private readonly camTargetLook = new THREE.Vector3(0, -0.2, -0.45);
   private roomDimFactor = 1.0;
   private targetRoomDimFactor = 1.0;
+  private plateBrightness = 1.0;
+  private targetPlateBrightness = 1.0;
 
   private readonly clock = new THREE.Clock();
   private totalElapsed = 0;
@@ -91,54 +158,60 @@ export class SceneManager {
     });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2.5));
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.12;
+    this.renderer.toneMappingExposure = 1.02;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // Guardrail #3: Enable local clipping (scoped strictly to Arbiter well meshes!)
+    this.renderer.localClippingEnabled = true;
     this.host.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color('#0c0a09');
-    this.scene.fog = new THREE.FogExp2('#0e0b09', 0.022);
 
-    // Warm procedural studio + dual tent-lantern HDRI via PMREMGenerator
+    // High-contrast warm RoomEnvironment + lantern HDRI via PMREMGenerator
     this.scene.environment = createStudioLanternEnvMap(this.renderer);
 
-    this.camera = new THREE.PerspectiveCamera(50, 9 / 16, 0.25, 85);
+    // Guardrail #1: Clean-plate `war_room_backdrop.jpg` background quad
+    const backdrop = createBackdropPlateMesh();
+    this.backdropMat = backdrop.mat;
+    this.scene.add(backdrop.mesh);
+
+    this.camera = new THREE.PerspectiveCamera(40, 9 / 16, 0.25, 95);
     this.camera.position.copy(this.camCurrentPos);
     this.camera.lookAt(this.camCurrentLook);
 
-    // Tightly frustum-fitted 2048x2048 tabletop Directional Key Light (calibrated < bloom threshold!)
-    this.keyLight = new THREE.DirectionalLight(0xffeed8, 1.55);
-    this.keyLight.position.set(5.2, 13.5, 8.2);
-    this.keyLight.castShadow = true;
-    this.keyLight.shadow.mapSize.set(2048, 2048);
-    this.keyLight.shadow.camera.near = 2.0;
-    this.keyLight.shadow.camera.far = 32.0;
-    this.keyLight.shadow.camera.left = -6.8;
-    this.keyLight.shadow.camera.right = 6.8;
-    this.keyLight.shadow.camera.top = 7.8;
-    this.keyLight.shadow.camera.bottom = -8.2;
-    this.keyLight.shadow.bias = -0.0004;
-    this.keyLight.shadow.normalBias = 0.018;
-    this.scene.add(this.keyLight);
+    // 1. Warm 3200K Overhead Tabletop Key SpotLight (`2048x2048` soft shadows onto ShadowMaterial plane!)
+    this.tabletopKeySpot = new THREE.SpotLight(0xffe3be, 2.65, 58, Math.PI / 3.1, 0.58, 0.35);
+    this.tabletopKeySpot.position.set(3.2, 21.5, 6.8);
+    this.tabletopKeySpot.target.position.set(0, -0.35, -0.45);
+    this.tabletopKeySpot.castShadow = true;
+    this.tabletopKeySpot.shadow.mapSize.set(2048, 2048);
+    this.tabletopKeySpot.shadow.camera.near = 8.0;
+    this.tabletopKeySpot.shadow.camera.far = 38.0;
+    this.tabletopKeySpot.shadow.bias = -0.00035;
+    this.tabletopKeySpot.shadow.normalBias = 0.016;
+    this.scene.add(this.tabletopKeySpot, this.tabletopKeySpot.target);
 
-    // Cool steel rim light to sculpt chamfered edges on Navy & Crimson wedges
-    this.rimLight = new THREE.DirectionalLight(0x9ec6f0, 0.72);
-    this.rimLight.position.set(-7.5, 9.5, -6.5);
-    this.scene.add(this.rimLight);
+    // 2. Cool-Slate Front Fill Light sculpting the `68 deg` front wedge bevels & 72% metallic reliefs
+    this.slateFrontFill = new THREE.DirectionalLight(0xa2c0e2, 0.92);
+    this.slateFrontFill.position.set(-2.5, 9.5, 13.5);
+    this.scene.add(this.slateFrontFill);
 
-    this.ambientFill = new THREE.HemisphereLight(0xffe8cc, 0x18202c, 0.52);
+    // 3. Warm Back-Rim Kicker sculpting chamfered slate tile edges, brass collars & wedge top caps
+    this.warmBackRim = new THREE.DirectionalLight(0xffb464, 1.05);
+    this.warmBackRim.position.set(4.5, 8.5, -12.5);
+    this.scene.add(this.warmBackRim);
+
+    this.ambientFill = new THREE.HemisphereLight(0xffebd2, 0x1e2838, 0.48);
     this.scene.add(this.ambientFill);
 
-    // Dedicated warm hero spotlight (shadow-free so the elevated winning wedge never casts a dark shadow onto the CRT!)
-    this.arbiterHeroSpot = new THREE.SpotLight(0xffe4bc, 0.0, 20, Math.PI / 3.2, 0.65, 1.3);
+    // Dedicated warm hero spotlight focused on the Electronic Arbiter during clashes
+    this.arbiterHeroSpot = new THREE.SpotLight(0xffe4bc, 0.0, 22, Math.PI / 3.2, 0.65, 1.25);
     this.arbiterHeroSpot.castShadow = false;
-    this.arbiterHeroSpot.position.set(0, 7.2, 1.2);
-    this.arbiterHeroSpot.target.position.set(0, 0.1, ARBITER_BAY_CENTER_Z + 0.6);
+    this.arbiterHeroSpot.position.set(0, 7.4, 1.4);
+    this.arbiterHeroSpot.target.position.set(0, 0.12, ARBITER_BAY_CENTER_Z + 0.55);
     this.scene.add(this.arbiterHeroSpot, this.arbiterHeroSpot.target);
 
-    // Build 3D World: War-Room Backdrop, Walnut 9x8 Cabinet, 16-Emblem Inspection Stage, Electronic Arbiter
     this.factory = new MeshFactory();
     this.warRoom = this.factory.createWarRoomEnvironment();
     this.scene.add(this.warRoom.root);
@@ -153,12 +226,10 @@ export class SceneManager {
     this.scene.add(this.boardPiecesRoot);
     this.scene.add(this.casualtyPiecesRoot);
 
-    // Load Blender-baked `.glb` shutter mesh asynchronously and attach cleanly
     void this.factory.preloadBakedModels().then(() => {
       this.arbiterStage.attachBakedShutterIfReady();
     });
 
-    // Post-Processing Pipeline: RenderPass -> UnrealBloomPass(0.82, 0.55, 0.35) -> OutputPass -> TiltShiftDoFPass
     const initRect = this.host.getBoundingClientRect();
     const w = Math.max(1, initRect.width || 412);
     const h = Math.max(1, initRect.height || 915);
@@ -166,9 +237,7 @@ export class SceneManager {
     this.composer = new EffectComposer(this.renderer);
     this.composer.addPass(new RenderPass(this.scene, this.camera));
 
-    // Selective Bloom (`threshold: 1.18`) so ONLY HDR emissive rings, tubes, CRT, and sparks glow—
-    // NEVER washing out oiled walnut, parchment maps, cobalt-navy wedges, or silver/brass reliefs!
-    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.42, 0.3, 1.18);
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.38, 0.28, 1.58);
     this.composer.addPass(this.bloomPass);
 
     this.composer.addPass(new OutputPass());
@@ -184,7 +253,6 @@ export class SceneManager {
   }
 
   public syncFromStore(view: PlayerVisibleView, options: Readonly<AppOptions>): void {
-    // 1. Apply render quality & DPR
     const maxDpr = options.renderQuality === 'ULTRA' ? 2.5 : 1.5;
     const desiredDpr = Math.min(window.devicePixelRatio || 1, maxDpr);
     if (Math.abs(this.renderer.getPixelRatio() - desiredDpr) > 0.01) {
@@ -194,13 +262,13 @@ export class SceneManager {
     this.tiltShiftPass.enabled =
       options.renderQuality === 'ULTRA' && view.cameraMode !== 'INSPECT_16';
 
-    // 2. Camera preset & room light dimming (55% dim during Electronic Arbiter battle!)
     this.cameraMode = view.cameraMode;
     this.updateCameraTargets(view.cameraMode);
-    this.targetRoomDimFactor = view.cameraMode === 'ARBITER' ? 0.45 : 1.0;
 
-    // 3. Sync alive board wedges (hide non-clashing board wedges during Arbiter hero close-up so
-    //    the foreground Attack Medallion is 100% unobstructed matching `ref_battle_act1..3.webp`!)
+    // Guardrail #1: Dim `war_room_backdrop.jpg` cleanly to 35% brightness during Arbiter clashes!
+    this.targetRoomDimFactor = view.cameraMode === 'ARBITER' ? 0.45 : 1.0;
+    this.targetPlateBrightness = view.cameraMode === 'ARBITER' ? 0.35 : 1.0;
+
     this.boardPiecesRoot.visible = view.cameraMode !== 'ARBITER';
     const activeIds = new Set<string>();
     const clashingIds = new Set<string>();
@@ -223,11 +291,9 @@ export class SceneManager {
       }
     }
 
-    // 4. Sync Velvet Casualty Wells (Player = Left Navy Well, Enemy = Right Crimson Well face-down!)
     this.syncCasualties(view.playerCasualties, 'LEFT');
     this.syncCasualties(view.enemyCasualties, 'RIGHT');
 
-    // 5. Sync glowing cyan move outlines/arrows & pulsing crimson-gold saber reticles
     const selectedPiece = view.selectedPieceId
       ? view.pieces.find((p) => p.id === view.selectedPieceId)
       : undefined;
@@ -238,17 +304,11 @@ export class SceneManager {
     );
   }
 
-  /**
-   * Starts the 3-Act Electronic Arbiter choreography on the 3D stage and places
-   * the heavy brushed-brass Attack Medallion in the hero foreground square `(col=4, row=0)`.
-   */
   public triggerArbiterSequence(verdict: ArbiterVerdict): void {
     const playerVisual = this.pieceVisuals.get(verdict.playerPieceId);
     const enemyVisual = this.pieceVisuals.get(verdict.enemyPieceId);
 
-    const pOrigin = playerVisual
-      ? playerVisual.group.position.clone()
-      : gridToWorld(4, 4);
+    const pOrigin = playerVisual ? playerVisual.group.position.clone() : gridToWorld(4, 4);
     const eOrigin = enemyVisual
       ? enemyVisual.group.position.clone()
       : gridToWorld(verdict.contestedCoord.col, verdict.contestedCoord.row);
@@ -264,12 +324,8 @@ export class SceneManager {
       () => this.store.finalizeActiveClash()
     );
 
-    // Position the heavy chamfered Attack Medallion on the foreground ceremonial challenge tile
-    // right in front of the Electronic Arbiter so every battle matches `ref_battle_act1..3.jpg`!
     const ceremonialSq = gridToWorld(4, 0);
     this.arbiterStage.worldMedallionGroup.position.set(ceremonialSq.x, 0, ceremonialSq.z);
-
-    // Snap camera smoothly into the Arbiter close-up
     this.updateCameraTargets('ARBITER');
   }
 
@@ -277,6 +333,7 @@ export class SceneManager {
     this.camCurrentPos.copy(this.camTargetPos);
     this.camCurrentLook.copy(this.camTargetLook);
     this.roomDimFactor = this.targetRoomDimFactor;
+    this.plateBrightness = this.targetPlateBrightness;
     this.applyLightingAndCamera();
   }
 
@@ -298,31 +355,29 @@ export class SceneManager {
   }
 
   private stepFrame(dt: number, elapsed: number): void {
-    // 1. Live pocket watch ticking second hand + subtle 2700K Perlin-like oil lantern flicker!
-    const discreteSec = Math.floor(elapsed);
-    const tickFrac = Math.min(1, (elapsed - discreteSec) * 8);
-    this.warRoom.watchSecondHand.rotation.y = -((discreteSec + tickFrac) / 60) * Math.PI * 2;
-
     const flickerL =
-      1.0 + 0.08 * Math.sin(elapsed * 7.3) + 0.05 * Math.sin(elapsed * 17.9 + 1.2);
+      1.0 + 0.08 * Math.sin(elapsed * 7.1) + 0.05 * Math.sin(elapsed * 17.3 + 1.2);
     const flickerR =
-      1.0 + 0.07 * Math.cos(elapsed * 6.4 + 0.7) + 0.05 * Math.sin(elapsed * 15.1);
-    this.warRoom.lanternLightLeft.intensity = 3.6 * flickerL * (0.7 + 0.3 * this.roomDimFactor);
-    this.warRoom.lanternLightRight.intensity = 3.2 * flickerR * (0.7 + 0.3 * this.roomDimFactor);
+      1.0 + 0.07 * Math.cos(elapsed * 6.3 + 0.7) + 0.05 * Math.sin(elapsed * 14.9);
+    this.warRoom.lanternLightLeft.intensity = 6.5 * flickerL * this.roomDimFactor;
+    this.warRoom.lanternLightRight.intensity = 5.8 * flickerR * this.roomDimFactor;
 
-    // 2. Smoothly damp room lighting dim (55% dim during battle!) & hero spot
-    const damp = 1 - Math.exp(-dt * 6.5);
+    const damp = 1 - Math.exp(-dt * 7.0);
     this.roomDimFactor = THREE.MathUtils.lerp(this.roomDimFactor, this.targetRoomDimFactor, damp);
+    this.plateBrightness = THREE.MathUtils.lerp(
+      this.plateBrightness,
+      this.targetPlateBrightness,
+      damp
+    );
+
     this.arbiterStage.update(dt, elapsed);
     this.indicatorLayer.update(elapsed);
 
-    // 3. Smoothly slide board pieces to target grid coordinates
     const pieceSlide = 1 - Math.exp(-dt * 14.0);
     for (const inst of this.pieceVisuals.values()) {
       inst.group.position.lerp(inst.targetPos, pieceSlide);
     }
 
-    // 4. Smoothly damp camera position & lookAt target (fast crisp lock for gallery/arbiter cuts)
     const speed = this.cameraMode === 'INSPECT_16' ? 14.0 : 8.5;
     const camDamp = 1 - Math.exp(-dt * speed);
     this.camCurrentPos.lerp(this.camTargetPos, camDamp);
@@ -333,48 +388,67 @@ export class SceneManager {
   }
 
   private applyLightingAndCamera(): void {
-    this.keyLight.intensity = 1.55 * this.roomDimFactor;
-    this.rimLight.intensity = 0.72 * this.roomDimFactor;
-    this.ambientFill.intensity = 0.52 * this.roomDimFactor;
-    this.arbiterHeroSpot.intensity = (1 - this.roomDimFactor) * 15.5;
+    this.tabletopKeySpot.intensity = 1.65 * this.roomDimFactor;
+    this.slateFrontFill.intensity = 0.55 * this.roomDimFactor;
+    this.warmBackRim.intensity = 0.65 * this.roomDimFactor;
+    this.ambientFill.intensity = 0.36 * this.roomDimFactor;
+    this.arbiterHeroSpot.intensity = (1 - this.roomDimFactor) * 4.2;
+    this.backdropMat.uniforms['uBrightness']!.value = this.plateBrightness;
 
     const shake = this.arbiterStage.getCameraShakeOffset();
     this.camera.position.copy(this.camCurrentPos).add(shake);
     this.camera.lookAt(this.camCurrentLook);
   }
 
+  /**
+   * Analytical Viewport Framing:
+   * In `PLAY` mode, solves exact camera distance `R` from viewport `aspect` so the oiled walnut
+   * board (`width = 10.56`) spans **93.5% of viewport width** (`92%–95%`) and **63%–67% of 9:16 height**
+   * dead-center horizontally with zero wasted dead space!
+   */
   private updateCameraTargets(mode: CameraMode): void {
     const rect = this.host.getBoundingClientRect();
     const aspect = Math.max(0.38, (rect.width || 412) / Math.max(1, rect.height || 915));
 
     if (mode === 'ARBITER') {
-      // Calibrated for `412x915` (`0.45` aspect) through `9:16` (`0.5625`):
-      // Frames the foreground Attack Medallion at bottom-third, BOTH full clashing wedges,
-      // ALL 4 Fresnel domes, BOTH flanking Vacuum-Tube VU meters, and the inner casualty wells!
-      const fov = aspect < 0.52 ? THREE.MathUtils.clamp(55 * (0.48 / aspect), 54, 60) : 50;
+      const fov = aspect < 0.52 ? THREE.MathUtils.clamp(54 * (0.48 / aspect), 53, 59) : 50;
       this.camera.fov = fov;
       this.camera.updateProjectionMatrix();
-      this.camTargetPos.set(0, 4.85, 2.35);
-      this.camTargetLook.set(0, 0.16, ARBITER_BAY_CENTER_Z + 0.35);
+      this.camTargetPos.set(0, 4.75, 2.3);
+      this.camTargetLook.set(0, 0.14, ARBITER_BAY_CENTER_Z + 0.32);
       (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.03, 0.78);
     } else if (mode === 'INSPECT_16') {
-      // Macro studio gallery framing ALL 4 columns × 5 rows (`4-angle turnaround` + `16 metallic reliefs`)
-      // cleanly inside `412x915` with zero side clipping and zero bottom HUD overlap!
       const fov = aspect < 0.52 ? THREE.MathUtils.clamp(47 * (0.48 / aspect), 47, 52) : 44;
       this.camera.fov = fov;
       this.camera.updateProjectionMatrix();
-      this.camTargetPos.set(INSPECT_STAGE_ORIGIN.x, 12.35, INSPECT_STAGE_ORIGIN.z + 5.75);
+      this.camTargetPos.set(INSPECT_STAGE_ORIGIN.x, 12.2, INSPECT_STAGE_ORIGIN.z + 5.7);
       this.camTargetLook.set(INSPECT_STAGE_ORIGIN.x, 0.1, INSPECT_STAGE_ORIGIN.z - 0.35);
-      (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.0, 1.0);
+      (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.02, 0.98);
     } else {
-      // Default 9:16 Tabletop Command Perspective (`ref_gameplay_main.jpg`):
-      // Fits all 4 outer beveled walnut rails + oak table margins cleanly inside `412x915`!
-      const fov = aspect < 0.52 ? THREE.MathUtils.clamp(52 * (0.49 / aspect), 52, 58) : 50;
-      this.camera.fov = fov;
+      // Analytical `93.5%` horizontal width solver (`92%–95%` target!):
+      const fovDeg = 40;
+      this.camera.fov = fovDeg;
       this.camera.updateProjectionMatrix();
-      this.camTargetPos.set(0, 18.6, 15.6);
-      this.camTargetLook.set(0, -0.35, -0.7);
-      (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.06, 0.82);
+
+      const halfFovRad = THREE.MathUtils.degToRad(fovDeg * 0.5);
+      const pitchRad = THREE.MathUtils.degToRad(62.5);
+      const targetWidthOccupancy = 0.935; // 93.5% of viewport width!
+      const boardOuterWidth = 10.56;
+      const frontViewWidth = boardOuterWidth / targetWidthOccupancy;
+
+      // Distance to front widest edge (`z = +5.55` vs lookAt `z = -0.35`, deltaZ = 5.90)
+      const rFront = frontViewWidth / (2 * Math.tan(halfFovRad) * aspect);
+      const rCenter = rFront + 5.9 * Math.cos(pitchRad);
+
+      const lookY = -0.22;
+      const lookZ = -0.35;
+      this.camTargetLook.set(0, lookY, lookZ);
+      this.camTargetPos.set(
+        0,
+        lookY + rCenter * Math.sin(pitchRad),
+        lookZ + rCenter * Math.cos(pitchRad)
+      );
+      (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.05, 0.84);
     }
   }
 
@@ -410,7 +484,6 @@ export class SceneManager {
       const key = `${side}:${item.id}`;
       if (this.casualtyVisuals.has(key)) continue;
 
-      // Enemy casualties rest face-down (`visibleRank: 'UNKNOWN'`) at organic angles in the crimson velvet well!
       const wedge = this.factory.createCommandWedge(item.faction, item.visibleRank);
       wedge.scale.setScalar(0.76);
 
@@ -425,7 +498,6 @@ export class SceneManager {
 
       wedge.position.set(wellCenter.x + ox, wellCenter.y + oy, wellCenter.z + oz);
       if (item.faction === 'ENEMY') {
-        // Face-down in crimson velvet so rank stays strictly unrevealed!
         wedge.rotation.set(Math.PI / 2 - 0.35, Math.sin(idx * 1.7) * 0.4, 0.12);
       } else {
         wedge.rotation.set(-Math.PI / 2 + 0.42, Math.cos(idx * 1.3) * 0.35, -0.1);
@@ -462,7 +534,6 @@ export class SceneManager {
 
       raycaster.setFromCamera(ndc, this.camera);
 
-      // 1. Check direct hit on a 3D Command Wedge first for generous touch ergonomics
       const hits = raycaster.intersectObjects(this.boardPiecesRoot.children, true);
       let hitPieceId: string | null = null;
       if (hits.length > 0) {
@@ -476,13 +547,11 @@ export class SceneManager {
         }
       }
 
-      // 2. Also intersect y = 0 board plane for empty-tile or adjacent-enemy challenge taps
       if (raycaster.ray.intersectPlane(this.raycastPlane, hitPoint)) {
         const col = Math.round(hitPoint.x / TILE_PITCH + (BOARD_COLS - 1) / 2);
         const row = Math.round((hitPoint.z - GRID_CENTER_Z) / TILE_PITCH + (BOARD_ROWS - 1) / 2);
 
         if (col >= 0 && col < BOARD_COLS && row >= 0 && row < BOARD_ROWS) {
-          // If tapping a valid move or challenge target of the currently selected piece, execute it!
           const outcome = this.store.executeMoveOrChallenge(col, row);
           if (outcome) {
             if (outcome.kind === 'MOVED') {
@@ -493,7 +562,6 @@ export class SceneManager {
             return;
           }
 
-          // Otherwise check if a player piece sits on `(col, row)` or was hit directly
           const view = this.store.getVisibleView();
           const tilePlayerPiece = view.pieces.find(
             (p) => p.faction === 'PLAYER' && p.col === col && p.row === row
@@ -522,6 +590,7 @@ export class SceneManager {
     const h = Math.max(1, Math.floor(rect.height));
 
     this.camera.aspect = w / h;
+    this.backdropMat.uniforms['uViewAspect']!.value = w / h;
     this.updateCameraTargets(this.cameraMode);
     this.camera.updateProjectionMatrix();
 
