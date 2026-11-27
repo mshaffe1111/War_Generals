@@ -1,6 +1,6 @@
-import { BOARD_COLS, BOARD_ROWS, ORDERED_RANKS, RANK_SPECS, type RankId } from '../core/ranks';
+import { BOARD_COLS, BOARD_ROWS, ORDERED_RANKS, RANK_SPECS, type Faction, type RankId } from '../core/ranks';
 import { resolveClash } from '../core/RulesEngine';
-import type { GridCoord } from '../core/types';
+import type { AudioEraMode, DifficultyTier, GridCoord } from '../core/types';
 import {
   getCommanderProfile,
   type CommanderId,
@@ -125,6 +125,8 @@ export class BeliefMatrixAI {
   private designatedBluffRunnerId: string | null = null;
   /** Designated motionless Row-0 `FIVE_STAR` decoy pretending to be the AI Flag */
   private designatedBackRankDecoyId: string | null = null;
+  /** Anti-oscillation origin square memory (`pieceId -> previous square`) to prevent sterile 2-tile shuffling */
+  private readonly lastVacatedSquare = new Map<string, GridCoord>();
 
   /**
    * Initializes the `21 × 15` Belief Matrix strictly from public initial coordinates `(row, col)`.
@@ -137,6 +139,7 @@ export class BeliefMatrixAI {
     this.possibleMask.clear();
     this.meta.clear();
     this.exposedAIHighOfficerIds.clear();
+    this.lastVacatedSquare.clear();
     this.designatedBluffRunnerId = null;
     this.designatedBackRankDecoyId = null;
 
@@ -543,18 +546,117 @@ export class BeliefMatrixAI {
   }
 
   /**
-   * Selects the optimal move for `commanderId` via **2-to-3 Ply Information-Set Expectimax**
-   * over sampled worlds from the `21 × 15` Belief Matrix + Active Psychological Bluffing (§3).
+   * Applies non-cheating **Bayesian Memory Decay** for lower Difficulty Tiers (§2):
+   * - `RECRUIT`: `40%` memory decay per turn (forgets older clashes/deductions like a casual human!)
+   * - `OFFICER`: `15%` memory decay (`85%` retention)
+   * - `GENERAL` & `SUPREME_MARSHAL`: `0%` decay (`100%` lossless Sinkhorn-Knopp memory!)
+   */
+  public applyTurnMemoryDecay(decayFraction: number): void {
+    if (decayFraction <= 0) return;
+    const keep = Math.max(0, Math.min(1, 1.0 - decayFraction));
+    for (const [id, m] of this.meta.entries()) {
+      if (!m.alive) continue;
+      const vec = this.matrix.get(id)!;
+      const mask = this.possibleMask.get(id)!;
+      for (let r = 0; r < NUM_RANKS; r++) {
+        const uniformPrior = RANK_SPECS[ORDERED_RANKS[r]!].countPerArmy / 21;
+        if (decayFraction >= 0.35) {
+          // Casual Recruit forgets older eliminations partially too
+          mask[r] = 1;
+        }
+        if (mask[r]) {
+          vec[r] = vec[r]! * keep + uniformPrior * (1.0 - keep);
+        }
+      }
+    }
+    this.runSinkhornKnopp(decayFraction >= 0.35 ? 6 : 12);
+  }
+
+  /**
+   * Records the AI's own committed move origin so consecutive turns avoid sterile `A -> B -> A` oscillation.
+   */
+  public recordOwnMoveOrigin(pieceId: string, from: GridCoord): void {
+    this.lastVacatedSquare.set(pieceId, { col: from.col, row: from.row });
+  }
+
+  /**
+   * Selects the optimal move for `commanderId` scaled strictly by `difficulty` & `eraMode` (§2–3):
+   * - `RECRUIT`: 1-ply search, 40% Bayesian memory decay/turn, zero bluffs
+   * - `OFFICER`: 2-ply Expectimax, 85% memory retention
+   * - `GENERAL`: Lossless 21×15 Sinkhorn memory, Spy-Private escorting & decoy bluffs
+   * - `SUPREME_MARSHAL`: 3-ply Information-Set Expectimax + Monte Carlo world rollouts + 1970s back-row bluff baiting!
    */
   public chooseCommanderMove(
     aiUnits: readonly AIOwnUnitState[],
     playerUnits: readonly ObservedPlayerUnitState[],
     commanderId: CommanderId,
     turnNumber: number,
-    rng: () => number = Math.random
+    options: {
+      difficulty?: DifficultyTier;
+      eraMode?: AudioEraMode;
+      aiFaction?: Faction;
+      rng?: () => number;
+    } = {}
   ): AIMoveDecision | null {
+    const difficulty = options.difficulty ?? 'GENERAL';
+    const eraMode = options.eraMode ?? '1980s';
+    const aiFaction = options.aiFaction ?? 'ENEMY';
+    const rng = options.rng ?? Math.random;
+
+    // Apply Difficulty Memory Retention Curve (0% cheat!)
+    if (difficulty === 'RECRUIT') {
+      this.applyTurnMemoryDecay(0.4);
+    } else if (difficulty === 'OFFICER') {
+      this.applyTurnMemoryDecay(0.15);
+    }
+
     const commander = getCommanderProfile(commanderId);
-    const W = commander.weights;
+    const baseW = commander.weights;
+    const effDepth: 1 | 2 | 3 =
+      difficulty === 'RECRUIT'
+        ? 1
+        : difficulty === 'OFFICER'
+          ? 2
+          : difficulty === 'SUPREME_MARSHAL'
+            ? 3
+            : baseW.searchDepth;
+    const effSamples =
+      difficulty === 'RECRUIT'
+        ? 1
+        : difficulty === 'OFFICER'
+          ? 4
+          : difficulty === 'SUPREME_MARSHAL'
+            ? 12
+            : baseW.worldSamples;
+    const effBluffMul =
+      difficulty === 'RECRUIT'
+        ? 0.0
+        : difficulty === 'OFFICER'
+          ? 0.45
+          : difficulty === 'SUPREME_MARSHAL'
+            ? 1.35
+            : 1.0;
+    const effNoise =
+      difficulty === 'RECRUIT'
+        ? Math.max(baseW.decisionNoise, 8.5)
+        : difficulty === 'OFFICER'
+          ? Math.max(baseW.decisionNoise, 3.2)
+          : difficulty === 'SUPREME_MARSHAL'
+            ? Math.min(baseW.decisionNoise, 0.25)
+            : baseW.decisionNoise;
+
+    const W: CommanderUtilityWeights = {
+      ...baseW,
+      worldSamples: effSamples,
+      decisionNoise: effNoise,
+      bluffRate: baseW.bluffRate * effBluffMul,
+    };
+
+    const forwardDr = aiFaction === 'ENEMY' ? 1 : -1;
+    const ownBackRow = aiFaction === 'ENEMY' ? 0 : BOARD_ROWS - 1;
+    const oppBackRow = aiFaction === 'ENEMY' ? BOARD_ROWS - 1 : 0;
+    const spearheadCrossed = (r: number) =>
+      aiFaction === 'ENEMY' ? r >= AI_SPEARHEAD_CROSS_ROW : r <= 4;
 
     const aiByCoord = new Map<string, AIOwnUnitState>();
     for (const a of aiUnits) aiByCoord.set(`${a.col},${a.row}`, a);
@@ -564,19 +666,20 @@ export class BeliefMatrixAI {
 
     const aiFlag = aiUnits.find((a) => a.ownRank === 'FLAG');
     const dirs = [
-      { dc: 0, dr: 1 }, // Advance south toward Player home row 7!
+      { dc: 0, dr: forwardDr },
       { dc: -1, dr: 0 },
       { dc: 1, dr: 0 },
-      { dc: 0, dr: -1 },
+      { dc: 0, dr: -forwardDr },
     ];
 
-    // 1. Enumerate all legal root AI moves and compute 1-ply Bayesian Heuristic + Psychological Bluff priors
     const rootCandidates: Array<{
       decision: AIMoveDecision;
       priorScore: number;
     }> = [];
 
     for (const unit of aiUnits) {
+      const lastVacated = this.lastVacatedSquare.get(unit.id);
+
       for (const d of dirs) {
         const nc = unit.col + d.dc;
         const nr = unit.row + d.dr;
@@ -587,16 +690,21 @@ export class BeliefMatrixAI {
         let prior = (rng() - 0.5) * W.decisionNoise;
         let isBluff = false;
 
-        // Psychological Bluff #1: Motionless `FIVE_STAR` parked on AI back rank (`row 0`) pretending to be AI Flag!
+        // Prevent sterile 2-square oscillation (`A -> B -> A`) on quiet moves
+        if (!targetPlayer && lastVacated && lastVacated.col === nc && lastVacated.row === nr) {
+          prior -= 18.5;
+        }
+
+        // Psychological Bluff #1: Motionless `FIVE_STAR` parked on own back rank pretending to be Flag!
         if (
           unit.id === this.designatedBackRankDecoyId &&
-          unit.row === AI_HOME_BACK_ROW &&
+          unit.row === ownBackRow &&
           !unit.hasMoved &&
           !targetPlayer &&
           turnNumber <= 18 &&
-          W.bluffRate >= 0.25
+          W.bluffRate >= 0.2
         ) {
-          prior -= 26 * W.bluffRate; // Hold motionless like a Flag until enemy walks into the jaws!
+          prior -= 26 * W.bluffRate;
         }
 
         // Psychological Bluff #2: Open edge-column `PRIVATE` or `SERGEANT` mimicking a daring `FLAG` sprint!
@@ -604,15 +712,34 @@ export class BeliefMatrixAI {
           (unit.id === this.designatedBluffRunnerId ||
             ((unit.ownRank === 'PRIVATE' || unit.ownRank === 'SERGEANT') &&
               (unit.col === 0 || unit.col === BOARD_COLS - 1))) &&
-          d.dr === 1 &&
+          d.dr === forwardDr &&
           !targetPlayer &&
-          W.bluffRate >= 0.15
+          W.bluffRate >= 0.12
         ) {
           const enemyAdj = playerUnits.some(
             (p) => Math.abs(p.col - nc) + Math.abs(p.row - nr) === 1
           );
           if (!enemyAdj) {
-            prior += 34 * W.bluffRate;
+            prior += 32 * W.bluffRate;
+            isBluff = true;
+          }
+        }
+
+        // Psychological Bluff #3 (Supreme Marshal + 1970s Classic Edition Back-Row Bluff Baiting!):
+        // Intentionally step a `GEN_5` or `GEN_4` onto the opponent's back rank adjacent to an enemy unit,
+        // mimicking a `1970s` deferred Flag arrival so the opponent panics and attacks into a 5★ General!
+        if (
+          eraMode === '1970s' &&
+          difficulty === 'SUPREME_MARSHAL' &&
+          (unit.ownRank === 'GEN_5' || unit.ownRank === 'GEN_4') &&
+          nr === oppBackRow &&
+          !targetPlayer
+        ) {
+          const adjOpponent = playerUnits.find(
+            (p) => Math.abs(p.col - nc) + Math.abs(p.row - nr) === 1
+          );
+          if (adjOpponent && this.getRankProbability(adjOpponent.id, 'SPY') < 0.2) {
+            prior += 46.0;
             isBluff = true;
           }
         }
@@ -624,35 +751,53 @@ export class BeliefMatrixAI {
           const nextAdj = playerUnits.some(
             (p) => Math.abs(p.col - nc) + Math.abs(p.row - nr) === 1
           );
-          if (nr === BOARD_ROWS - 1 && !nextAdj && !targetPlayer) {
-            prior += 850; // Immediate Back-Row Flag Traverse Victory!
+          if (nr === oppBackRow && !targetPlayer) {
+            // In `1980s` Electronic Mode, stepping onto `oppBackRow` wins INSTANTLY even if `nextAdj` is true!
+            if (eraMode === '1980s' || !nextAdj) {
+              prior += 900;
+            } else if (difficulty === 'SUPREME_MARSHAL' && W.bluffRate > 0.25) {
+              // Bold 1970s deferred Flag bluff when opponent likely fears a 5★ General!
+              prior += 42;
+            } else {
+              prior -= 120;
+            }
           } else if (currAdj && !nextAdj && !targetPlayer) {
-            prior += 85 * W.flagSafetyWeight; // Evade adjacent danger!
-          } else if (d.dr === 1 && !nextAdj && !targetPlayer && playerUnits.length <= 8) {
-            prior += 28; // Late-game open-lane Flag march
+            prior += 85 * W.flagSafetyWeight;
+          } else if (d.dr === forwardDr && !nextAdj && !targetPlayer && playerUnits.length <= 9) {
+            prior += 32;
           } else {
             prior -= 115 * W.flagSafetyWeight;
           }
         } else if (targetPlayer) {
           prior += this.evaluateBayesianClashUtility(unit, targetPlayer, commander, aiFlag);
         } else {
-          // Quiet Positional & Commander Doctrine Scoring
-          if (d.dr > 0) prior += 8.5 * W.aggressionWeight;
-          if (d.dr < 0) prior -= 4.5;
+          if (d.dr === forwardDr) prior += 9.5 * W.aggressionWeight;
+          if (d.dr === -forwardDr) prior -= 5.0;
           prior += (4 - Math.abs(nc - 4)) * 0.65;
 
-          // Gen. Vance ("Spearhead"): Surge 5★, 4★, and 3★ Generals across Row 3 on early turns!
+          // Pull toward nearest opponent units so endgame armies never stall across empty space
+          let minEnemyDistNow = 99;
+          let minEnemyDistNext = 99;
+          for (const p of playerUnits) {
+            const dn = Math.abs(unit.col - p.col) + Math.abs(unit.row - p.row);
+            const dx = Math.abs(nc - p.col) + Math.abs(nr - p.row);
+            if (dn < minEnemyDistNow) minEnemyDistNow = dn;
+            if (dx < minEnemyDistNext) minEnemyDistNext = dx;
+          }
+          if (minEnemyDistNext < minEnemyDistNow) {
+            prior += 4.2 * W.aggressionWeight;
+          }
+
           if (
             turnNumber <= 12 &&
             (unit.ownRank === 'GEN_5' || unit.ownRank === 'GEN_4' || unit.ownRank === 'GEN_3') &&
-            d.dr > 0 &&
-            nr >= AI_SPEARHEAD_CROSS_ROW
+            d.dr === forwardDr &&
+            spearheadCrossed(nr)
           ) {
             prior += 18.0 * W.earlySpearheadWeight;
           }
 
-          // Marshal Hollis / Col. Reyes: Maintain Spy + Private Escort Pairings!
-          if (unit.ownRank === 'SPY') {
+          if (unit.ownRank === 'SPY' && difficulty !== 'RECRUIT') {
             const hasPrivateEscort = aiUnits.some(
               (other) =>
                 other.id !== unit.id &&
@@ -661,7 +806,6 @@ export class BeliefMatrixAI {
             );
             if (hasPrivateEscort) prior += 10.5 * W.spyPrivateEscortWeight;
 
-            // Shadow high-probability enemy Officers (`P(Officer) > 0.60`)!
             for (const p of playerUnits) {
               const pOff = this.getOfficerProbability(p.id);
               const pPvt = this.getRankProbability(p.id, 'PRIVATE');
@@ -673,17 +817,15 @@ export class BeliefMatrixAI {
             }
           }
 
-          // Escort Privates move up alongside friendly Spies!
-          if (unit.ownRank === 'PRIVATE' && W.spyPrivateEscortWeight > 1.0) {
+          if (unit.ownRank === 'PRIVATE' && W.spyPrivateEscortWeight > 1.0 && difficulty !== 'RECRUIT') {
             const nearSpy = aiUnits.some(
               (other) =>
                 other.ownRank === 'SPY' &&
                 Math.abs(other.col - nc) + Math.abs(other.row - nr) === 1
             );
-            if (nearSpy && d.dr >= 0) prior += 8.0 * W.spyPrivateEscortWeight;
+            if (nearSpy && d.dr === forwardDr) prior += 8.0 * W.spyPrivateEscortWeight;
           }
 
-          // Defend AI Flag perimeter when a suspect enemy unit approaches within 3 squares!
           if (aiFlag) {
             for (const p of playerUnits) {
               const distToFlag = Math.abs(p.col - aiFlag.col) + Math.abs(p.row - aiFlag.row);
@@ -711,8 +853,13 @@ export class BeliefMatrixAI {
     if (rootCandidates.length === 0) return null;
     rootCandidates.sort((a, b) => b.priorScore - a.priorScore);
 
-    // 2. Information-Set Expectimax Search (`2-to-3 ply`) over Top Beam Moves × Sampled Plausible Worlds!
-    const beamWidth = Math.min(rootCandidates.length, W.searchDepth === 3 ? 10 : 7);
+    // Recruit (`effDepth === 1`): pure 1-ply decision without multi-ply lookahead!
+    if (effDepth === 1) {
+      return rootCandidates[0]!.decision;
+    }
+
+    // 2-to-3 Ply Information-Set Expectimax (+ Monte Carlo Rollout Tail on `SUPREME_MARSHAL`)
+    const beamWidth = Math.min(rootCandidates.length, effDepth === 3 ? 10 : 7);
     const worlds: Map<string, RankId>[] = [];
     for (let k = 0; k < W.worldSamples; k++) {
       worlds.push(this.samplePlausibleWorld(rng));
@@ -731,7 +878,11 @@ export class BeliefMatrixAI {
           playerUnits,
           world,
           cand.decision,
-          W
+          W,
+          effDepth,
+          difficulty === 'SUPREME_MARSHAL',
+          ownBackRow,
+          eraMode
         );
       }
       const avgFutureValue = worldExpectation / Math.max(1, worlds.length);
@@ -823,7 +974,11 @@ export class BeliefMatrixAI {
     playerUnits: readonly ObservedPlayerUnitState[],
     world: ReadonlyMap<string, RankId>,
     rootMove: AIMoveDecision,
-    W: CommanderUtilityWeights
+    W: CommanderUtilityWeights,
+    effDepth: 2 | 3 = 3,
+    enableMonteCarloRollout = false,
+    ownBackRow = 0,
+    eraMode: AudioEraMode = '1980s'
   ): number {
     interface SimUnit {
       id: string;
@@ -887,13 +1042,16 @@ export class BeliefMatrixAI {
 
     for (const p of simP) {
       if (!p.alive) continue;
-      // Check if Player Flag can step unopposed onto Row 0!
-      if (p.rank === 'FLAG' && p.row === 1) {
-        const canWin = !simAI.some(
-          (a) => a.alive && Math.abs(a.col - p.col) + Math.abs(a.row - 0) <= 1
-        );
-        if (canWin) {
-          worstPlayerSwing = Math.max(worstPlayerSwing, 480 * W.flagSafetyWeight);
+      // Check if opponent Flag can step onto AI's back row (`ownBackRow`)!
+      if (p.rank === 'FLAG' && Math.abs(p.row - ownBackRow) === 1) {
+        const occupiedByP = simP.some((o) => o.alive && o.col === p.col && o.row === ownBackRow);
+        if (!occupiedByP) {
+          const adjDefender = simAI.some(
+            (a) => a.alive && Math.abs(a.col - p.col) + Math.abs(a.row - ownBackRow) <= 1
+          );
+          if (eraMode === '1980s' || !adjDefender) {
+            worstPlayerSwing = Math.max(worstPlayerSwing, 520 * W.flagSafetyWeight);
+          }
         }
       }
 
@@ -918,13 +1076,12 @@ export class BeliefMatrixAI {
 
     boardDelta -= worstPlayerSwing;
 
-    // Ply 3 (Max Node, enabled when `W.searchDepth === 3`):
+    // Ply 3 (Max Node, enabled when `effDepth === 3`):
     // Check AI's immediate recapture / Spy assassination counter-strike if Player captures at `mover`'s square!
-    if (W.searchDepth === 3 && ply2Attacker && mover.alive) {
+    if (effDepth === 3 && ply2Attacker && mover.alive) {
       let bestRecapture = 0;
       for (const ally of simAI) {
         if (!ally.alive || ally.id === mover.id) continue;
-        // Ally adjacent to `mover`'s destination can immediately counter-strike `ply2Attacker` on Ply 3!
         if (Math.abs(ally.col - mover.col) + Math.abs(ally.row - mover.row) === 1) {
           const counterRes = resolveClash(ally.rank, ply2Attacker.rank);
           if (counterRes === 'ATTACKER') {
@@ -936,6 +1093,24 @@ export class BeliefMatrixAI {
         }
       }
       boardDelta += bestRecapture;
+    }
+
+    // Supreme Marshal Monte Carlo Rollout Tail: evaluate remaining material + Spy-vs-General proximity balance!
+    if (enableMonteCarloRollout) {
+      let tailEval = 0;
+      for (const a of simAI) {
+        if (!a.alive) continue;
+        if (a.rank === 'SPY') {
+          for (const p of simP) {
+            if (!p.alive) continue;
+            if (p.rank === 'GEN_5' || p.rank === 'GEN_4') {
+              const d = Math.abs(a.col - p.col) + Math.abs(a.row - p.row);
+              tailEval += Math.max(0, 8 - d) * 1.8;
+            }
+          }
+        }
+      }
+      boardDelta += tailEval;
     }
 
     return boardDelta;

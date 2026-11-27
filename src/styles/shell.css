@@ -1023,6 +1023,31 @@ button:active:not(:disabled) {
 }
 
 /* Options & Showcase Grids */
+.era-rule-callout {
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: rgba(229, 185, 104, 0.08);
+  border-left: 2px solid var(--brass-bright);
+  font-size: 9.8px;
+  line-height: 1.25;
+  color: var(--text-muted);
+}
+
+/* Left-Handed Ergonomic Mirroring (`body[data-handedness='LEFT']`) */
+body[data-handedness='LEFT'] .play-bottom-dock {
+  direction: rtl;
+}
+
+body[data-handedness='LEFT'] .play-bottom-dock > * {
+  direction: ltr;
+}
+
+body[data-handedness='LEFT'] .mob-top-bar,
+body[data-handedness='LEFT'] .mob-blueprint-row,
+body[data-handedness='LEFT'] .dossier-secondary-row {
+  flex-direction: row-reverse;
+}
+
 .options-grid {
   display: flex;
   flex-direction: column;
@@ -1650,6 +1675,14 @@ button:active:not(:disabled) {
     width: min(362px, 41vw);
     padding: 8px 10px;
     gap: 5px;
+  }
+
+  body[data-handedness='LEFT'] .title-thumb-deck,
+  body[data-handedness='LEFT'] .mobilization-drawer,
+  body[data-handedness='LEFT'] .manual-thumb-sheet,
+  body[data-handedness='LEFT'] .dossier-card {
+    left: max(14px, var(--safe-left));
+    right: auto;
   }
 
   .smoked-sheet {

@@ -94,8 +94,11 @@ export class SceneManager {
   private viewingFaction: Faction = 'PLAYER';
   private cameraMode: CameraMode = 'TITLE';
   private boardView: BoardViewAngle = 'COMMAND';
+  private handedness: AppOptions['handedness'] = 'RIGHT';
+  private renderQuality: AppOptions['renderQuality'] = 'ULTRA';
   private selectedPieceId: string | null = null;
   private turnClockSec = 45;
+  private isUntimed = false;
   private userPitchDeltaDeg = 0;
 
   private activeDrag: ActiveHologramDrag | null = null;
@@ -112,6 +115,8 @@ export class SceneManager {
 
   private readonly clock = new THREE.Clock();
   private totalElapsed = 0;
+  private frameAccumSec = 0;
+  private lastArbiterTapTime = 0;
   private rafId = 0;
   private resizeObserver: ResizeObserver;
 
@@ -281,14 +286,24 @@ export class SceneManager {
   }
 
   public syncFromStore(view: PlayerVisibleView, options: Readonly<AppOptions>): void {
-    const maxDpr = options.renderQuality === 'ULTRA' ? 2.5 : 1.5;
+    this.renderQuality = options.renderQuality;
+    this.handedness = options.handedness;
+    this.factory.applyBoardFinish(options.boardFinish);
+
+    const isUltra = options.renderQuality === 'ULTRA';
+    const maxDpr = isUltra ? 2.5 : 1.5;
     const desiredDpr = Math.min(window.devicePixelRatio || 1, maxDpr);
     if (Math.abs(this.renderer.getPixelRatio() - desiredDpr) > 0.01) {
       this.renderer.setPixelRatio(desiredDpr);
       this.handleResize();
     }
+
+    // Battery Saver Mode (`1.5x DPR`, Bloom Only — disables Soft Shadows & Tilt-Shift DoF, caps at 30 FPS)
+    this.renderer.shadowMap.enabled = isUltra;
+    this.keyShadowLight.castShadow = isUltra;
+    this.rimShadowSpot.castShadow = isUltra;
     this.tiltShiftPass.enabled =
-      options.renderQuality === 'ULTRA' &&
+      isUltra &&
       view.cameraMode !== 'INSPECT_16' &&
       view.cameraMode !== 'REPLAY' &&
       view.cameraMode !== 'FIELD_MANUAL';
@@ -302,6 +317,7 @@ export class SceneManager {
     this.viewingFaction = view.viewingFaction;
     this.selectedPieceId = view.selectedPieceId;
     this.turnClockSec = view.turnClockSec;
+    this.isUntimed = view.isUntimed;
     this.cameraMode = view.cameraMode;
     this.updateCameraTargets(view.cameraMode);
 
@@ -453,7 +469,8 @@ export class SceneManager {
       ? enemyVisual.group.position.clone()
       : gridToWorld(verdict.contestedCoord.col, verdict.contestedCoord.row);
 
-    const speed = this.store.getOptions().arbiterSpeed === '1.75x' ? 1.75 : 1.0;
+    // `THEATRICAL` = Full `4.0s` 3-Act Show (`1.0x`); `TACTICAL_FAST` = Accelerated `1.6s` Blitz Clash (`2.55x`)!
+    const speed = this.store.getOptions().arbiterSpeed === 'TACTICAL_FAST' ? 2.55 : 1.0;
 
     this.arbiterStage.startBattleSequence(
       verdict,
@@ -484,9 +501,24 @@ export class SceneManager {
   public startLoop(): void {
     const tick = () => {
       this.rafId = requestAnimationFrame(tick);
-      const dt = Math.min(0.05, this.clock.getDelta());
-      this.totalElapsed += dt;
-      this.stepFrame(dt, this.totalElapsed);
+      const rawDt = Math.min(0.08, this.clock.getDelta());
+
+      // Enforce genuine 30 FPS cap in `BATTERY_SAVER` mode (`1 / 30 = 0.0333s`)!
+      if (this.renderQuality === 'BATTERY_SAVER') {
+        this.frameAccumSec += rawDt;
+        if (this.frameAccumSec < 1 / 31) {
+          return;
+        }
+        const steppedDt = Math.min(0.06, this.frameAccumSec);
+        this.frameAccumSec = 0;
+        this.totalElapsed += steppedDt;
+        this.stepFrame(steppedDt, this.totalElapsed);
+      } else {
+        this.frameAccumSec = 0;
+        const dt = Math.min(0.05, rawDt);
+        this.totalElapsed += dt;
+        this.stepFrame(dt, this.totalElapsed);
+      }
     };
     this.clock.start();
     tick();
@@ -520,8 +552,13 @@ export class SceneManager {
     this.arbiterStage.update(dt, elapsed);
     this.indicatorLayer.update(elapsed);
 
-    // Sync final-10-second Round Timer urgency tick with SoundDirector!
-    if (this.cameraMode === 'PLAY' && this.phase === 'PLAY' && !this.arbiterStage.isBusy) {
+    // Sync final-10-second Round Timer urgency tick with SoundDirector (disabled in Untimed Casual)!
+    if (
+      this.cameraMode === 'PLAY' &&
+      this.phase === 'PLAY' &&
+      !this.arbiterStage.isBusy &&
+      !this.isUntimed
+    ) {
       this.sound.setTurnWarningUrgent(this.turnClockSec <= 10);
     } else {
       this.sound.setTurnWarningUrgent(false);
@@ -718,7 +755,8 @@ export class SceneManager {
       const rWidth = 11.2 / (2 * Math.tan(halfFovRad) * effectiveAspect);
       const rDist = Math.max(rHeight, rWidth);
 
-      const lookX = rightPanelOpen ? 2.55 : 0;
+      const handSign = this.handedness === 'LEFT' ? -1 : 1;
+      const lookX = rightPanelOpen ? 2.55 * handSign : 0;
       const lookY = -0.12;
       this.camTargetLook.set(lookX, lookY, lSpec.lookZ);
       this.camTargetPos.set(
@@ -1061,6 +1099,14 @@ export class SceneManager {
       this.sound.unlock();
 
       if (this.arbiterStage.isBusy) {
+        const nowMs = performance.now();
+        if (nowMs - this.lastArbiterTapTime < 360) {
+          // Double-tap during Act 1 / Act 2 skips straight to Act 3 Verdict!
+          this.lastArbiterTapTime = 0;
+          this.arbiterStage.skipToVerdictAct3();
+          return;
+        }
+        this.lastArbiterTapTime = nowMs;
         this.arbiterStage.setOverdriveHeld(true);
         return;
       }

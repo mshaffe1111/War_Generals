@@ -748,6 +748,20 @@ export class ArbiterStage3D {
     this.overdriveHeld = held;
   }
 
+  /**
+   * Double-tap during Act 1 / Act 2 skips straight to Act 3 Verdict payoff (§3)!
+   */
+  public skipToVerdictAct3(): boolean {
+    if (!this.activeVerdict || this.elapsed >= this.tVerdict - 0.05) {
+      return false;
+    }
+    this.sound.stopActiveSequence();
+    this.pushAudioTriggered = true;
+    this.vacuumAudioTriggered = true;
+    this.elapsed = this.tVerdict - 0.01;
+    return true;
+  }
+
   public getCameraShakeOffset(): THREE.Vector3 {
     return this.cameraShakeOffset;
   }

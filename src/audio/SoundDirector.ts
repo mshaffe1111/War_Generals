@@ -45,6 +45,7 @@ export class SoundDirector {
   private pinkBrownCache: AudioBuffer | null = null;
 
   private muted = false;
+  private masterVol = 0.9;
   private musicVol = 0.85;
   private sfxVol = 0.95;
   private ambianceVol = 0.75;
@@ -158,10 +159,17 @@ export class SoundDirector {
   public syncOptions(
     opts: Pick<
       AppOptions,
-      'audioMuted' | 'musicVolume' | 'sfxVolume' | 'ambianceVolume' | 'hapticsEnabled' | 'eraMode'
+      | 'audioMuted'
+      | 'masterVolume'
+      | 'musicVolume'
+      | 'sfxVolume'
+      | 'ambianceVolume'
+      | 'hapticsEnabled'
+      | 'eraMode'
     >
   ): void {
     this.muted = opts.audioMuted;
+    this.masterVol = opts.masterVolume;
     this.musicVol = opts.musicVolume;
     this.sfxVol = opts.sfxVolume;
     this.ambianceVol = opts.ambianceVolume;
@@ -170,7 +178,7 @@ export class SoundDirector {
 
     if (!this.ctx) return;
     const t = this.ctx.currentTime;
-    this.masterGain?.gain.setTargetAtTime(this.muted ? 0 : 0.88, t, 0.02);
+    this.masterGain?.gain.setTargetAtTime(this.muted ? 0 : this.masterVol * 0.92, t, 0.02);
     this.musicGain?.gain.setTargetAtTime(this.musicVol, t, 0.03);
     this.sfxGain?.gain.setTargetAtTime(this.sfxVol, t, 0.03);
     this.ambianceGain?.gain.setTargetAtTime(this.ambianceVol * 0.32, t, 0.05);
@@ -179,7 +187,7 @@ export class SoundDirector {
   public setMuted(muted: boolean): void {
     this.muted = muted;
     if (this.masterGain && this.ctx) {
-      this.masterGain.gain.setTargetAtTime(muted ? 0 : 0.88, this.ctx.currentTime, 0.02);
+      this.masterGain.gain.setTargetAtTime(muted ? 0 : this.masterVol * 0.92, this.ctx.currentTime, 0.02);
     }
   }
 

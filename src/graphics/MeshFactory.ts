@@ -8,7 +8,7 @@ import {
   type Faction,
   type RankId,
 } from '../core/ranks';
-import type { ManualRankOutcome, SuspectTag } from '../core/types';
+import type { BoardFinishMode, ManualRankOutcome, SuspectTag } from '../core/types';
 import {
   buildAttackMedallionMesh,
   buildRankEmblemMesh,
@@ -236,6 +236,9 @@ export class MeshFactory {
     escutcheon: null,
   };
   private readonly liveWedges = new Set<LiveWedgeRefs>();
+  private readonly walnutAlbedoTex: THREE.Texture;
+  private readonly walnutNormalTex: THREE.Texture;
+  private activeBoardFinish: BoardFinishMode = 'WALNUT_SLATE';
 
   private arbiterParts: BakedArbiterHardwareParts = {
     warfieldArena: null,
@@ -248,11 +251,13 @@ export class MeshFactory {
     walnutAlbedo.colorSpace = THREE.SRGBColorSpace;
     walnutAlbedo.wrapS = walnutAlbedo.wrapT = THREE.RepeatWrapping;
     walnutAlbedo.anisotropy = 16;
+    this.walnutAlbedoTex = walnutAlbedo;
 
     const walnutNormal = loader.load('./textures/walnut_normal.jpg');
     walnutNormal.colorSpace = THREE.NoColorSpace;
     walnutNormal.wrapS = walnutNormal.wrapT = THREE.RepeatWrapping;
     walnutNormal.anisotropy = 16;
+    this.walnutNormalTex = walnutNormal;
 
     const velvetAlbedo = loader.load('./textures/velvet_albedo.jpg');
     velvetAlbedo.colorSpace = THREE.SRGBColorSpace;
@@ -1193,6 +1198,43 @@ export class MeshFactory {
 
   public createAttackMedallion(): THREE.Group {
     return buildAttackMedallionMesh(this.materials.emblemPalette);
+  }
+
+  /**
+   * Live-swaps between `Signature Oiled Walnut & Slate` and `Retro 1980 Bakelite & Crimson/Cobalt` (§1.B)!
+   */
+  public applyBoardFinish(finish: BoardFinishMode): void {
+    if (this.activeBoardFinish === finish) return;
+    this.activeBoardFinish = finish;
+
+    const isBakelite = finish === 'RETRO_BAKELITE';
+    const cab = this.materials.walnut;
+    cab.map = isBakelite ? null : this.walnutAlbedoTex;
+    cab.normalMap = isBakelite ? null : this.walnutNormalTex;
+    cab.color.set(isBakelite ? '#181c24' : '#BE9574');
+    cab.roughness = isBakelite ? 0.22 : 0.35;
+    cab.metalness = isBakelite ? 0.14 : 0.02;
+    cab.clearcoat = isBakelite ? 0.78 : 0.24;
+    cab.needsUpdate = true;
+
+    const tile = this.materials.slateTile;
+    tile.color.set(isBakelite ? '#2f394c' : '#232934');
+    tile.roughness = isBakelite ? 0.38 : 0.58;
+    tile.metalness = isBakelite ? 0.16 : 0.08;
+    tile.clearcoat = isBakelite ? 0.35 : 0.05;
+    tile.needsUpdate = true;
+
+    const pNavy = this.materials.playerNavy;
+    pNavy.color.set(isBakelite ? '#1546a6' : '#132A52');
+    pNavy.roughness = isBakelite ? 0.26 : 0.38;
+    pNavy.clearcoat = isBakelite ? 0.52 : 0.18;
+    pNavy.needsUpdate = true;
+
+    const eCrim = this.materials.enemyCrimson;
+    eCrim.color.set(isBakelite ? '#9e192a' : '#661524');
+    eCrim.roughness = isBakelite ? 0.26 : 0.38;
+    eCrim.clearcoat = isBakelite ? 0.52 : 0.18;
+    eCrim.needsUpdate = true;
   }
 
   public createBoardCabinetGroup(): THREE.Group {

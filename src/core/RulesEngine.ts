@@ -128,12 +128,15 @@ export function formatAlgebraicCoord(col: number, row: number): string {
 }
 
 /**
- * Evaluates Back-Row Flag Traverse Victory dynamically per active Era Ruleset:
+ * Evaluates Back-Row Flag Traverse Victory dynamically per active Era Ruleset (§1.A vs §1.B):
  * - Player goal row = `0` (Enemy back rank); Enemy goal row = `7` (Player back rank).
- * - `1980s` Electronic Ruleset: Reaching the opposite back row wins immediately if no enemy piece is orthogonally adjacent
- *   (or if already unchallenged on the back row).
- * - `1970s` Classic Ruleset: Deferred 1-turn adjacency check — if an enemy piece is orthogonally adjacent when the Flag steps
- *   onto the back row, the opponent gets 1 turn to capture it; if uncaptured when turn returns (or zero adjacent enemies), victory!
+ * - `1980s Electronic Edition` (Sudden-Death): Stepping your `FLAG` onto ANY square of the opponent's back rank
+ *   triggers the Electronic Arbiter's `VICTORY` circuit and wins on the spot, even if an enemy sits right beside it!
+ * - `1970s Classic Edition` (Deferred Back-Row Flag Bluff Rule):
+ *   - If `0` enemy pieces sit orthogonally adjacent (`left`, `right`, or `in front`), the `FLAG` wins immediately!
+ *   - If `>= 1` enemy pieces sit orthogonally adjacent on arrival, the match does NOT end yet and NO alert reveals
+ *     the Flag! The opponent gets ONE final turn; if uncaptured when turn returns (`flagAlreadySurvivedTurnOnGoalRow === true`),
+ *     the `FLAG` unveils itself and wins the war!
  */
 export function checkBackRowFlagTraverse(
   pieces: ReadonlyArray<{
@@ -143,35 +146,33 @@ export function checkBackRowFlagTraverse(
     row: number;
     alive: boolean;
   }>,
-  justMovedFaction: Faction,
+  evaluatingFaction: Faction,
   eraMode: AudioEraMode,
   flagAlreadySurvivedTurnOnGoalRow: boolean
 ): Faction | null {
-  for (const p of pieces) {
-    if (!p.alive || p.trueRank !== 'FLAG') continue;
-    const goalRow = p.faction === 'PLAYER' ? 0 : BOARD_ROWS - 1;
-    if (p.row !== goalRow) continue;
+  const goalRow = evaluatingFaction === 'PLAYER' ? 0 : BOARD_ROWS - 1;
+  const flag = pieces.find(
+    (p) => p.alive && p.faction === evaluatingFaction && p.trueRank === 'FLAG' && p.row === goalRow
+  );
+  if (!flag) return null;
 
-    const hasAdjacentEnemy = pieces.some(
-      (other) =>
-        other.alive &&
-        other.faction !== p.faction &&
-        Math.abs(other.col - p.col) + Math.abs(other.row - p.row) === 1
-    );
-
-    if (eraMode === '1980s') {
-      // 1980s Electronic instant win upon safely reaching opposite back row (or surviving to own turn)
-      if (!hasAdjacentEnemy || flagAlreadySurvivedTurnOnGoalRow || p.faction === justMovedFaction) {
-        return p.faction;
-      }
-    } else {
-      // 1970s Classic deferred check: immediate if zero adjacent enemies, otherwise must survive opponent's response turn!
-      if (!hasAdjacentEnemy || flagAlreadySurvivedTurnOnGoalRow) {
-        return p.faction;
-      }
-    }
+  if (eraMode === '1980s') {
+    return evaluatingFaction;
   }
-  return null;
+
+  // `1970s Classic Edition`:
+  if (flagAlreadySurvivedTurnOnGoalRow) {
+    return evaluatingFaction;
+  }
+
+  const hasAdjacentEnemy = pieces.some(
+    (other) =>
+      other.alive &&
+      other.faction !== evaluatingFaction &&
+      Math.abs(other.col - flag.col) + Math.abs(other.row - flag.row) === 1
+  );
+
+  return hasAdjacentEnemy ? null : evaluatingFaction;
 }
 
 /**

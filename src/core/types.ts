@@ -139,7 +139,7 @@ export interface DeclassifiedReplayView {
 }
 
 // -----------------------------------------------------------------------------
-// Block 5: Command Shroud (2P Local), Public Log, Intel Ledger, Dossier & 3D Field Manual
+// Command Shroud (2P Local), Public Log, Intel Ledger, Dossier & 3D Field Manual
 // -----------------------------------------------------------------------------
 
 export interface CommandShroudState {
@@ -199,19 +199,32 @@ export type CameraMode =
   | 'REPLAY'
   | 'FIELD_MANUAL';
 
+// -----------------------------------------------------------------------------
+// Block 7: Era Editions, 4 Difficulty Tiers, Mobile Ergonomics, Clocks & Battery
+// -----------------------------------------------------------------------------
+
 export type BoardViewAngle = 'COMMAND' | 'TACTICAL' | 'OVERHEAD';
 export type AudioEraMode = '1980s' | '1970s';
-export type ArbiterSpeedMode = '1x' | '1.75x';
-export type RenderQualityMode = 'ULTRA' | 'BALANCED';
+export type BoardFinishMode = 'WALNUT_SLATE' | 'RETRO_BAKELITE';
+export type DifficultyTier = 'RECRUIT' | 'OFFICER' | 'GENERAL' | 'SUPREME_MARSHAL';
+export type HandednessMode = 'RIGHT' | 'LEFT';
+export type ArbiterSpeedMode = 'THEATRICAL' | 'TACTICAL_FAST';
+export type ClockPresetMode = 'BLITZ' | 'STANDARD' | 'UNTIMED';
+export type RenderQualityMode = 'ULTRA' | 'BATTERY_SAVER';
 
 export interface AppOptions {
   audioMuted: boolean;
+  masterVolume: number;
   musicVolume: number;
   sfxVolume: number;
   ambianceVolume: number;
   hapticsEnabled: boolean;
   eraMode: AudioEraMode;
+  boardFinish: BoardFinishMode;
+  difficulty: DifficultyTier;
+  handedness: HandednessMode;
   arbiterSpeed: ArbiterSpeedMode;
+  clockPreset: ClockPresetMode;
   renderQuality: RenderQualityMode;
   boardView: BoardViewAngle;
 }
@@ -251,6 +264,7 @@ export interface PlayerVisibleView {
   readonly matchClockSec: number;
   readonly turnClockSec: number;
   readonly turnClockMaxSec: number;
+  readonly isUntimed: boolean;
   readonly shroud: CommandShroudState | null;
   readonly publicLog: readonly PublicCombatLogEntry[];
   readonly intelLedger: IntelLedgerSummary;

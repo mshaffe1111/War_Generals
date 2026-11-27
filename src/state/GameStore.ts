@@ -39,6 +39,10 @@ import {
   validateFactionDeployment,
   type DeploymentSlot,
 } from '../core/RulesEngine';
+import {
+  CLOCK_PRESET_SPECS,
+  SettingsStore,
+} from './SettingsStore';
 import type {
   AppOptions,
   ArbiterVerdict,
@@ -76,9 +80,6 @@ export type ShowcasePreset =
   | 'SPY_INTERCEPT'
   | 'MUTUAL_SPLIT'
   | 'FLAG_CAPTURE';
-
-const MATCH_CLOCK_DEFAULT_SEC = 600; // 10:00
-const TURN_CLOCK_DEFAULT_SEC = 45; // 00:45
 
 function formatClockMMSS(sec: number): string {
   const clamped = Math.max(0, Math.floor(sec));
@@ -166,9 +167,10 @@ export class GameStore {
   private campaign: CampaignProgressState = loadCampaignProgress();
   private initialPlayerDeploySlots: DeploymentSlot[] = [];
 
-  private matchClockSec = MATCH_CLOCK_DEFAULT_SEC;
-  private turnClockSec = TURN_CLOCK_DEFAULT_SEC;
-  private clockInterval: number | null = null;
+  private matchClockSec = 600;
+  private turnClockSec = 45;
+  private matchElapsedSec = 0;
+  private clockInterval: ReturnType<typeof setInterval> | null = null;
 
   private shroud: CommandShroudState | null = null;
   private publicLog: PublicCombatLogEntry[] = [];
@@ -189,32 +191,21 @@ export class GameStore {
   private interactionLocked = false;
   private pieceIdCounter = 0;
 
-  // Classic 1970s 1-turn deferred back-row Flag traverse tracking
-  private flagPendingGoalFaction: Faction | null = null;
+  // Classic 1970s 1-turn deferred back-row Flag traverse tracking (supports simultaneous pending flags!)
+  private readonly pendingGoalFlags = new Set<Faction>();
 
   // Declassified Replay Scrubber State
   private replayCurrentPly = 0;
   private replayPlaying = false;
-  private replayTimer: number | null = null;
-  private aiTurnTimer: number | null = null;
+  private replayTimer: ReturnType<typeof setInterval> | null = null;
+  private aiTurnTimer: ReturnType<typeof setTimeout> | null = null;
 
+  private readonly settingsStore = new SettingsStore();
   private readonly beliefAI = new BeliefMatrixAI();
   private readonly listeners = new Set<StoreListener>();
 
   public onAIClashTriggered?: (verdict: ArbiterVerdict) => void;
   public onAIQuietMove?: (publicKills: number) => void;
-
-  private options: AppOptions = {
-    audioMuted: false,
-    musicVolume: 0.85,
-    sfxVolume: 0.95,
-    ambianceVolume: 0.75,
-    hapticsEnabled: true,
-    eraMode: '1980s',
-    arbiterSpeed: '1x',
-    renderQuality: 'ULTRA',
-    boardView: 'COMMAND',
-  };
 
   constructor() {
     this.returnToTitleMenu();
@@ -229,19 +220,38 @@ export class GameStore {
   }
 
   public getOptions(): Readonly<AppOptions> {
-    return { ...this.options };
+    return this.settingsStore.get();
   }
 
   public updateOptions(patch: Partial<AppOptions>): void {
-    this.options = { ...this.options, ...patch };
+    const prevClock = this.settingsStore.get().clockPreset;
+    const next = this.settingsStore.update(patch);
+    if (patch.clockPreset && patch.clockPreset !== prevClock) {
+      const spec = CLOCK_PRESET_SPECS[next.clockPreset];
+      if (this.phase !== 'PLAY' || spec.isUntimed) {
+        this.matchClockSec = spec.matchSec;
+        this.turnClockSec = spec.turnSec;
+      } else if (prevClock === 'UNTIMED' || this.matchClockSec <= 0) {
+        this.matchClockSec = spec.matchSec;
+        this.turnClockSec = spec.turnSec;
+      } else {
+        const prevSpec = CLOCK_PRESET_SPECS[prevClock];
+        const deltaMatch = spec.matchSec - prevSpec.matchSec;
+        this.matchClockSec =
+          deltaMatch < 0
+            ? Math.min(this.matchClockSec, spec.matchSec)
+            : Math.min(spec.matchSec, this.matchClockSec + deltaMatch);
+        this.turnClockSec = Math.min(spec.turnSec, Math.max(10, this.turnClockSec));
+      }
+    }
     this.emit();
   }
 
   public cycleBoardView(): void {
     const order: AppOptions['boardView'][] = ['COMMAND', 'TACTICAL', 'OVERHEAD'];
-    const idx = order.indexOf(this.options.boardView);
+    const idx = order.indexOf(this.getOptions().boardView);
     const next = order[(idx + 1) % order.length]!;
-    this.options = { ...this.options, boardView: next };
+    this.settingsStore.update({ boardView: next });
     if (this.cameraMode === 'INSPECT_16') {
       this.cameraMode = 'PLAY';
       this.banner =
@@ -298,7 +308,7 @@ export class GameStore {
    */
   public startSkirmish(commanderId?: CommanderId, eraMode?: AudioEraMode): void {
     if (commanderId) this.commanderId = commanderId;
-    if (eraMode) this.options = { ...this.options, eraMode };
+    if (eraMode) this.settingsStore.update({ eraMode });
     this.matchMode = 'SKIRMISH';
     this.startNewDeployment();
   }
@@ -345,7 +355,7 @@ export class GameStore {
     this.matchWinner = null;
     this.winReason = null;
     this.interactionLocked = false;
-    this.flagPendingGoalFaction = null;
+    this.pendingGoalFlags.clear();
     this.pieceIdCounter = 0;
 
     this.emit();
@@ -363,7 +373,8 @@ export class GameStore {
       this.banner = 'TACTICAL DEPLOYMENT';
     } else if (this.phase === 'PLAY') {
       this.banner = 'TACTICAL COMMAND';
-      this.turnClockSec = TURN_CLOCK_DEFAULT_SEC;
+      const cSpec = CLOCK_PRESET_SPECS[this.getOptions().clockPreset];
+      this.turnClockSec = cSpec.turnSec;
     }
     this.emit();
   }
@@ -475,12 +486,14 @@ export class GameStore {
     this.turnCount = 1;
     this.clashesWonByPlayer = 0;
     this.clashesWonByEnemy = 0;
-    this.matchClockSec = MATCH_CLOCK_DEFAULT_SEC;
-    this.turnClockSec = TURN_CLOCK_DEFAULT_SEC;
+    const cSpec = CLOCK_PRESET_SPECS[this.getOptions().clockPreset];
+    this.matchClockSec = cSpec.matchSec;
+    this.turnClockSec = cSpec.turnSec;
+    this.matchElapsedSec = 0;
     this.matchWinner = null;
     this.winReason = null;
     this.interactionLocked = false;
-    this.flagPendingGoalFaction = null;
+    this.pendingGoalFlags.clear();
     this.pieceIdCounter = 0;
 
     // Deploy Enemy AI army on Rows 0..2 using active Commander's procedural randomized setup!
@@ -717,8 +730,10 @@ export class GameStore {
     this.activeTurn = 'PLAYER';
     this.turnCount = 1;
     this.selectedDeployRank = null;
-    this.matchClockSec = MATCH_CLOCK_DEFAULT_SEC;
-    this.turnClockSec = TURN_CLOCK_DEFAULT_SEC;
+    const cSpec = CLOCK_PRESET_SPECS[this.getOptions().clockPreset];
+    this.matchClockSec = cSpec.matchSec;
+    this.turnClockSec = cSpec.turnSec;
+    this.matchElapsedSec = 0;
 
     this.initialPlayerDeploySlots = this.getFactionDeploymentSlots('PLAYER').map((s) => ({
       ...s,
@@ -746,7 +761,7 @@ export class GameStore {
       {
         turn: 0,
         actor: 'SYSTEM',
-        text: `Engagement commenced (${this.options.eraMode} Ruleset) — 21 vs. 21`,
+        text: `Engagement commenced (${this.getOptions().eraMode} Edition) — 21 vs. 21`,
         isClash: false,
       },
     ];
@@ -780,13 +795,19 @@ export class GameStore {
 
   private startMatchClocks(): void {
     this.stopMatchClocks();
-    this.clockInterval = window.setInterval(() => {
+    this.clockInterval = globalThis.setInterval(() => {
       if (
         this.phase !== 'PLAY' ||
         this.interactionLocked ||
         this.shroud?.active ||
         this.cameraMode !== 'PLAY'
       ) {
+        return;
+      }
+
+      this.matchElapsedSec += 1;
+      const cSpec = CLOCK_PRESET_SPECS[this.getOptions().clockPreset];
+      if (cSpec.isUntimed) {
         return;
       }
 
@@ -813,7 +834,7 @@ export class GameStore {
       }
 
       if (this.turnClockSec <= 0) {
-        this.turnClockSec = TURN_CLOCK_DEFAULT_SEC;
+        this.turnClockSec = cSpec.turnSec;
         this.executeAutoFallbackMoveForActiveTurn();
         return;
       }
@@ -824,7 +845,7 @@ export class GameStore {
 
   private stopMatchClocks(): void {
     if (this.clockInterval !== null) {
-      window.clearInterval(this.clockInterval);
+      globalThis.clearInterval(this.clockInterval);
       this.clockInterval = null;
     }
   }
@@ -1029,7 +1050,7 @@ export class GameStore {
       }
 
       this.selectedPieceId = null;
-      this.turnClockSec = TURN_CLOCK_DEFAULT_SEC;
+      this.turnClockSec = CLOCK_PRESET_SPECS[this.getOptions().clockPreset].turnSec;
 
       if (this.evaluateFlagTraverseAfterMove(mover.faction)) {
         return { kind: 'MOVED' };
@@ -1208,7 +1229,7 @@ export class GameStore {
     this.activeClash = null;
     this.cameraMode = 'PLAY';
     this.interactionLocked = false;
-    this.turnClockSec = TURN_CLOCK_DEFAULT_SEC;
+    this.turnClockSec = CLOCK_PRESET_SPECS[this.getOptions().clockPreset].turnSec;
 
     if (verdict.resolution === 'FLAG_CAPTURED_BY_PLAYER') {
       this.declareMatchWinner(
@@ -1267,8 +1288,8 @@ export class GameStore {
     this.banner = 'ENEMY MANEUVERING...';
     this.emit();
 
-    if (this.aiTurnTimer !== null) window.clearTimeout(this.aiTurnTimer);
-    this.aiTurnTimer = window.setTimeout(() => {
+    if (this.aiTurnTimer !== null) globalThis.clearTimeout(this.aiTurnTimer);
+    this.aiTurnTimer = globalThis.setTimeout(() => {
       this.aiTurnTimer = null;
       this.executeEnemyTurnNow();
     }, delayMs);
@@ -1305,11 +1326,17 @@ export class GameStore {
       }
     }
 
+    const opts = this.getOptions();
     const decision = this.beliefAI.chooseCommanderMove(
       aiUnits,
       observedPlayers,
       this.commanderId,
-      this.turnCount
+      this.turnCount,
+      {
+        difficulty: opts.difficulty,
+        eraMode: opts.eraMode,
+        aiFaction: 'ENEMY',
+      }
     );
     if (!decision) {
       this.declareMatchWinner(
@@ -1326,6 +1353,7 @@ export class GameStore {
 
     const fromCoord = { col: mover.col, row: mover.row };
     const toCoord = { col: decision.toCol, row: decision.toRow };
+    this.beliefAI.recordOwnMoveOrigin(mover.id, fromCoord);
     const occupant = this.findAliveAt(toCoord.col, toCoord.row);
 
     if (occupant && occupant.faction === 'PLAYER') {
@@ -1355,7 +1383,7 @@ export class GameStore {
       isClash: false,
     });
 
-    this.turnClockSec = TURN_CLOCK_DEFAULT_SEC;
+    this.turnClockSec = CLOCK_PRESET_SPECS[opts.clockPreset].turnSec;
     if (this.evaluateFlagTraverseAfterMove('ENEMY')) {
       return;
     }
@@ -1371,7 +1399,7 @@ export class GameStore {
   }
 
   private checkPending1970sSurvivalWin(turnStartingFaction: Faction): boolean {
-    if (this.flagPendingGoalFaction !== turnStartingFaction) return false;
+    if (!this.pendingGoalFlags.has(turnStartingFaction)) return false;
     const goalRow = turnStartingFaction === 'PLAYER' ? 0 : BOARD_ROWS - 1;
     const survivingFlag = Array.from(this.#truthPieces.values()).find(
       (p) =>
@@ -1383,22 +1411,23 @@ export class GameStore {
         turnStartingFaction === 'PLAYER' ? 'FLAG TRAVERSE — VICTORY' : 'FLAG LOST — DEFEAT',
         'Back-Rank Flag Breakthrough',
         turnStartingFaction === 'PLAYER'
-          ? 'Navy Flag survived uncaptured on the Crimson home rank!'
-          : 'Crimson Flag survived uncaptured on the Navy home rank!'
+          ? 'Navy Flag survived opponent final turn on the Crimson back rank!'
+          : 'Crimson Flag survived your final turn on the Navy back rank!'
       );
       return true;
     }
-    this.flagPendingGoalFaction = null;
+    this.pendingGoalFlags.delete(turnStartingFaction);
     return false;
   }
 
   private evaluateFlagTraverseAfterMove(movedFaction: Faction): boolean {
     const all = Array.from(this.#truthPieces.values());
+    const era = this.getOptions().eraMode;
     const winner = checkBackRowFlagTraverse(
       all,
       movedFaction,
-      this.options.eraMode,
-      this.flagPendingGoalFaction === movedFaction
+      era,
+      this.pendingGoalFlags.has(movedFaction)
     );
     if (winner) {
       this.declareMatchWinner(
@@ -1412,11 +1441,15 @@ export class GameStore {
       return true;
     }
 
-    for (const p of all) {
-      if (!p.alive || p.trueRank !== 'FLAG') continue;
-      const goalRow = p.faction === 'PLAYER' ? 0 : BOARD_ROWS - 1;
-      if (p.row === goalRow) {
-        this.flagPendingGoalFaction = p.faction;
+    // `1970s Classic Edition`: If `movedFaction`'s Flag just arrived on `goalRow` with >=1 adjacent enemy,
+    // silently arm the 1-turn deferred survival check with ZERO public alert!
+    if (era === '1970s') {
+      const goalRow = movedFaction === 'PLAYER' ? 0 : BOARD_ROWS - 1;
+      const flagOnGoal = all.find(
+        (p) => p.alive && p.faction === movedFaction && p.trueRank === 'FLAG' && p.row === goalRow
+      );
+      if (flagOnGoal) {
+        this.pendingGoalFlags.add(movedFaction);
       }
     }
     return false;
@@ -1451,7 +1484,7 @@ export class GameStore {
     }
 
     const highOfficer = this.findHighestSurvivingRankName(winner);
-    const elapsedSec = Math.max(1, MATCH_CLOCK_DEFAULT_SEC - this.matchClockSec);
+    const elapsedSec = Math.max(1, this.matchElapsedSec || 1);
 
     this.dossier = {
       winner,
@@ -1637,7 +1670,7 @@ export class GameStore {
       this.replayCurrentPly = 0;
     }
     this.replayPlaying = true;
-    this.replayTimer = window.setInterval(() => {
+    this.replayTimer = globalThis.setInterval(() => {
       if (this.replayCurrentPly < this.#replayPlies.length - 1) {
         this.replayCurrentPly += 1;
         this.emit();
@@ -1652,7 +1685,7 @@ export class GameStore {
   private stopReplayAutoPlay(): void {
     this.replayPlaying = false;
     if (this.replayTimer !== null) {
-      window.clearInterval(this.replayTimer);
+      globalThis.clearInterval(this.replayTimer);
       this.replayTimer = null;
     }
   }
@@ -1749,6 +1782,8 @@ export class GameStore {
       visibleRank: 'UNKNOWN' as const,
     }));
 
+    const cSpec = CLOCK_PRESET_SPECS[this.getOptions().clockPreset];
+
     return {
       phase: this.phase,
       matchMode: this.matchMode,
@@ -1758,7 +1793,8 @@ export class GameStore {
       campaign: this.campaign,
       matchClockSec: this.matchClockSec,
       turnClockSec: this.turnClockSec,
-      turnClockMaxSec: TURN_CLOCK_DEFAULT_SEC,
+      turnClockMaxSec: Math.max(1, cSpec.turnSec || 45),
+      isUntimed: cSpec.isUntimed,
       shroud: this.shroud,
       publicLog: this.publicLog,
       intelLedger,
@@ -2043,7 +2079,7 @@ export class GameStore {
     this.stopMatchClocks();
     this.stopReplayAutoPlay();
     if (this.aiTurnTimer !== null) {
-      window.clearTimeout(this.aiTurnTimer);
+      globalThis.clearTimeout(this.aiTurnTimer);
       this.aiTurnTimer = null;
     }
   }

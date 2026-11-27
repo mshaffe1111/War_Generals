@@ -95,6 +95,7 @@ export interface UIManagerCallbacks {
 
 type TitleSubView = 'ROOT' | 'SKIRMISH' | 'CAMPAIGN';
 type ActiveDrawer = 'NONE' | 'INTEL' | 'LOG' | 'OPTIONS' | 'SHOWCASE';
+type OptionsTab = 'RULES' | 'AUDIO_GPU';
 
 export class UIManager {
   private readonly root: HTMLElement;
@@ -104,6 +105,7 @@ export class UIManager {
 
   private titleSubView: TitleSubView = 'ROOT';
   private activeDrawer: ActiveDrawer = 'NONE';
+  private optionsTab: OptionsTab = 'RULES';
   private fullscreenActive = false;
   private saveSlotArmed = false;
   private suspectTargetPieceId: string | null = null;
@@ -343,7 +345,7 @@ export class UIManager {
             </button>
           </div>
 
-          <!-- Sub-Panel A: Skirmish Commander & Era Selector -->
+          <!-- Sub-Panel A: Skirmish Commander, Era & Difficulty Selector -->
           <div class="title-sub-sheet" id="title-sub-skirmish" hidden>
             <div class="sub-sheet-header">
               <span class="sub-sheet-title">SKIRMISH BRIEFING</span>
@@ -354,10 +356,19 @@ export class UIManager {
             </div>
             <div class="cmd-dossier-blurb" id="skirmish-cmd-summary"></div>
             <div class="era-inline-row">
-              <span class="era-inline-label">ERA RULESET</span>
+              <span class="era-inline-label">ERA EDITION</span>
               <div class="seg-track" id="seg-skirmish-era">
                 <button type="button" data-sk-era="1980s">1980s Electronic</button>
                 <button type="button" data-sk-era="1970s">1970s Classic</button>
+              </div>
+            </div>
+            <div class="era-inline-row">
+              <span class="era-inline-label">DIFFICULTY</span>
+              <div class="seg-track" id="seg-skirmish-diff">
+                <button type="button" data-sk-diff="RECRUIT">Recruit</button>
+                <button type="button" data-sk-diff="OFFICER">Officer</button>
+                <button type="button" data-sk-diff="GENERAL">General</button>
+                <button type="button" data-sk-diff="SUPREME_MARSHAL">Marshal</button>
               </div>
             </div>
             <button type="button" class="primary-brass-cta cta-sheen" id="btn-start-skirmish">
@@ -502,67 +513,120 @@ export class UIManager {
           </div>
         </div>
 
-        <!-- Pop-up Sheet: Options, Era Rules & 4-Bus Audio Mixer -->
+        <!-- Pop-up Sheet: Options, Era Editions, Difficulty, Ergonomics & 5-Control Audio/GPU -->
         <div class="smoked-sheet" id="sheet-options" hidden>
           <div class="sub-sheet-header">
-            <span class="sub-sheet-title">OPTIONS &amp; ERA RULES</span>
+            <div class="seg-track" id="seg-opt-tabs">
+              <button type="button" data-opt-tab="RULES" data-selected="true">ERA &amp; UX</button>
+              <button type="button" data-opt-tab="AUDIO_GPU">AUDIO &amp; GPU</button>
+            </div>
             <div class="hud-orb-cluster">
               <button type="button" class="mini-brass-btn" id="btn-opt-showcase">SHOWCASE</button>
-              <button type="button" class="mini-brass-btn" id="btn-opt-mainmenu">MAIN MENU</button>
+              <button type="button" class="mini-brass-btn" id="btn-opt-mainmenu">MENU</button>
               <button type="button" class="mini-brass-btn" data-close-sheet="true">✕</button>
             </div>
           </div>
-          <div class="options-grid">
+
+          <!-- Tab 1: Era Editions, Difficulty, Handedness, Battle Pacing & Match Clocks -->
+          <div class="options-grid" id="opt-pane-rules">
             <div class="setting-row">
-              <span>Era &amp; Flag Rule</span>
+              <span>Era Edition</span>
               <div class="seg-track" id="seg-era">
-                <button type="button" data-era="1980s" title="Instant back-row Flag win">1980s Instant</button>
-                <button type="button" data-era="1970s" title="1-turn deferred Flag check">1970s Classic</button>
+                <button type="button" data-era="1980s" title="Sudden-Death Back-Row Flag Win">1980s Electronic</button>
+                <button type="button" data-era="1970s" title="Deferred 1-Turn Adjacent Flag Bluff">1970s Classic</button>
+              </div>
+            </div>
+            <div class="era-rule-callout" id="opt-era-rule-note">
+              1980s Sudden-Death: Flag reaching opponent back rank wins immediately.
+            </div>
+            <div class="setting-row">
+              <span>Board Finish</span>
+              <div class="seg-track" id="seg-finish">
+                <button type="button" data-finish="WALNUT_SLATE">Oiled Walnut</button>
+                <button type="button" data-finish="RETRO_BAKELITE">1980 Bakelite</button>
               </div>
             </div>
             <div class="setting-row">
-              <span>Display</span>
-              <div class="seg-track" id="seg-fullscreen">
-                <button type="button" data-fs="false">Framed</button>
-                <button type="button" data-fs="true">Fullscreen</button>
+              <span>Difficulty</span>
+              <div class="seg-track" id="seg-difficulty">
+                <button type="button" data-diff="RECRUIT">Recruit</button>
+                <button type="button" data-diff="OFFICER">Officer</button>
+                <button type="button" data-diff="GENERAL">General</button>
+                <button type="button" data-diff="SUPREME_MARSHAL">Marshal</button>
               </div>
             </div>
             <div class="setting-row">
-              <span>Camera Tilt</span>
-              <div class="seg-track" id="seg-view">
-                <button type="button" data-view="COMMAND">40° Hero</button>
-                <button type="button" data-view="TACTICAL">32° Low</button>
-                <button type="button" data-view="OVERHEAD">62° Top</button>
+              <span>Handedness</span>
+              <div class="seg-track" id="seg-handedness">
+                <button type="button" data-hand="RIGHT">Right-Hand</button>
+                <button type="button" data-hand="LEFT">Left-Hand</button>
               </div>
             </div>
             <div class="setting-row">
-              <span>Battle Pace</span>
+              <span>Battle Pacing</span>
               <div class="seg-track" id="seg-speed">
-                <button type="button" data-speed="1x">1x Cinema</button>
-                <button type="button" data-speed="1.75x">1.75x Fast</button>
+                <button type="button" data-speed="THEATRICAL">Theatrical 4.0s</button>
+                <button type="button" data-speed="TACTICAL_FAST">Fast 1.6s</button>
               </div>
             </div>
             <div class="setting-row">
-              <span>Music Bus</span>
-              <input type="range" class="bus-slider" id="slider-music" min="0" max="100" step="5" value="85" aria-label="Music Bus" />
+              <span>Match Clocks</span>
+              <div class="seg-track" id="seg-clocks">
+                <button type="button" data-clock="BLITZ">Blitz 5m</button>
+                <button type="button" data-clock="STANDARD">Std 10m</button>
+                <button type="button" data-clock="UNTIMED">Untimed</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab 2: Graphics / Battery Saver, Camera, Fullscreen & 4-Bus + Master Audio Mixer -->
+          <div class="options-grid" id="opt-pane-audio" hidden>
+            <div class="setting-row">
+              <span>Graphics &amp; FPS</span>
+              <div class="seg-track" id="seg-quality">
+                <button type="button" data-quality="ULTRA">Ultra 60FPS</button>
+                <button type="button" data-quality="BATTERY_SAVER">Battery 30FPS</button>
+              </div>
             </div>
             <div class="setting-row">
-              <span>SFX Foley</span>
-              <input type="range" class="bus-slider" id="slider-sfx" min="0" max="100" step="5" value="95" aria-label="SFX Bus" />
+              <span>Display &amp; Tilt</span>
+              <div class="hud-orb-cluster">
+                <div class="seg-track" id="seg-fullscreen">
+                  <button type="button" data-fs="false">Framed</button>
+                  <button type="button" data-fs="true">Full</button>
+                </div>
+                <div class="seg-track" id="seg-view">
+                  <button type="button" data-view="COMMAND">40°</button>
+                  <button type="button" data-view="TACTICAL">32°</button>
+                  <button type="button" data-view="OVERHEAD">62°</button>
+                </div>
+              </div>
             </div>
             <div class="setting-row">
-              <span>Ambiance</span>
-              <input type="range" class="bus-slider" id="slider-ambiance" min="0" max="100" step="5" value="75" aria-label="Ambiance Bus" />
+              <span>Master Vol</span>
+              <input type="range" class="bus-slider" id="slider-master" min="0" max="100" step="5" value="90" aria-label="Master Volume" />
             </div>
             <div class="setting-row">
-              <span>Haptics / Audio</span>
+              <span>Battle Music</span>
+              <input type="range" class="bus-slider" id="slider-music" min="0" max="100" step="5" value="85" aria-label="Battle Music Volume" />
+            </div>
+            <div class="setting-row">
+              <span>Tabletop SFX</span>
+              <input type="range" class="bus-slider" id="slider-sfx" min="0" max="100" step="5" value="95" aria-label="Tabletop SFX Volume" />
+            </div>
+            <div class="setting-row">
+              <span>Tent Ambiance</span>
+              <input type="range" class="bus-slider" id="slider-ambiance" min="0" max="100" step="5" value="75" aria-label="Tent Ambiance Volume" />
+            </div>
+            <div class="setting-row">
+              <span>Haptics / Mute</span>
               <div class="hud-orb-cluster">
                 <div class="seg-track" id="seg-haptics">
-                  <button type="button" data-haptics="true">Vib</button>
+                  <button type="button" data-haptics="true">Vib On</button>
                   <button type="button" data-haptics="false">Off</button>
                 </div>
                 <div class="seg-track" id="seg-mute">
-                  <button type="button" data-mute="false">Sound</button>
+                  <button type="button" data-mute="false">Audio On</button>
                   <button type="button" data-mute="true">Mute</button>
                 </div>
               </div>
@@ -807,6 +871,14 @@ export class UIManager {
     const hostRect = this.root.getBoundingClientRect();
     const localX = clampVal(clientX - hostRect.left, 82, Math.max(82, hostRect.width - 82));
     const localY = clampVal(clientY - hostRect.top, 82, Math.max(82, hostRect.height - 82));
+    const dirSign = this.store.getOptions().handedness === 'LEFT' ? -1 : 1;
+    const orbs = this.suspectWheel.querySelectorAll<HTMLButtonElement>('.suspect-orb');
+    orbs.forEach((btn, idx) => {
+      const ang = dirSign * (idx / orbs.length) * Math.PI * 2 - Math.PI / 2;
+      const rx = Math.round(Math.cos(ang) * 58);
+      const ry = Math.round(Math.sin(ang) * 58);
+      btn.style.transform = `translate(calc(-50% + ${rx}px), calc(-50% + ${ry}px))`;
+    });
     this.suspectWheel.style.left = `${localX}px`;
     this.suspectWheel.style.top = `${localY}px`;
     this.suspectWheel.hidden = false;
@@ -827,6 +899,9 @@ export class UIManager {
     const inReplay = view.phase === 'REPLAY' && !inInspect;
     const inGameOver = view.phase === 'GAME_OVER' && !inInspect && !inArbiter;
     const shrouded = Boolean(view.shroud?.active);
+
+    document.body.dataset['handedness'] = options.handedness;
+    document.body.dataset['era'] = options.eraMode;
 
     if (inArbiter) {
       this.activeDrawer = 'NONE';
@@ -889,15 +964,25 @@ export class UIManager {
     const showTopTrio = inPlay || inArbiter;
     this.playTopTrio.hidden = !showTopTrio;
     if (showTopTrio) {
-      this.countdownVal.textContent = formatClock(view.matchClockSec);
-      this.roundTimerVal.textContent = formatClock(view.turnClockSec);
-      const isUrgent = !inArbiter && view.turnClockSec <= 10;
-      this.roundTimerPill.dataset['urgent'] = String(isUrgent);
+      if (view.isUntimed) {
+        this.countdownVal.textContent = '∞';
+        this.roundTimerVal.textContent = '∞';
+        this.roundTimerPill.dataset['urgent'] = 'false';
+        this.turnProgressFill.style.width = '100%';
+      } else {
+        this.countdownVal.textContent = formatClock(view.matchClockSec);
+        this.roundTimerVal.textContent = formatClock(view.turnClockSec);
+        const isUrgent = !inArbiter && view.turnClockSec <= 10;
+        this.roundTimerPill.dataset['urgent'] = String(isUrgent);
 
-      const pct = Math.max(0, Math.min(100, (view.turnClockSec / view.turnClockMaxSec) * 100));
-      this.turnProgressFill.style.width = `${inArbiter ? 100 : pct}%`;
+        const pct = Math.max(0, Math.min(100, (view.turnClockSec / view.turnClockMaxSec) * 100));
+        this.turnProgressFill.style.width = `${inArbiter ? 100 : pct}%`;
+      }
 
-      if (inArbiter) {
+      document.body.dataset['handedness'] = options.handedness;
+    document.body.dataset['era'] = options.eraMode;
+
+    if (inArbiter) {
         this.centerStateText.textContent =
           view.banner === 'ARBITRATING' ? 'ARBITRATING' : view.banner;
         this.centerStatePill.dataset['tone'] =
@@ -1086,15 +1171,37 @@ export class UIManager {
       inspectBtn.textContent = inInspect ? 'Back to Board' : '16-Rank Gallery';
     }
 
-    // Sync Options Controls
+    // Sync Options Tabs & Controls
+    const rulesPane = this.root.querySelector<HTMLElement>('#opt-pane-rules');
+    const audioPane = this.root.querySelector<HTMLElement>('#opt-pane-audio');
+    if (rulesPane) rulesPane.hidden = this.optionsTab !== 'RULES';
+    if (audioPane) audioPane.hidden = this.optionsTab !== 'AUDIO_GPU';
+    this.syncSeg('#seg-opt-tabs button', 'optTab', this.optionsTab);
+
+    const eraNote = this.root.querySelector<HTMLElement>('#opt-era-rule-note');
+    if (eraNote) {
+      eraNote.textContent =
+        options.eraMode === '1980s'
+          ? '1980s Electronic: Flag reaching opponent back rank wins immediately on the spot.'
+          : '1970s Classic: Contested Flag on back rank stays unrevealed & must survive 1 opponent turn!';
+    }
+
     this.syncSeg('#seg-skirmish-era button', 'skEra', options.eraMode);
+    this.syncSeg('#seg-skirmish-diff button', 'skDiff', options.difficulty);
     this.syncSeg('#seg-fullscreen button', 'fs', String(this.fullscreenActive));
     this.syncSeg('#seg-view button', 'view', options.boardView);
     this.syncSeg('#seg-era button', 'era', options.eraMode);
+    this.syncSeg('#seg-finish button', 'finish', options.boardFinish);
+    this.syncSeg('#seg-difficulty button', 'diff', options.difficulty);
+    this.syncSeg('#seg-handedness button', 'hand', options.handedness);
+    this.syncSeg('#seg-clocks button', 'clock', options.clockPreset);
+    this.syncSeg('#seg-quality button', 'quality', options.renderQuality);
     this.syncSeg('#seg-haptics button', 'haptics', String(options.hapticsEnabled));
     this.syncSeg('#seg-speed button', 'speed', options.arbiterSpeed);
     this.syncSeg('#seg-mute button', 'mute', String(options.audioMuted));
 
+    const masSlider = this.root.querySelector<HTMLInputElement>('#slider-master');
+    if (masSlider) masSlider.value = String(Math.round(options.masterVolume * 100));
     const mSlider = this.root.querySelector<HTMLInputElement>('#slider-music');
     if (mSlider) mSlider.value = String(Math.round(options.musicVolume * 100));
     const sSlider = this.root.querySelector<HTMLInputElement>('#slider-sfx');
@@ -1324,6 +1431,14 @@ export class UIManager {
         this.sound.setEraMode(era);
         this.sound.playUiClick();
         this.store.updateOptions({ eraMode: era });
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>('#seg-skirmish-diff button').forEach((b) => {
+      b.addEventListener('click', () => {
+        const difficulty = b.dataset['skDiff'] as AppOptions['difficulty'];
+        this.sound.playUiClick();
+        this.store.updateOptions({ difficulty });
       });
     });
 
@@ -1661,12 +1776,60 @@ export class UIManager {
       });
     });
 
+    this.root.querySelectorAll<HTMLButtonElement>('#seg-opt-tabs button').forEach((b) => {
+      b.addEventListener('click', () => {
+        this.optionsTab = b.dataset['optTab'] as OptionsTab;
+        this.sound.playUiClick();
+        this.render(this.store.getVisibleView(), this.store.getOptions());
+      });
+    });
+
     this.root.querySelectorAll<HTMLButtonElement>('#seg-era button').forEach((b) => {
       b.addEventListener('click', () => {
         const era = b.dataset['era'] as AppOptions['eraMode'];
         this.sound.setEraMode(era);
         this.sound.playUiClick();
         this.store.updateOptions({ eraMode: era });
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>('#seg-finish button').forEach((b) => {
+      b.addEventListener('click', () => {
+        const boardFinish = b.dataset['finish'] as AppOptions['boardFinish'];
+        this.sound.playUiClick();
+        this.store.updateOptions({ boardFinish });
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>('#seg-difficulty button').forEach((b) => {
+      b.addEventListener('click', () => {
+        const difficulty = b.dataset['diff'] as AppOptions['difficulty'];
+        this.sound.playUiClick();
+        this.store.updateOptions({ difficulty });
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>('#seg-handedness button').forEach((b) => {
+      b.addEventListener('click', () => {
+        const handedness = b.dataset['hand'] as AppOptions['handedness'];
+        this.sound.playUiClick();
+        this.store.updateOptions({ handedness });
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>('#seg-clocks button').forEach((b) => {
+      b.addEventListener('click', () => {
+        const clockPreset = b.dataset['clock'] as AppOptions['clockPreset'];
+        this.sound.playUiClick();
+        this.store.updateOptions({ clockPreset });
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>('#seg-quality button').forEach((b) => {
+      b.addEventListener('click', () => {
+        const renderQuality = b.dataset['quality'] as AppOptions['renderQuality'];
+        this.sound.playUiClick();
+        this.store.updateOptions({ renderQuality });
       });
     });
 
@@ -1695,7 +1858,10 @@ export class UIManager {
       });
     });
 
-    const bindBusSlider = (id: string, key: 'musicVolume' | 'sfxVolume' | 'ambianceVolume') => {
+    const bindBusSlider = (
+      id: string,
+      key: 'masterVolume' | 'musicVolume' | 'sfxVolume' | 'ambianceVolume'
+    ) => {
       const el = this.root.querySelector<HTMLInputElement>(id);
       if (!el) return;
       el.addEventListener('input', () => {
@@ -1707,6 +1873,7 @@ export class UIManager {
         this.sound.playUiClick();
       });
     };
+    bindBusSlider('#slider-master', 'masterVolume');
     bindBusSlider('#slider-music', 'musicVolume');
     bindBusSlider('#slider-sfx', 'sfxVolume');
     bindBusSlider('#slider-ambiance', 'ambianceVolume');
