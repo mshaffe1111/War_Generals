@@ -1,3 +1,4 @@
+import type { CommanderProfile } from '../core/CommanderProfiles';
 import { BOARD_COLS, BOARD_ROWS, ORDERED_RANKS, type RankId } from '../core/ranks';
 import { resolveClash } from '../core/RulesEngine';
 import type { AIBeliefState } from './AIBeliefState';
@@ -36,8 +37,13 @@ export class AIStrategist {
   public chooseMove(
     aiPieces: readonly AIOwnPieceInfo[],
     playerPieces: readonly ObservedPlayerPieceInfo[],
-    belief: AIBeliefState
+    belief: AIBeliefState,
+    commander?: CommanderProfile
   ): AIDecision | null {
+    const jitterSpan = commander?.decisionJitter ?? 3.5;
+    const aggMul = commander?.aggressionBias ?? 1.0;
+    const spyWeight = commander?.spyHuntWeight ?? 1.0;
+
     const aiByCoord = new Map<string, AIOwnPieceInfo>();
     for (const a of aiPieces) aiByCoord.set(`${a.col},${a.row}`, a);
 
@@ -62,10 +68,9 @@ export class AIStrategist {
         if (aiByCoord.has(`${nc},${nr}`)) continue;
 
         const targetPlayer = playerByCoord.get(`${nc},${nr}`);
-        let score = (Math.random() - 0.5) * 3.5; // human unpredictability jitter
+        let score = (Math.random() - 0.5) * jitterSpan;
 
         if (unit.ownRank === 'FLAG') {
-          // Only march AI Flag if path to Row 7 is wide open or escaping immediate danger!
           const adjDanger = playerPieces.some(
             (p) => Math.abs(p.col - unit.col) + Math.abs(p.row - unit.row) === 1
           );
@@ -73,41 +78,41 @@ export class AIStrategist {
             (p) => Math.abs(p.col - nc) + Math.abs(p.row - nr) === 1
           );
           if (nr === BOARD_ROWS - 1 && !nextDanger && !targetPlayer) {
-            score += 500; // Winning Flag Traverse!
+            score += 500;
           } else if (adjDanger && !nextDanger && !targetPlayer) {
-            score += 48; // Evade adjacent attacker!
+            score += 48;
           } else {
-            score -= 80; // Keep Flag safely tucked!
+            score -= 80;
           }
         } else if (targetPlayer) {
-          // Evaluate Bayesian expected win value against `AIBeliefState`!
-          const expectedWin = this.estimateExpectedClashScore(unit.ownRank, targetPlayer, belief);
-          score += expectedWin;
+          const expectedWin = this.estimateExpectedClashScore(
+            unit.ownRank,
+            targetPlayer,
+            belief,
+            spyWeight
+          );
+          score += expectedWin * aggMul;
 
-          // Defend AI Flag aggressively if a Player piece crept within 2 squares of AI Flag!
           if (
             aiFlag &&
             Math.abs(targetPlayer.col - aiFlag.col) + Math.abs(targetPlayer.row - aiFlag.row) <= 2
           ) {
             score += 28;
           }
-          // Unmoved Player piece on Row 7 = prime Flag suspect!
           if (!targetPlayer.hasMoved && targetPlayer.row === 7) {
-            score += 34;
+            score += 34 * aggMul;
           }
         } else {
-          // Positional Maneuvering: advance south (`dr > 0`) toward Player territory & center control
-          if (d.dr > 0) score += 9.5;
+          if (d.dr > 0) score += 9.5 * aggMul;
           if (d.dr < 0) score -= 5.5;
           score += (4 - Math.abs(nc - 4)) * 0.8;
 
-          // Pull Spies & Generals toward blooded Player threats (`publicKills >= 1`)
           if (unit.ownRank === 'SPY' || unit.ownRank === 'GEN_5' || unit.ownRank === 'GEN_4') {
             for (const p of playerPieces) {
               if (p.publicKills >= 1) {
                 const distNow = Math.abs(unit.col - p.col) + Math.abs(unit.row - p.row);
                 const distNext = Math.abs(nc - p.col) + Math.abs(nr - p.row);
-                if (distNext < distNow) score += 6.5;
+                if (distNext < distNow) score += 6.5 * spyWeight;
               }
             }
           }
@@ -128,7 +133,8 @@ export class AIStrategist {
   private estimateExpectedClashScore(
     aiRank: RankId,
     target: ObservedPlayerPieceInfo,
-    belief: AIBeliefState
+    belief: AIBeliefState,
+    spyWeight = 1.0
   ): number {
     const probs = belief.getPieceProbabilities(target.id);
     let ev = 0;
@@ -144,18 +150,14 @@ export class AIStrategist {
       } else if (res === 'SPLIT') {
         ev += p * 4;
       } else {
-        // Penalize losing high-value AI officers more than losing a scouting Private
         const lossCost = aiRank === 'PRIVATE' ? -10 : aiRank === 'SPY' ? -26 : -22;
         ev += p * lossCost;
       }
     }
 
-    // Heuristic deduction on public behavior (still 0% cheat!):
-    // If target already has 2+ public kills, Spies & 5-Star Generals love hunting it!
     if (target.publicKills >= 2 && (aiRank === 'SPY' || aiRank === 'GEN_5')) {
-      ev += 24;
+      ev += 24 * spyWeight;
     }
-    // Scouting Privates love probing unknown vanguard pieces!
     if (aiRank === 'PRIVATE' && target.publicKills === 0) {
       ev += 14;
     }

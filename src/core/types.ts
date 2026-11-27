@@ -1,3 +1,4 @@
+import type { CampaignProgressState, CommanderId } from './CommanderProfiles';
 import type { Faction, RankId } from './ranks';
 
 export interface GridCoord {
@@ -7,7 +8,16 @@ export interface GridCoord {
 
 export type MoveDirection = 'UP' | 'DOWN' | 'LEFT' | 'RIGHT';
 
-export type MatchPhase = 'DEPLOY' | 'PLAY' | 'GAME_OVER' | 'REPLAY';
+export type MatchPhase =
+  | 'TITLE'
+  | 'DEPLOY'
+  | 'PLAY'
+  | 'GAME_OVER'
+  | 'REPLAY'
+  | 'ARMORY'
+  | 'FIELD_MANUAL';
+
+export type MatchMode = 'SKIRMISH' | 'CAMPAIGN' | 'PASS_AND_PLAY';
 export type SuspectTag = 'SPY?' | 'GEN?' | 'PVT?' | 'OFF?' | 'FLAG?';
 export type DeploymentPresetId = 'VACCINATION' | 'MOTHERSHIP' | 'IRON_BLITZ' | 'MIRAGE_DECOY';
 
@@ -36,7 +46,7 @@ export interface TruthPieceRecord {
 
 /**
  * PLAYER-VISIBLE PIECE PROJECTION.
- * Enemy wedges ALWAYS carry visibleRank: 'UNKNOWN' during active play (`DEPLOY` / `PLAY`).
+ * Non-viewing faction wedges ALWAYS carry visibleRank: 'UNKNOWN' during active play (`DEPLOY` / `PLAY`).
  */
 export interface VisiblePieceView {
   readonly id: string;
@@ -88,7 +98,7 @@ export interface ArbiterVerdict {
   readonly defenderId: string;
   readonly defenderFaction: Faction;
   readonly playerPieceId: string;
-  readonly playerVisibleRank: RankId;
+  readonly playerVisibleRank: RankId | 'UNKNOWN';
   readonly enemyPieceId: string;
   readonly survivorId: string | null;
   readonly survivorFaction: Faction | null;
@@ -128,7 +138,66 @@ export interface DeclassifiedReplayView {
   readonly plies: readonly ReplayPlyEntry[];
 }
 
-export type CameraMode = 'PLAY' | 'ARBITER' | 'INSPECT_16' | 'REPLAY';
+// -----------------------------------------------------------------------------
+// Block 5: Command Shroud (2P Local), Public Log, Intel Ledger, Dossier & 3D Field Manual
+// -----------------------------------------------------------------------------
+
+export interface CommandShroudState {
+  readonly active: boolean;
+  readonly nextFaction: Faction;
+  readonly headline: string;
+  readonly subline: string;
+}
+
+export interface PublicCombatLogEntry {
+  readonly turn: number;
+  readonly actor: Faction | 'SYSTEM';
+  readonly text: string;
+  readonly isClash: boolean;
+}
+
+export interface IntelLedgerSummary {
+  readonly ownOfficersAlive: number;
+  readonly ownPrivatesAlive: number;
+  readonly ownSpiesAlive: number;
+  readonly ownFlagAlive: boolean;
+  readonly ownCasualtiesTotal: number;
+  readonly enemyUnconfirmedAlive: number;
+  readonly enemyEliminatedTotal: number;
+  readonly enemyVeteranCount: number;
+  readonly enemyTaggedCount: number;
+}
+
+export interface MatchDossierSummary {
+  readonly winner: Faction;
+  readonly playerWon: boolean;
+  readonly winnerLabel: string;
+  readonly winMethod: string;
+  readonly detailNote: string;
+  readonly turnsElapsed: number;
+  readonly clashesWonByPlayer: number;
+  readonly clashesWonByEnemy: number;
+  readonly survivingHighOfficer: string;
+  readonly matchDurationFormatted: string;
+  readonly campaignMedalUnlocked: string | null;
+}
+
+export type ManualRankOutcome = 'SELECTED' | 'DEFEATS' | 'THREAT' | 'SPLIT' | 'FLAG_ATTACK_WIN';
+
+export interface FieldManualEntry {
+  readonly rank: RankId;
+  readonly col: number;
+  readonly row: number;
+  readonly outcome: ManualRankOutcome;
+}
+
+export type CameraMode =
+  | 'TITLE'
+  | 'PLAY'
+  | 'ARBITER'
+  | 'INSPECT_16'
+  | 'REPLAY'
+  | 'FIELD_MANUAL';
 
 export type BoardViewAngle = 'COMMAND' | 'TACTICAL' | 'OVERHEAD';
 export type AudioEraMode = '1980s' | '1970s';
@@ -148,7 +217,10 @@ export interface AppOptions {
 }
 
 export type HudBannerState =
+  | 'WAR GENERALS'
   | 'TACTICAL DEPLOYMENT'
+  | 'FORMATION ARMORY'
+  | 'FIELD MANUAL & RANKS'
   | 'TACTICAL COMMAND'
   | 'ENEMY MANEUVERING...'
   | 'SELECT TARGET'
@@ -171,7 +243,20 @@ export type HudBannerState =
 
 export interface PlayerVisibleView {
   readonly phase: MatchPhase;
+  readonly matchMode: MatchMode;
+  readonly viewingFaction: Faction;
   readonly activeTurn: Faction;
+  readonly commanderId: CommanderId;
+  readonly campaign: CampaignProgressState;
+  readonly matchClockSec: number;
+  readonly turnClockSec: number;
+  readonly turnClockMaxSec: number;
+  readonly shroud: CommandShroudState | null;
+  readonly publicLog: readonly PublicCombatLogEntry[];
+  readonly intelLedger: IntelLedgerSummary;
+  readonly dossier: MatchDossierSummary | null;
+  readonly manualSelectedRank: RankId;
+  readonly manualEntries: readonly FieldManualEntry[];
   readonly pieces: readonly VisiblePieceView[];
   readonly playerCasualties: readonly CasualtyView[];
   readonly enemyCasualties: readonly CasualtyView[];

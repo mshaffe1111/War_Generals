@@ -89,6 +89,33 @@ export function isPlayerHomeSquare(col: number, row: number): boolean {
   return col >= 0 && col < BOARD_COLS && row >= 5 && row <= 7;
 }
 
+export function isFactionHomeSquare(faction: Faction, col: number, row: number): boolean {
+  if (col < 0 || col >= BOARD_COLS) return false;
+  return faction === 'PLAYER' ? row >= 5 && row <= 7 : row >= 0 && row <= 2;
+}
+
+export function validateFactionDeployment(
+  faction: Faction,
+  slots: readonly DeploymentSlot[]
+): boolean {
+  if (slots.length !== ARMY_PIECE_TOTAL) return false;
+  const seenCoords = new Set<string>();
+  const counts = new Map<RankId, number>();
+
+  for (const s of slots) {
+    if (!isFactionHomeSquare(faction, s.col, s.row)) return false;
+    const key = `${s.col},${s.row}`;
+    if (seenCoords.has(key)) return false;
+    seenCoords.add(key);
+    counts.set(s.rank, (counts.get(s.rank) ?? 0) + 1);
+  }
+
+  for (const r of ORDERED_RANKS) {
+    if ((counts.get(r) ?? 0) !== RANK_SPECS[r].countPerArmy) return false;
+  }
+  return true;
+}
+
 export function isOrthogonalSingleStep(from: GridCoord, to: GridCoord): boolean {
   if (to.col < 0 || to.col >= BOARD_COLS || to.row < 0 || to.row >= BOARD_ROWS) return false;
   return Math.abs(from.col - to.col) + Math.abs(from.row - to.row) === 1;
@@ -304,11 +331,31 @@ export function generateSmartAutoDeploy(): DeploymentSlot[] {
 /**
  * Generates an authentic Enemy deployment on Enemy Home Rows `0..2` (`row' = 7 - row`).
  */
-export function generateEnemyTournamentDeployment(): DeploymentSlot[] {
-  const base = generateSmartAutoDeploy();
+export function generateEnemyTournamentDeployment(
+  preferredPreset?: DeploymentPresetId
+): DeploymentSlot[] {
+  const base = preferredPreset
+    ? (Math.random() < 0.5
+        ? mirrorDeploymentLR(TOURNAMENT_PRESETS[preferredPreset])
+        : TOURNAMENT_PRESETS[preferredPreset].map((s) => ({ ...s })))
+    : generateSmartAutoDeploy();
   return base.map((s) => ({
     col: BOARD_COLS - 1 - s.col,
     row: BOARD_ROWS - 1 - s.row, // maps 5..7 -> 2..0!
+    rank: s.rank,
+  }));
+}
+
+export function projectPresetForFaction(
+  faction: Faction,
+  slots: readonly DeploymentSlot[]
+): DeploymentSlot[] {
+  if (faction === 'PLAYER') {
+    return slots.map((s) => ({ ...s }));
+  }
+  return slots.map((s) => ({
+    col: BOARD_COLS - 1 - s.col,
+    row: BOARD_ROWS - 1 - s.row,
     rank: s.rank,
   }));
 }

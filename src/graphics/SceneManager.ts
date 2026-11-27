@@ -5,17 +5,20 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { ArbiterStage3D } from '../arbiter/ArbiterStage3D';
 import type { SoundDirector } from '../audio/SoundDirector';
-import { BOARD_COLS, BOARD_ROWS, type RankId } from '../core/ranks';
-import { isPlayerHomeSquare } from '../core/RulesEngine';
+import { BOARD_COLS, BOARD_ROWS, type Faction, type RankId } from '../core/ranks';
+import { isFactionHomeSquare } from '../core/RulesEngine';
 import type {
   AppOptions,
   ArbiterVerdict,
   BoardViewAngle,
   CameraMode,
   CasualtyView,
+  FieldManualEntry,
   MatchPhase,
+  MoveDirection,
   PlayerVisibleView,
   ReplayPlyEntry,
+  ValidMoveTarget,
   VisiblePieceView,
 } from '../core/types';
 import type { GameStore } from '../state/GameStore';
@@ -75,6 +78,7 @@ export class SceneManager {
 
   private readonly boardPiecesRoot = new THREE.Group();
   private readonly replayPiecesRoot = new THREE.Group();
+  private readonly fieldManualRoot = new THREE.Group();
   private readonly dragGhostRoot = new THREE.Group();
   private readonly onBoardInspectGroup: THREE.Group;
   private readonly casualtyPiecesRoot = new THREE.Group();
@@ -84,11 +88,14 @@ export class SceneManager {
   private readonly pieceVisuals = new Map<string, PieceVisualInstance>();
   private readonly casualtyVisuals = new Map<string, THREE.Group>();
   private renderedReplayKey = '';
+  private renderedManualKey = '';
 
-  private phase: MatchPhase = 'DEPLOY';
-  private cameraMode: CameraMode = 'PLAY';
+  private phase: MatchPhase = 'TITLE';
+  private viewingFaction: Faction = 'PLAYER';
+  private cameraMode: CameraMode = 'TITLE';
   private boardView: BoardViewAngle = 'COMMAND';
   private selectedPieceId: string | null = null;
+  private turnClockSec = 45;
   private userPitchDeltaDeg = 0;
 
   private activeDrag: ActiveHologramDrag | null = null;
@@ -96,16 +103,15 @@ export class SceneManager {
   private readonly defaultBgColor = new THREE.Color('#06080c');
   private readonly replayBgColor = new THREE.Color('#020a16');
 
-  private readonly camCurrentPos = new THREE.Vector3(0, 12.5, 16.5);
-  private readonly camCurrentLook = new THREE.Vector3(0, 0.15, -0.55);
-  private readonly camTargetPos = new THREE.Vector3(0, 12.5, 16.5);
-  private readonly camTargetLook = new THREE.Vector3(0, 0.15, -0.55);
+  private readonly camCurrentPos = new THREE.Vector3(0, 5.15, 11.4);
+  private readonly camCurrentLook = new THREE.Vector3(0, 0.05, 0.35);
+  private readonly camTargetPos = new THREE.Vector3(0, 5.15, 11.4);
+  private readonly camTargetLook = new THREE.Vector3(0, 0.05, 0.35);
   private roomDimFactor = 1.0;
   private targetRoomDimFactor = 1.0;
 
   private readonly clock = new THREE.Clock();
   private totalElapsed = 0;
-  private idleTurnElapsed = 0;
   private rafId = 0;
   private resizeObserver: ResizeObserver;
 
@@ -195,6 +201,7 @@ export class SceneManager {
     this.scene.add(this.indicatorLayer.root);
     this.scene.add(this.boardPiecesRoot);
     this.scene.add(this.replayPiecesRoot);
+    this.scene.add(this.fieldManualRoot);
     this.scene.add(this.dragGhostRoot);
     this.scene.add(this.casualtyPiecesRoot);
 
@@ -225,10 +232,40 @@ export class SceneManager {
   }
 
   /**
+   * Coordinate rotation helper for 2P Pass & Play (`viewingFaction === 'ENEMY'` spins board 180°
+   * so the active player's home rows ALWAYS sit at `visualRow 5..7` in front of their thumb!).
+   */
+  private logicalToVisualCoord(col: number, row: number): { col: number; row: number } {
+    if (this.viewingFaction === 'ENEMY') {
+      return { col: BOARD_COLS - 1 - col, row: BOARD_ROWS - 1 - row };
+    }
+    return { col, row };
+  }
+
+  private visualToLogicalCoord(vCol: number, vRow: number): { col: number; row: number } {
+    if (this.viewingFaction === 'ENEMY') {
+      return { col: BOARD_COLS - 1 - vCol, row: BOARD_ROWS - 1 - vRow };
+    }
+    return { col: vCol, row: vRow };
+  }
+
+  private logicalToVisualDir(dir: MoveDirection): MoveDirection {
+    if (this.viewingFaction !== 'ENEMY') return dir;
+    if (dir === 'UP') return 'DOWN';
+    if (dir === 'DOWN') return 'UP';
+    if (dir === 'LEFT') return 'RIGHT';
+    return 'LEFT';
+  }
+
+  private isDeployLikePhase(): boolean {
+    return this.phase === 'DEPLOY' || this.phase === 'ARMORY';
+  }
+
+  /**
    * Starts a lifted `+28px` Cyan Holographic Projection Drag directly out of the HTML Mobilization Crate!
    */
   public beginCrateDrag(rank: RankId, clientX: number, clientY: number): void {
-    if (this.phase !== 'DEPLOY' || this.cameraMode !== 'PLAY') return;
+    if (!this.isDeployLikePhase() || this.cameraMode !== 'PLAY') return;
     this.clearActiveDrag();
     this.sound.playPiecePickup();
 
@@ -253,7 +290,8 @@ export class SceneManager {
     this.tiltShiftPass.enabled =
       options.renderQuality === 'ULTRA' &&
       view.cameraMode !== 'INSPECT_16' &&
-      view.cameraMode !== 'REPLAY';
+      view.cameraMode !== 'REPLAY' &&
+      view.cameraMode !== 'FIELD_MANUAL';
 
     if (this.boardView !== options.boardView) {
       this.boardView = options.boardView;
@@ -261,20 +299,36 @@ export class SceneManager {
     }
 
     this.phase = view.phase;
+    this.viewingFaction = view.viewingFaction;
     this.selectedPieceId = view.selectedPieceId;
+    this.turnClockSec = view.turnClockSec;
     this.cameraMode = view.cameraMode;
     this.updateCameraTargets(view.cameraMode);
 
     const isReplay = view.phase === 'REPLAY' || view.cameraMode === 'REPLAY';
-    this.targetRoomDimFactor = view.cameraMode === 'ARBITER' ? 0.56 : isReplay ? 0.34 : 1.0;
+    const isFieldManual = view.phase === 'FIELD_MANUAL' || view.cameraMode === 'FIELD_MANUAL';
+    const isInspect = view.cameraMode === 'INSPECT_16';
+
+    this.targetRoomDimFactor =
+      view.cameraMode === 'ARBITER' ? 0.56 : isReplay ? 0.34 : view.phase === 'TITLE' ? 0.92 : 1.0;
     (this.scene.background as THREE.Color).copy(
       isReplay ? this.replayBgColor : this.defaultBgColor
     );
 
-    this.onBoardInspectGroup.visible = view.cameraMode === 'INSPECT_16';
-    this.boardPiecesRoot.visible = view.cameraMode === 'PLAY' && !isReplay;
+    this.onBoardInspectGroup.visible = isInspect;
+    this.fieldManualRoot.visible = isFieldManual;
     this.replayPiecesRoot.visible = isReplay;
-    this.casualtyPiecesRoot.visible = view.cameraMode !== 'INSPECT_16' && !isReplay;
+    this.boardPiecesRoot.visible =
+      !isInspect && !isFieldManual && !isReplay && (view.cameraMode === 'PLAY' || view.cameraMode === 'TITLE');
+    this.casualtyPiecesRoot.visible = !isInspect && !isFieldManual && !isReplay;
+
+    if (isFieldManual) {
+      this.syncFieldManualScene(view.manualSelectedRank, view.manualEntries);
+      this.indicatorLayer.syncReplayOverlay(false, null, null, false);
+      this.indicatorLayer.syncDeploymentGrid(false, new Set(), null);
+      this.indicatorLayer.sync(null, [], false);
+      return;
+    }
 
     if (isReplay && view.replay) {
       this.syncDeclassifiedReplayScene(view.replay.plies[view.replay.currentPly]);
@@ -295,11 +349,12 @@ export class SceneManager {
     const occupiedHomeKeys = new Set<string>();
     for (const p of view.pieces) {
       activeIds.add(p.id);
-      if (p.faction === 'PLAYER') {
-        occupiedHomeKeys.add(`${p.col},${p.row}`);
+      const vis = this.logicalToVisualCoord(p.col, p.row);
+      if (p.faction === view.viewingFaction) {
+        occupiedHomeKeys.add(`${vis.col},${vis.row}`);
       }
-      const inst = this.getOrCreatePieceVisual(p);
-      inst.targetPos.copy(gridToWorld(p.col, p.row));
+      const inst = this.getOrCreatePieceVisual(p, view.viewingFaction, Boolean(view.shroud?.active));
+      inst.targetPos.copy(gridToWorld(vis.col, vis.row));
       inst.group.visible =
         !clashingIds.has(p.id) && this.activeDrag?.sourcePieceId !== p.id;
     }
@@ -317,22 +372,55 @@ export class SceneManager {
     const selectedPiece = view.selectedPieceId
       ? view.pieces.find((p) => p.id === view.selectedPieceId)
       : undefined;
+    const selectedVis = selectedPiece
+      ? this.logicalToVisualCoord(selectedPiece.col, selectedPiece.row)
+      : null;
 
-    if (view.phase === 'DEPLOY' && view.cameraMode === 'PLAY') {
+    if (this.isDeployLikePhase() && view.cameraMode === 'PLAY' && !view.shroud?.active) {
       this.indicatorLayer.sync(null, [], false);
-      this.indicatorLayer.syncDeploymentGrid(
-        true,
-        occupiedHomeKeys,
-        selectedPiece ? { col: selectedPiece.col, row: selectedPiece.row } : null
-      );
+      this.indicatorLayer.syncDeploymentGrid(true, occupiedHomeKeys, selectedVis);
     } else {
       this.indicatorLayer.syncDeploymentGrid(false, occupiedHomeKeys, null);
+      const visMoves: ValidMoveTarget[] = view.validMoves.map((m) => {
+        const vm = this.logicalToVisualCoord(m.col, m.row);
+        return {
+          ...m,
+          col: vm.col,
+          row: vm.row,
+          direction: this.logicalToVisualDir(m.direction),
+        };
+      });
       this.indicatorLayer.sync(
-        selectedPiece ? { col: selectedPiece.col, row: selectedPiece.row } : null,
-        view.validMoves,
-        view.cameraMode === 'PLAY' && view.phase === 'PLAY' && !view.activeClash
+        selectedVis,
+        visMoves,
+        view.cameraMode === 'PLAY' &&
+          view.phase === 'PLAY' &&
+          !view.activeClash &&
+          !view.shroud?.active
       );
     }
+  }
+
+  private syncFieldManualScene(
+    selectedRank: RankId,
+    entries: readonly FieldManualEntry[]
+  ): void {
+    const key = `${selectedRank}:${entries.length}`;
+    if (this.renderedManualKey === key) return;
+    this.renderedManualKey = key;
+    this.fieldManualRoot.clear();
+
+    // 5 columns × 3 rows centered cleanly inside the 9×8 slate grid (`x = -3.2 .. +3.2`, `z = -1.35 .. +2.45`)!
+    const colWorldX = [-3.2, -1.6, 0.0, 1.6, 3.2];
+    const rowWorldZ = [-1.35, 0.55, 2.45];
+
+    entries.forEach((entry, idx) => {
+      const cx = colWorldX[idx % 5]!;
+      const rz = rowWorldZ[Math.floor(idx / 5)]!;
+      const wedge = this.factory.createFieldManualWedge(entry.rank, entry.outcome);
+      wedge.position.set(cx, 0, rz);
+      this.fieldManualRoot.add(wedge);
+    });
   }
 
   private syncDeclassifiedReplayScene(ply: ReplayPlyEntry | undefined): void {
@@ -432,11 +520,10 @@ export class SceneManager {
     this.arbiterStage.update(dt, elapsed);
     this.indicatorLayer.update(elapsed);
 
+    // Sync final-10-second Round Timer urgency tick with SoundDirector!
     if (this.cameraMode === 'PLAY' && this.phase === 'PLAY' && !this.arbiterStage.isBusy) {
-      this.idleTurnElapsed += dt;
-      this.sound.setTurnWarningUrgent(this.idleTurnElapsed >= 20.0);
+      this.sound.setTurnWarningUrgent(this.turnClockSec <= 10);
     } else {
-      this.idleTurnElapsed = 0;
       this.sound.setTurnWarningUrgent(false);
     }
 
@@ -465,7 +552,25 @@ export class SceneManager {
     }
 
     let desiredCamSpeed = this.cameraMode === 'INSPECT_16' ? 12.0 : 8.5;
-    if (this.cameraMode === 'ARBITER') {
+
+    if (this.cameraMode === 'TITLE') {
+      // Live 3D Start Screen: Slow, low-angle cinematic orbital drift across the active mid-game board!
+      const rect = this.host.getBoundingClientRect();
+      const aspect = Math.max(0.38, (rect.width || 412) / Math.max(1, rect.height || 915));
+      const isLandscape = aspect >= 0.88;
+      const orbAngle = Math.sin(elapsed * 0.18) * 0.46;
+      const radius = isLandscape ? 9.6 : 11.4;
+      const camY = (isLandscape ? 4.15 : 4.85) + Math.sin(elapsed * 0.27) * 0.25;
+      const lookShiftX = isLandscape ? 1.85 : 0.0;
+      this.camTargetPos.set(
+        lookShiftX + Math.sin(orbAngle) * radius * 0.62,
+        camY,
+        Math.cos(orbAngle) * radius
+      );
+      this.camTargetLook.set(lookShiftX + Math.sin(elapsed * 0.14) * 0.35, -0.08, -0.35);
+      desiredCamSpeed = 3.2;
+      this.arbiterHeroSpot.color.setHex(0xffe0b2);
+    } else if (this.cameraMode === 'ARBITER') {
       const rect = this.host.getBoundingClientRect();
       const aspect = Math.max(0.38, (rect.width || 412) / Math.max(1, rect.height || 915));
       const shot = this.arbiterStage.getBattleCameraPose(aspect >= 0.88, aspect);
@@ -529,10 +634,18 @@ export class SceneManager {
     const rect = this.host.getBoundingClientRect();
     const aspect = Math.max(0.38, (rect.width || 412) / Math.max(1, rect.height || 915));
     const isLandscape = aspect >= 0.88;
-    const inDeploy = this.phase === 'DEPLOY' && mode === 'PLAY';
+    const inDeploy = this.isDeployLikePhase() && mode === 'PLAY';
     const inReplay = this.phase === 'REPLAY' || mode === 'REPLAY';
+    const inGameOver = this.phase === 'GAME_OVER' && mode === 'PLAY';
 
-    if (mode === 'ARBITER') {
+    if (mode === 'TITLE') {
+      this.camera.fov = isLandscape ? 38 : 44;
+      this.camera.updateProjectionMatrix();
+      const shiftX = isLandscape ? 1.85 : 0.0;
+      this.camTargetPos.set(shiftX + 1.8, isLandscape ? 4.2 : 4.85, isLandscape ? 9.4 : 11.2);
+      this.camTargetLook.set(shiftX, -0.08, -0.35);
+      (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.06, 0.88);
+    } else if (mode === 'ARBITER') {
       const shot = this.arbiterStage.getBattleCameraPose(isLandscape, aspect);
       this.camera.fov = shot.fov;
       this.camera.updateProjectionMatrix();
@@ -540,6 +653,22 @@ export class SceneManager {
       this.camTargetLook.copy(shot.look);
       this.targetRoomDimFactor = shot.roomDim;
       (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.04, 0.86);
+    } else if (mode === 'FIELD_MANUAL') {
+      const fov = isLandscape ? 36 : 43;
+      this.camera.fov = fov;
+      this.camera.updateProjectionMatrix();
+      if (isLandscape) {
+        this.camTargetLook.set(2.25, 0.12, 0.55);
+        this.camTargetPos.set(2.25, 8.2, 8.6);
+      } else {
+        // Compute exact aspect-aware distance so all 5 columns (`width = 8.4`) fit 100% uncropped in 9:16 Portrait!
+        const halfFov = THREE.MathUtils.degToRad(fov * 0.5);
+        const dist = Math.max(13.2, 8.55 / (2 * Math.tan(halfFov) * aspect));
+        const pitch = THREE.MathUtils.degToRad(47.0);
+        const lookZ = 2.15;
+        this.camTargetLook.set(0, -0.05, lookZ);
+        this.camTargetPos.set(0, Math.sin(pitch) * dist, lookZ + Math.cos(pitch) * dist);
+      }
     } else if (mode === 'INSPECT_16') {
       const fov = isLandscape ? 34 : aspect < 0.52 ? 42 : 38;
       this.camera.fov = fov;
@@ -548,29 +677,28 @@ export class SceneManager {
       this.camTargetPos.set(-0.5, isLandscape ? 9.4 : 8.6, isLandscape ? 9.2 : 8.95);
       (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.02, 0.98);
     } else if (isLandscape) {
-      // In Landscape `DEPLOY`, dock the Mobilization Crate on the right and shift `lookX = +2.45` so all 72 tiles sit 100% uncovered on the left!
-      // In Landscape `REPLAY`, lift the board above the single-row bottom transport bar (`lookZ = +0.75, heightOcc = 0.72`).
+      const rightPanelOpen = inDeploy || inGameOver;
       const landscapePresets: Record<
         BoardViewAngle,
         { pitchDeg: number; fovDeg: number; heightOcc: number; lookZ: number }
       > = {
         COMMAND: {
-          pitchDeg: inDeploy ? 47.0 : inReplay ? 45.0 : 43.0,
+          pitchDeg: rightPanelOpen ? 47.0 : inReplay ? 45.0 : 43.0,
           fovDeg: 38,
-          heightOcc: inDeploy ? 0.77 : inReplay ? 0.72 : 0.82,
-          lookZ: inDeploy ? -0.15 : inReplay ? 0.85 : -0.25,
+          heightOcc: rightPanelOpen ? 0.76 : inReplay ? 0.72 : 0.8,
+          lookZ: rightPanelOpen ? -0.15 : inReplay ? 0.85 : -0.1,
         },
         TACTICAL: {
           pitchDeg: 32.5,
           fovDeg: 38,
-          heightOcc: inReplay ? 0.72 : 0.8,
-          lookZ: inReplay ? 0.85 : 0.05,
+          heightOcc: inReplay ? 0.72 : 0.78,
+          lookZ: inReplay ? 0.85 : 0.1,
         },
         OVERHEAD: {
           pitchDeg: 62.0,
           fovDeg: 36,
-          heightOcc: inReplay ? 0.73 : 0.83,
-          lookZ: inReplay ? 0.75 : -0.45,
+          heightOcc: inReplay ? 0.73 : 0.8,
+          lookZ: inReplay ? 0.75 : -0.35,
         },
       };
       const lSpec = landscapePresets[this.boardView];
@@ -585,12 +713,12 @@ export class SceneManager {
       const halfFovRad = THREE.MathUtils.degToRad(lSpec.fovDeg * 0.5);
       const pitchRad = THREE.MathUtils.degToRad(finalPitchDeg);
       const projBoardH = 12.36 * Math.sin(pitchRad) + 1.05 * Math.cos(pitchRad);
-      const effectiveAspect = inDeploy ? aspect * 0.62 : aspect;
+      const effectiveAspect = rightPanelOpen ? aspect * 0.62 : aspect;
       const rHeight = projBoardH / lSpec.heightOcc / (2 * Math.tan(halfFovRad));
       const rWidth = 11.2 / (2 * Math.tan(halfFovRad) * effectiveAspect);
       const rDist = Math.max(rHeight, rWidth);
 
-      const lookX = inDeploy ? 2.55 : 0;
+      const lookX = rightPanelOpen ? 2.55 : 0;
       const lookY = -0.12;
       this.camTargetLook.set(lookX, lookY, lSpec.lookZ);
       this.camTargetPos.set(
@@ -600,15 +728,18 @@ export class SceneManager {
       );
       (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.04, 0.92);
     } else {
-      // In `DEPLOY` or `REPLAY`, lift `frontNdcY` above the bottom Mobilization Crate / Scrubber
-      // so Rows 5..7 sit 100% unobstructed in thumb reach! In `PLAY`, lock tight to `-0.75`.
-      const bottomLock = inDeploy ? -0.24 : inReplay ? -0.52 : -0.75;
+      // Portrait Safe-Zone Framing:
+      // - `DEPLOY` / `ARMORY` / `GAME_OVER`: lift `frontNdcY` above lower 42% thumb sheet (`-0.22`)
+      // - `REPLAY`: `-0.50`
+      // - `PLAY`: `-0.68` so 78%+ of screen showcases the 3D board cleanly above the compact bottom dock!
+      const bottomLock =
+        inDeploy || inGameOver ? -0.22 : inReplay ? -0.5 : -0.68;
       const presetSpec: Record<
         BoardViewAngle,
         { pitchDeg: number; fovDeg: number; widthOcc: number; frontNdcY: number }
       > = {
         COMMAND: {
-          pitchDeg: inDeploy ? 46.0 : inReplay ? 48.0 : 40.0,
+          pitchDeg: inDeploy ? 46.0 : inReplay ? 48.0 : 41.0,
           fovDeg: 43,
           widthOcc: 0.98,
           frontNdcY: bottomLock,
@@ -647,13 +778,19 @@ export class SceneManager {
     }
   }
 
-  private getOrCreatePieceVisual(p: VisiblePieceView): PieceVisualInstance {
-    const key = `${p.faction}:${p.visibleRank}:k${p.publicKills}:tag${p.suspectTag ?? ''}`;
+  private getOrCreatePieceVisual(
+    p: VisiblePieceView,
+    viewingFaction: Faction,
+    shrouded: boolean
+  ): PieceVisualInstance {
+    const faceCam = !shrouded && p.faction === viewingFaction;
+    const key = `${p.faction}:${p.visibleRank}:k${p.publicKills}:tag${p.suspectTag ?? ''}:fc${faceCam}`;
     const existing = this.pieceVisuals.get(p.id);
     if (existing && existing.renderedKey === key) {
       return existing;
     }
-    const prevPos = existing ? existing.group.position.clone() : gridToWorld(p.col, p.row);
+    const vis = this.logicalToVisualCoord(p.col, p.row);
+    const prevPos = existing ? existing.group.position.clone() : gridToWorld(vis.col, vis.row);
     if (existing) {
       this.boardPiecesRoot.remove(existing.group);
     }
@@ -662,7 +799,8 @@ export class SceneManager {
       p.faction,
       p.visibleRank,
       p.publicKills,
-      p.suspectTag
+      p.suspectTag,
+      faceCam
     );
     group.userData['pieceId'] = p.id;
     group.position.copy(prevPos);
@@ -672,7 +810,7 @@ export class SceneManager {
       id: p.id,
       group,
       renderedKey: key,
-      targetPos: gridToWorld(p.col, p.row),
+      targetPos: gridToWorld(vis.col, vis.row),
     };
     this.pieceVisuals.set(p.id, inst);
     return inst;
@@ -681,10 +819,16 @@ export class SceneManager {
   private syncCasualties(list: readonly CasualtyView[], side: 'LEFT' | 'RIGHT'): void {
     const wellCenter = side === 'LEFT' ? LEFT_WELL_CENTER : RIGHT_WELL_CENTER;
     for (const item of list) {
-      const key = `${side}:${item.id}`;
+      const key = `${side}:${item.id}:${item.visibleRank}`;
       if (this.casualtyVisuals.has(key)) continue;
 
-      const wedge = this.factory.createCommandWedge(item.faction, item.visibleRank);
+      const wedge = this.factory.createCommandWedge(
+        item.faction,
+        item.visibleRank,
+        0,
+        null,
+        item.visibleRank !== 'UNKNOWN'
+      );
       wedge.scale.setScalar(0.64);
 
       const idx = item.casualtyIndex;
@@ -697,7 +841,7 @@ export class SceneManager {
       const oy = -0.29 + layer * 0.24;
 
       wedge.position.set(wellCenter.x + ox, oy, wellCenter.z + oz);
-      const baseYaw = item.faction === 'ENEMY' ? Math.PI : 0;
+      const baseYaw = item.visibleRank === 'UNKNOWN' ? Math.PI : 0;
       wedge.rotation.set(
         Math.sin(idx * 1.7) * 0.08,
         baseYaw + Math.cos(idx * 2.1) * 0.24,
@@ -719,7 +863,7 @@ export class SceneManager {
   }
 
   // ---------------------------------------------------------------------------
-  // Pointer, `+28px` Lifted Hologram Drag, & `320ms` Suspect Tagging Input
+  // Pointer, `+28px` Lifted Hologram Drag, Field Manual Tap & `320ms` Suspect Wheel
   // ---------------------------------------------------------------------------
 
   private screenToBoardWorld(clientX: number, clientY: number, outWorld: THREE.Vector3): boolean {
@@ -738,20 +882,20 @@ export class SceneManager {
     const drag = this.activeDrag;
     if (!drag) return;
     const worldPt = new THREE.Vector3();
-    // `+28px` upward finger clearance (`clientY - 28`) so the user's thumb never hides the target tile!
     if (!this.screenToBoardWorld(clientX, clientY - 28, worldPt)) return;
 
     drag.ghostGroup.position.set(worldPt.x, 0.34, worldPt.z);
 
-    const col = Math.round(worldPt.x / TILE_PITCH + (BOARD_COLS - 1) / 2);
-    const row = Math.round((worldPt.z - GRID_CENTER_Z) / TILE_PITCH + (BOARD_ROWS - 1) / 2);
+    const vCol = Math.round(worldPt.x / TILE_PITCH + (BOARD_COLS - 1) / 2);
+    const vRow = Math.round((worldPt.z - GRID_CENTER_Z) / TILE_PITCH + (BOARD_ROWS - 1) / 2);
+    const logical = this.visualToLogicalCoord(vCol, vRow);
 
     if (drag.mode === 'CRATE_DEPLOY' || drag.mode === 'BOARD_DEPLOY') {
-      if (isPlayerHomeSquare(col, row)) {
-        drag.hoverCoord = { col, row };
-        const snapped = gridToWorld(col, row);
+      if (isFactionHomeSquare(this.viewingFaction, logical.col, logical.row)) {
+        drag.hoverCoord = logical;
+        const snapped = gridToWorld(vCol, vRow);
         drag.ghostGroup.position.set(snapped.x, 0.34, snapped.z);
-        this.indicatorLayer.setDragHoverCoord({ col, row });
+        this.indicatorLayer.setDragHoverCoord({ col: vCol, row: vRow });
       } else {
         drag.hoverCoord = null;
         this.indicatorLayer.setDragHoverCoord(null);
@@ -759,12 +903,12 @@ export class SceneManager {
     } else if (drag.mode === 'BOARD_PLAY' && drag.sourcePieceId) {
       const valid = this.store
         .computeValidMoves(drag.sourcePieceId)
-        .find((m) => m.col === col && m.row === row);
+        .find((m) => m.col === logical.col && m.row === logical.row);
       if (valid) {
-        drag.hoverCoord = { col, row };
-        const snapped = gridToWorld(col, row);
+        drag.hoverCoord = logical;
+        const snapped = gridToWorld(vCol, vRow);
         drag.ghostGroup.position.set(snapped.x, 0.34, snapped.z);
-        this.indicatorLayer.setDragHoverCoord({ col, row });
+        this.indicatorLayer.setDragHoverCoord({ col: vCol, row: vRow });
       } else {
         drag.hoverCoord = null;
         this.indicatorLayer.setDragHoverCoord(null);
@@ -786,16 +930,17 @@ export class SceneManager {
       }
     } else if (drag.mode === 'BOARD_DEPLOY' && drag.sourcePieceId) {
       if (target) {
-        if (this.store.placeOrSwapDeployment(target.col, target.row, undefined, drag.sourcePieceId)) {
+        if (
+          this.store.placeOrSwapDeployment(target.col, target.row, undefined, drag.sourcePieceId)
+        ) {
           this.sound.playMoveSlide();
           this.sound.playMagneticSnap();
         }
       } else {
-        // Dragged south off the home grid back into the crate -> return piece to Mobilization Crate!
         const pt = new THREE.Vector3();
         if (this.screenToBoardWorld(clientX, clientY, pt)) {
-          const r = Math.round((pt.z - GRID_CENTER_Z) / TILE_PITCH + (BOARD_ROWS - 1) / 2);
-          if (r > 7 && this.store.removeDeployedPiece(drag.sourcePieceId)) {
+          const vRow = Math.round((pt.z - GRID_CENTER_Z) / TILE_PITCH + (BOARD_ROWS - 1) / 2);
+          if (vRow > 7 && this.store.removeDeployedPiece(drag.sourcePieceId)) {
             this.sound.playUiClick();
           } else {
             this.syncFromStore(this.store.getVisibleView(), this.store.getOptions());
@@ -803,7 +948,11 @@ export class SceneManager {
         }
       }
     } else if (drag.mode === 'BOARD_PLAY' && drag.sourcePieceId && target) {
-      const outcome = this.store.executeMoveOrChallenge(target.col, target.row, drag.sourcePieceId);
+      const outcome = this.store.executeMoveOrChallenge(
+        target.col,
+        target.row,
+        drag.sourcePieceId
+      );
       if (outcome) {
         if (outcome.kind === 'MOVED') {
           this.sound.playMoveSlide();
@@ -848,6 +997,25 @@ export class SceneManager {
       }
     };
 
+    const raycastFieldManualRank = (clientX: number, clientY: number): RankId | null => {
+      const rect = this.renderer.domElement.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return null;
+      ndc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+      ndc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(ndc, this.camera);
+      const hits = raycaster.intersectObjects(this.fieldManualRoot.children, true);
+      for (const h of hits) {
+        let cur: THREE.Object3D | null = h.object;
+        while (cur) {
+          if (typeof cur.userData['manualRank'] === 'string') {
+            return cur.userData['manualRank'] as RankId;
+          }
+          cur = cur.parent;
+        }
+      }
+      return null;
+    };
+
     const raycastBoardPieceAndCoord = (
       clientX: number,
       clientY: number
@@ -875,10 +1043,10 @@ export class SceneManager {
 
       let coord: { col: number; row: number } | null = null;
       if (raycaster.ray.intersectPlane(this.raycastPlane, hitPoint)) {
-        const col = Math.round(hitPoint.x / TILE_PITCH + (BOARD_COLS - 1) / 2);
-        const row = Math.round((hitPoint.z - GRID_CENTER_Z) / TILE_PITCH + (BOARD_ROWS - 1) / 2);
-        if (col >= 0 && col < BOARD_COLS && row >= 0 && row < BOARD_ROWS) {
-          coord = { col, row };
+        const vCol = Math.round(hitPoint.x / TILE_PITCH + (BOARD_COLS - 1) / 2);
+        const vRow = Math.round((hitPoint.z - GRID_CENTER_Z) / TILE_PITCH + (BOARD_ROWS - 1) / 2);
+        if (vCol >= 0 && vCol < BOARD_COLS && vRow >= 0 && vRow < BOARD_ROWS) {
+          coord = this.visualToLogicalCoord(vCol, vRow);
         }
       }
 
@@ -891,14 +1059,29 @@ export class SceneManager {
 
     this.renderer.domElement.addEventListener('pointerdown', (ev: PointerEvent) => {
       this.sound.unlock();
-      this.idleTurnElapsed = 0;
-      this.sound.setTurnWarningUrgent(false);
 
       if (this.arbiterStage.isBusy) {
         this.arbiterStage.setOverdriveHeld(true);
         return;
       }
-      if (this.cameraMode !== 'PLAY' || this.phase === 'REPLAY' || this.phase === 'GAME_OVER') {
+
+      if (this.cameraMode === 'FIELD_MANUAL' || this.phase === 'FIELD_MANUAL') {
+        const rankHit = raycastFieldManualRank(ev.clientX, ev.clientY);
+        if (rankHit) {
+          this.sound.playPiecePickup();
+          this.store.selectFieldManualRank(rankHit);
+        }
+        return;
+      }
+
+      const view = this.store.getVisibleView();
+      if (
+        this.cameraMode !== 'PLAY' ||
+        this.phase === 'REPLAY' ||
+        this.phase === 'GAME_OVER' ||
+        this.phase === 'TITLE' ||
+        view.shroud?.active
+      ) {
         return;
       }
 
@@ -910,10 +1093,10 @@ export class SceneManager {
       longPressTriggered = false;
 
       const { piece } = raycastBoardPieceAndCoord(ev.clientX, ev.clientY);
-      candidateBoardPiece = piece && piece.faction === 'PLAYER' ? piece : null;
+      candidateBoardPiece = piece && piece.faction === view.viewingFaction ? piece : null;
 
-      // 320ms Long-Press Detector on Unmarked Enemy Pieces -> Opens Radial Suspect Wheel!
-      if (piece && piece.faction === 'ENEMY' && this.phase === 'PLAY') {
+      // 320ms Long-Press Detector on Unmarked Opponent Pieces -> Opens Radial Suspect Wheel!
+      if (piece && piece.faction !== view.viewingFaction && this.phase === 'PLAY') {
         const enemyId = piece.id;
         const sx = ev.clientX;
         const sy = ev.clientY;
@@ -943,13 +1126,13 @@ export class SceneManager {
         cancelLongPress();
       }
 
-      // Initiate Direct Thumb Hologram Drag if dragging a friendly Player piece!
+      const view = this.store.getVisibleView();
       if (
         candidateBoardPiece &&
         candidateBoardPiece.visibleRank !== 'UNKNOWN' &&
         moveDist > 13 &&
-        (this.phase === 'DEPLOY' ||
-          (this.phase === 'PLAY' && this.store.getVisibleView().activeTurn === 'PLAYER'))
+        (this.isDeployLikePhase() ||
+          (this.phase === 'PLAY' && view.activeTurn === view.viewingFaction))
       ) {
         const rank = candidateBoardPiece.visibleRank;
         const pid = candidateBoardPiece.id;
@@ -964,7 +1147,7 @@ export class SceneManager {
         if (srcInst) srcInst.group.visible = false;
 
         this.activeDrag = {
-          mode: this.phase === 'DEPLOY' ? 'BOARD_DEPLOY' : 'BOARD_PLAY',
+          mode: this.isDeployLikePhase() ? 'BOARD_DEPLOY' : 'BOARD_PLAY',
           rank,
           sourcePieceId: pid,
           ghostGroup: ghost,
@@ -974,7 +1157,12 @@ export class SceneManager {
         return;
       }
 
-      if (!candidateBoardPiece && !draggedCamera && Math.abs(dy) > 14 && Math.abs(dy) > Math.abs(dx) * 1.25) {
+      if (
+        !candidateBoardPiece &&
+        !draggedCamera &&
+        Math.abs(dy) > 14 &&
+        Math.abs(dy) > Math.abs(dx) * 1.25
+      ) {
         draggedCamera = true;
       }
       if (draggedCamera) {
@@ -1000,18 +1188,24 @@ export class SceneManager {
       candidateBoardPiece = null;
       draggedCamera = false;
 
-      if (longPressTriggered || wasDrag || this.arbiterStage.isBusy || this.cameraMode !== 'PLAY') {
+      const view = this.store.getVisibleView();
+      if (
+        longPressTriggered ||
+        wasDrag ||
+        this.arbiterStage.isBusy ||
+        this.cameraMode !== 'PLAY' ||
+        view.shroud?.active
+      ) {
         return;
       }
 
       const { piece, coord } = raycastBoardPieceAndCoord(ev.clientX, ev.clientY);
+      const ownFac = view.viewingFaction;
 
-      // DEPLOYMENT PHASE TAP FLOW: Tap square to place/swap!
-      if (this.phase === 'DEPLOY') {
-        if (coord && isPlayerHomeSquare(coord.col, coord.row)) {
-          const view = this.store.getVisibleView();
-          // If tapping an occupied friendly piece while no crate rank is armed -> select for swap!
-          if (piece && piece.faction === 'PLAYER' && !view.selectedDeployRank && !view.selectedPieceId) {
+      // DEPLOYMENT & ARMORY PHASE TAP FLOW
+      if (this.isDeployLikePhase()) {
+        if (coord && isFactionHomeSquare(ownFac, coord.col, coord.row)) {
+          if (piece && piece.faction === ownFac && !view.selectedDeployRank && !view.selectedPieceId) {
             this.sound.playPiecePickup();
             this.store.selectPiece(piece.id);
             return;
@@ -1021,7 +1215,7 @@ export class SceneManager {
             this.sound.playMagneticSnap();
             return;
           }
-          if (piece && piece.faction === 'PLAYER') {
+          if (piece && piece.faction === ownFac) {
             this.sound.playPiecePickup();
             this.store.selectPiece(piece.id);
           }
@@ -1029,10 +1223,9 @@ export class SceneManager {
         return;
       }
 
-      // ACTIVE PLAY PHASE TAP FLOW + `< 320ms` DOUBLE-TAP ENEMY SUSPECT TAGGING!
+      // ACTIVE PLAY PHASE TAP FLOW + `< 320ms` DOUBLE-TAP OPPONENT SUSPECT TAGGING!
       if (this.phase === 'PLAY') {
-        // Check double-tap on Enemy piece first (when not executing an adjacent challenge, or rapid double-tap!)
-        if (piece && piece.faction === 'ENEMY') {
+        if (piece && piece.faction !== ownFac) {
           const nowMs = performance.now();
           if (lastEnemyTapId === piece.id && nowMs - lastEnemyTapTime < 320) {
             lastEnemyTapId = null;
@@ -1061,15 +1254,15 @@ export class SceneManager {
           }
         }
 
-        if (piece && piece.faction === 'PLAYER') {
-          const deselecting = this.store.getVisibleView().selectedPieceId === piece.id;
+        if (piece && piece.faction === ownFac) {
+          const deselecting = view.selectedPieceId === piece.id;
           if (deselecting) {
             this.sound.playUiClick();
           } else {
             this.sound.playPiecePickup();
           }
           this.store.selectPiece(piece.id);
-        } else if (!piece || piece.faction !== 'ENEMY') {
+        } else if (!piece || piece.faction === ownFac) {
           this.store.selectPiece(null);
         }
       }

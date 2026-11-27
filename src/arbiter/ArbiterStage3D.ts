@@ -954,6 +954,14 @@ export class ArbiterStage3D {
   public update(dt: number, totalElapsedSec: number): void {
     if (!this.activeVerdict) {
       this.cameraShakeOffset.set(0, 0, 0);
+      // Warm analog filament breathing wave across the 8 vacuum tubes during idle & Live 3D Start Screen!
+      for (let i = 0; i < this.vacuumTubes.length; i++) {
+        const tube = this.vacuumTubes[i]!;
+        const wave = 0.5 + 0.5 * Math.sin(totalElapsedSec * 2.15 + i * 0.68);
+        tube.filament.scale.y = 0.22 + 0.24 * wave;
+        const glow = 1.45 + 0.78 * wave;
+        tube.mat.color.setRGB(glow, glow * 0.56, glow * 0.16);
+      }
       return;
     }
 

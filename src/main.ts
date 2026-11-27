@@ -2,7 +2,7 @@ import './styles/shell.css';
 import { SoundDirector } from './audio/SoundDirector';
 import { SceneManager } from './graphics/SceneManager';
 import { GameStore, type ShowcasePreset } from './state/GameStore';
-import { HudController } from './ui/HudController';
+import { UIManager } from './ui/UIManager';
 
 const canvasHost = document.getElementById('canvas-host');
 const hudRoot = document.getElementById('hud-root');
@@ -15,7 +15,7 @@ const store = new GameStore();
 const sound = new SoundDirector();
 const sceneManager = new SceneManager(canvasHost, store, sound);
 
-const hud = new HudController(hudRoot, store, sound, {
+const ui = new UIManager(hudRoot, store, sound, {
   onTriggerVerdict: (verdict) => {
     sceneManager.triggerArbiterSequence(verdict);
   },
@@ -25,7 +25,7 @@ const hud = new HudController(hudRoot, store, sound, {
 });
 
 sceneManager.onOpenSuspectWheel = (pieceId, clientX, clientY) => {
-  hud.openSuspectWheel(pieceId, clientX, clientY);
+  ui.openSuspectWheel(pieceId, clientX, clientY);
 };
 
 store.onAIClashTriggered = (verdict) => {
@@ -39,7 +39,7 @@ store.onAIQuietMove = (publicKills) => {
 store.subscribe((view, options) => {
   sound.syncOptions(options);
   sceneManager.syncFromStore(view, options);
-  hud.render(view, options);
+  ui.render(view, options);
 });
 
 sceneManager.snapCameraImmediately();
@@ -49,18 +49,26 @@ sceneManager.startLoop();
 declare global {
   interface Window {
     __WAR_GENERALS_STAGE__?: {
+      poseTitle: () => void;
       poseTabletop: (boardView?: 'COMMAND' | 'TACTICAL' | 'OVERHEAD') => void;
       poseInspect16: () => void;
       poseReplay: () => void;
+      poseFieldManual: () => void;
       poseArbiterAct: (preset: ShowcasePreset, actSeconds: number) => void;
     };
   }
 }
 
 window.__WAR_GENERALS_STAGE__ = {
+  poseTitle: () => {
+    sceneManager.arbiterStage.resetToIdle();
+    store.returnToTitleMenu();
+    sceneManager.snapCameraImmediately();
+  },
   poseTabletop: (boardView = 'COMMAND') => {
     sceneManager.arbiterStage.resetToIdle();
-    store.startNewDeployment('VACCINATION');
+    store.startSkirmish('REYES');
+    store.applyDeploymentPreset('VACCINATION');
     store.launchBattleFromDeployment();
     store.updateOptions({ boardView });
     sceneManager.snapCameraImmediately();
@@ -75,9 +83,15 @@ window.__WAR_GENERALS_STAGE__ = {
     store.enterDeclassifiedReplay();
     sceneManager.snapCameraImmediately();
   },
+  poseFieldManual: () => {
+    sceneManager.arbiterStage.resetToIdle();
+    store.openFieldManual('SPY');
+    sceneManager.snapCameraImmediately();
+  },
   poseArbiterAct: (preset: ShowcasePreset, actSeconds: number) => {
     sceneManager.arbiterStage.resetToIdle();
-    store.startNewDeployment('VACCINATION');
+    store.startSkirmish('REYES');
+    store.applyDeploymentPreset('VACCINATION');
     store.launchBattleFromDeployment();
     const verdict = store.triggerShowcaseClash(preset);
     if (verdict) {

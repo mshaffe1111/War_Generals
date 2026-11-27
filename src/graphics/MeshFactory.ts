@@ -8,7 +8,7 @@ import {
   type Faction,
   type RankId,
 } from '../core/ranks';
-import type { SuspectTag } from '../core/types';
+import type { ManualRankOutcome, SuspectTag } from '../core/types';
 import {
   buildAttackMedallionMesh,
   buildRankEmblemMesh,
@@ -826,7 +826,8 @@ export class MeshFactory {
     faction: Faction,
     visibleRank: RankId | 'UNKNOWN',
     publicKills = 0,
-    suspectTag: SuspectTag | null = null
+    suspectTag: SuspectTag | null = null,
+    faceCameraOverride?: boolean
   ): THREE.Group {
     const root = new THREE.Group();
     const isPlayer = faction === 'PLAYER';
@@ -906,7 +907,9 @@ export class MeshFactory {
       }
     }
 
-    if (faction === 'ENEMY') {
+    const shouldFaceCamera =
+      faceCameraOverride !== undefined ? faceCameraOverride : faction === 'PLAYER';
+    if (!shouldFaceCamera) {
       root.rotation.y = Math.PI;
     }
 
@@ -919,6 +922,82 @@ export class MeshFactory {
 
     root.scale.setScalar(HERO_WEDGE_SCALE);
     return root;
+  }
+
+  /**
+   * Interactive 3D Field Manual Monolith (`createFieldManualWedge`):
+   * Highlights `DEFEATS` in glowing Emerald Green, `THREAT` in pulsing Crimson,
+   * `SELECTED` in Cyan-Gold spotlight, and `SPLIT` in Brushed Brass!
+   */
+  public createFieldManualWedge(rank: RankId, outcome: ManualRankOutcome): THREE.Group {
+    const holder = new THREE.Group();
+    holder.userData['manualRank'] = rank;
+
+    const wedge = this.createCommandWedge('PLAYER', rank, 0, null, true);
+    const isSelected = outcome === 'SELECTED' || outcome === 'FLAG_ATTACK_WIN';
+    wedge.position.y = isSelected ? 0.14 : 0.0;
+    holder.add(wedge);
+
+    const ringColor =
+      outcome === 'DEFEATS'
+        ? new THREE.Color(0.18, 1.85, 0.95)
+        : outcome === 'THREAT'
+          ? new THREE.Color(2.15, 0.28, 0.38)
+          : isSelected
+            ? new THREE.Color(0.42, 1.75, 2.35)
+            : new THREE.Color(1.85, 1.42, 0.48);
+
+    const padGeo = new THREE.RingGeometry(0.0, 0.46, 36);
+    padGeo.rotateX(-Math.PI / 2);
+    const padMat = new THREE.MeshBasicMaterial({
+      color: ringColor,
+      transparent: true,
+      opacity: isSelected ? 0.24 : outcome === 'SPLIT' ? 0.12 : 0.19,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    const pad = new THREE.Mesh(padGeo, padMat);
+    pad.position.y = 0.027;
+    holder.add(pad);
+
+    const haloGeo = new THREE.RingGeometry(0.43, 0.51, 40);
+    haloGeo.rotateX(-Math.PI / 2);
+    const haloMat = new THREE.MeshBasicMaterial({
+      color: ringColor,
+      transparent: true,
+      opacity: 0.92,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    const halo = new THREE.Mesh(haloGeo, haloMat);
+    halo.position.y = 0.031;
+    holder.add(halo);
+
+    const pillText =
+      outcome === 'SELECTED'
+        ? `${RANK_SPECS[rank].shortLabel}`
+        : outcome === 'FLAG_ATTACK_WIN'
+          ? 'WINS ON ATTACK'
+          : outcome === 'DEFEATS'
+            ? 'DEFEATS'
+            : outcome === 'THREAT'
+              ? 'THREAT'
+              : 'SPLIT';
+    const pillTone =
+      outcome === 'DEFEATS'
+        ? 'EMERALD'
+        : outcome === 'THREAT'
+          ? 'CRIMSON'
+          : isSelected
+            ? 'CYAN'
+            : 'AMBER';
+    const badge = this.createHolographicPillSprite(pillText, pillTone, true);
+    badge.position.set(0, isSelected ? 1.32 : 1.15, 0);
+    holder.add(badge);
+
+    return holder;
   }
 
   /**
@@ -1031,24 +1110,38 @@ export class MeshFactory {
 
   private createHolographicPillSprite(
     text: string,
-    tone: 'AMBER' | 'CYAN' | 'CRIMSON',
+    tone: 'AMBER' | 'CYAN' | 'CRIMSON' | 'EMERALD',
     compact = false
   ): THREE.Sprite {
     const canvas = document.createElement('canvas');
-    canvas.width = compact ? 184 : 256;
+    canvas.width = compact ? 196 : 256;
     canvas.height = 76;
     const ctx = canvas.getContext('2d')!;
 
     const borderCol =
-      tone === 'AMBER' ? '#ffc44d' : tone === 'CYAN' ? '#4de8ff' : '#ff5e72';
+      tone === 'AMBER'
+        ? '#ffc44d'
+        : tone === 'EMERALD'
+          ? '#34f09e'
+          : tone === 'CYAN'
+            ? '#4de8ff'
+            : '#ff5e72';
     const bgCol =
       tone === 'AMBER'
         ? 'rgba(30, 18, 5, 0.94)'
-        : tone === 'CYAN'
-          ? 'rgba(6, 22, 36, 0.9)'
-          : 'rgba(36, 8, 14, 0.9)';
+        : tone === 'EMERALD'
+          ? 'rgba(6, 30, 20, 0.92)'
+          : tone === 'CYAN'
+            ? 'rgba(6, 22, 36, 0.9)'
+            : 'rgba(36, 8, 14, 0.92)';
     const textCol =
-      tone === 'AMBER' ? '#ffebad' : tone === 'CYAN' ? '#e2fbff' : '#ffd8de';
+      tone === 'AMBER'
+        ? '#ffebad'
+        : tone === 'EMERALD'
+          ? '#d4ffec'
+          : tone === 'CYAN'
+            ? '#e2fbff'
+            : '#ffd8de';
 
     const boxW = canvas.width - 16;
     const midX = canvas.width * 0.5;
