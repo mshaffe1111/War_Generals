@@ -9,7 +9,6 @@ import {
 import {
   createBrushedMetalBumpMap,
   createSlateBumpMap,
-  createWalnutTextures,
 } from './ProceduralTextures';
 
 export const TILE_PITCH = 1.0;
@@ -17,7 +16,7 @@ export const GRID_CENTER_Z = 0.85;
 export const ARBITER_BAY_CENTER_Z = -4.78;
 export const LEFT_WELL_CENTER = new THREE.Vector3(-3.68, -0.28, -4.78);
 export const RIGHT_WELL_CENTER = new THREE.Vector3(3.68, -0.28, -4.78);
-export const INSPECT_STAGE_ORIGIN = new THREE.Vector3(-22.0, 0.0, 0.0);
+export const HERO_WEDGE_SCALE = 1.13;
 
 export function gridToWorld(col: number, row: number): THREE.Vector3 {
   const x = (col - (BOARD_COLS - 1) / 2) * TILE_PITCH;
@@ -30,49 +29,49 @@ export interface SharedPBRMaterials {
   readonly slateTile: THREE.MeshPhysicalMaterial;
   readonly obsidianGroove: THREE.MeshStandardMaterial;
   readonly brassTrim: THREE.MeshPhysicalMaterial;
+  readonly enemyBronzeTrim: THREE.MeshPhysicalMaterial;
   readonly brassRecessed: THREE.MeshPhysicalMaterial;
   readonly silverEmblem: THREE.MeshPhysicalMaterial;
   readonly playerNavy: THREE.MeshPhysicalMaterial;
+  readonly playerInset: THREE.MeshStandardMaterial;
   readonly enemyCrimson: THREE.MeshPhysicalMaterial;
+  readonly enemyInset: THREE.MeshStandardMaterial;
   readonly velvetNavy: THREE.MeshPhysicalMaterial;
   readonly velvetCrimson: THREE.MeshPhysicalMaterial;
   readonly gunmetal: THREE.MeshPhysicalMaterial;
   readonly darkSteel: THREE.MeshStandardMaterial;
+  readonly oiledSpringSteel: THREE.MeshStandardMaterial;
+  readonly mudTerrain: THREE.MeshStandardMaterial;
+  readonly sandbagBurlap: THREE.MeshStandardMaterial;
+  readonly bunkerConcrete: THREE.MeshStandardMaterial;
   readonly emblemPalette: EmblemMaterialPalette;
 }
 
 export interface WarRoomEnvironmentRefs {
   readonly root: THREE.Group;
-  readonly lanternLightLeft: THREE.PointLight;
+  readonly tableLanternShadowLight: THREE.PointLight;
   readonly lanternLightRight: THREE.PointLight;
+  readonly lanternFlameMat: THREE.MeshBasicMaterial;
+  readonly tentBackdropMesh: THREE.Mesh;
+  readonly tentBackdropMat: THREE.MeshBasicMaterial;
+  readonly watchSecondHand: THREE.Object3D;
 }
 
-function extrudeRoundedShapeWithHoles(
-  shape: THREE.Shape,
-  depth: number,
-  bevelThickness: number,
-  bevelSize: number,
-  bevelSegments = 4,
-  uvScale = 0.1
-): THREE.BufferGeometry {
-  const geo = new THREE.ExtrudeGeometry(shape, {
-    depth,
-    bevelEnabled: true,
-    bevelThickness,
-    bevelSize,
-    bevelSegments,
-    curveSegments: 20,
-  });
-  geo.rotateX(-Math.PI / 2);
-  const uv = geo.attributes.uv as THREE.BufferAttribute | undefined;
-  if (uv) {
-    for (let i = 0; i < uv.count; i++) {
-      uv.setXY(i, uv.getX(i) * uvScale + 0.5, uv.getY(i) * uvScale + 0.5);
-    }
-    uv.needsUpdate = true;
-  }
-  geo.computeVertexNormals();
-  return geo;
+export interface BakedArbiterHardwareParts {
+  readonly warfieldArena: THREE.Object3D | null;
+}
+
+interface BakedMonolithGeometries {
+  body: THREE.BufferGeometry | null;
+  brassPlinth: THREE.BufferGeometry | null;
+  escutcheon: THREE.BufferGeometry | null;
+}
+
+interface LiveWedgeRefs {
+  readonly faction: Faction;
+  readonly bodyMesh: THREE.Mesh;
+  readonly plinthMesh: THREE.Mesh;
+  readonly insetMesh: THREE.Mesh;
 }
 
 export function makeRoundedRectPath(
@@ -99,148 +98,418 @@ export function makeRoundedRectPath(
   return p;
 }
 
+function createWatchDialCanvasTexture(): THREE.CanvasTexture {
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+  const c = size / 2;
+  const g = ctx.createRadialGradient(c, c, 8, c, c, c * 0.96);
+  g.addColorStop(0, '#e5d9bf');
+  g.addColorStop(0.82, '#cbb997');
+  g.addColorStop(1, '#8c7b5c');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(c, c, c * 0.96, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = '#241c13';
+  for (let i = 0; i < 60; i++) {
+    const a = (i / 60) * Math.PI * 2 - Math.PI / 2;
+    const major = i % 5 === 0;
+    ctx.lineWidth = major ? 3.2 : 1.2;
+    ctx.beginPath();
+    ctx.moveTo(c + Math.cos(a) * (major ? 84 : 97), c + Math.sin(a) * (major ? 84 : 97));
+    ctx.lineTo(c + Math.cos(a) * 108, c + Math.sin(a) * 108);
+    ctx.stroke();
+  }
+  ctx.lineWidth = 4.6;
+  ctx.beginPath();
+  ctx.moveTo(c, c);
+  ctx.lineTo(c - 26, c - 34);
+  ctx.stroke();
+  ctx.lineWidth = 3.2;
+  ctx.beginPath();
+  ctx.moveTo(c, c);
+  ctx.lineTo(c + 44, c - 24);
+  ctx.stroke();
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/**
+ * Generates an Ultra-HD `1024x1024` Dark Slate-Indigo Tactical Command Baize & Gold Navigation Table Texture!
+ * Eliminates "brown wood on brown wood" forever so the warm Oiled-Walnut & Champagne-Brass Game Board
+ * pops off the table like an heirloom centerpiece!
+ */
+function createTacticalCommandBaizeTexture(): THREE.CanvasTexture {
+  const size = 1024;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+
+  const bg = ctx.createRadialGradient(512, 512, 60, 512, 512, 700);
+  bg.addColorStop(0, '#1e2b3c');
+  bg.addColorStop(0.65, '#15202e');
+  bg.addColorStop(1, '#0c121b');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, size, size);
+
+  // Crisp tactical coordinate grid hairlines & antique-gold azimuth compass rings
+  ctx.strokeStyle = 'rgba(225, 182, 92, 0.22)';
+  ctx.lineWidth = 1.5;
+  const step = 128;
+  for (let p = step; p < size; p += step) {
+    ctx.beginPath();
+    ctx.moveTo(p, 0);
+    ctx.lineTo(p, size);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(0, p);
+    ctx.lineTo(size, p);
+    ctx.stroke();
+  }
+
+  ctx.strokeStyle = 'rgba(235, 192, 102, 0.36)';
+  for (const r of [190, 330, 455]) {
+    ctx.lineWidth = r === 330 ? 2.6 : 1.5;
+    ctx.beginPath();
+    ctx.arc(512, 512, r, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Cardinal crosshairs & degree tick marks around outer azimuth ring
+  ctx.beginPath();
+  ctx.moveTo(512, 32);
+  ctx.lineTo(512, 992);
+  ctx.moveTo(32, 512);
+  ctx.lineTo(992, 512);
+  ctx.stroke();
+
+  for (let deg = 0; deg < 360; deg += 5) {
+    const a = (deg * Math.PI) / 180;
+    const major = deg % 30 === 0;
+    const r0 = major ? 434 : 445;
+    ctx.lineWidth = major ? 2.4 : 1.2;
+    ctx.beginPath();
+    ctx.moveTo(512 + Math.cos(a) * r0, 512 + Math.sin(a) * r0);
+    ctx.lineTo(512 + Math.cos(a) * 455, 512 + Math.sin(a) * 455);
+    ctx.stroke();
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.anisotropy = 16;
+  return tex;
+}
+
 export class MeshFactory {
   public readonly materials: SharedPBRMaterials;
-  private readonly wedgeBodyGeo: THREE.BufferGeometry;
-  private glbShutterTemplate: THREE.Object3D | null = null;
+
+  private readonly boardContainer = new THREE.Group();
+  private readonly tablePropsContainer = new THREE.Group();
+  private readonly watchMountGroup = new THREE.Group();
+  private readonly tacticalTableMat: THREE.MeshStandardMaterial;
+  private readonly crateSlateMat: THREE.MeshStandardMaterial;
+  private readonly parchmentScrollMat: THREE.MeshStandardMaterial;
+  private readonly lanternGlassMat: THREE.MeshPhysicalMaterial;
+
+  private readonly wedgeAoGeo: THREE.PlaneGeometry;
+  private readonly wedgeAoMat: THREE.MeshBasicMaterial;
+  private fallbackWedgeGeo: THREE.BufferGeometry;
+  private monolithGeos: BakedMonolithGeometries = {
+    body: null,
+    brassPlinth: null,
+    escutcheon: null,
+  };
+  private readonly liveWedges = new Set<LiveWedgeRefs>();
+
+  private arbiterParts: BakedArbiterHardwareParts = {
+    warfieldArena: null,
+  };
 
   constructor() {
-    const walnutTex = createWalnutTextures(512);
+    const loader = new THREE.TextureLoader();
+
+    const walnutAlbedo = loader.load('./textures/walnut_albedo.jpg');
+    walnutAlbedo.colorSpace = THREE.SRGBColorSpace;
+    walnutAlbedo.wrapS = walnutAlbedo.wrapT = THREE.RepeatWrapping;
+    walnutAlbedo.anisotropy = 16;
+
+    const walnutNormal = loader.load('./textures/walnut_normal.jpg');
+    walnutNormal.colorSpace = THREE.NoColorSpace;
+    walnutNormal.wrapS = walnutNormal.wrapT = THREE.RepeatWrapping;
+    walnutNormal.anisotropy = 16;
+
+    const velvetAlbedo = loader.load('./textures/velvet_albedo.jpg');
+    velvetAlbedo.colorSpace = THREE.SRGBColorSpace;
+    velvetAlbedo.anisotropy = 8;
+
+    const velvetNormal = loader.load('./textures/velvet_normal.jpg');
+    velvetNormal.colorSpace = THREE.NoColorSpace;
+    velvetNormal.anisotropy = 8;
+
+    const oakAlbedo = loader.load('./textures/oak_albedo.jpg');
+    oakAlbedo.colorSpace = THREE.SRGBColorSpace;
+    oakAlbedo.wrapS = oakAlbedo.wrapT = THREE.RepeatWrapping;
+
+    const oakNormal = loader.load('./textures/oak_normal.jpg');
+    oakNormal.colorSpace = THREE.NoColorSpace;
+    oakNormal.wrapS = oakNormal.wrapT = THREE.RepeatWrapping;
+
     const metalBump = createBrushedMetalBumpMap(256);
     const slateBump = createSlateBumpMap(256);
 
     const walnut = new THREE.MeshPhysicalMaterial({
-      map: walnutTex.map,
-      bumpMap: walnutTex.bumpMap,
-      bumpScale: 0.009,
-      roughnessMap: walnutTex.roughnessMap,
-      color: new THREE.Color('#6E472C'),
-      roughness: 0.44,
+      map: walnutAlbedo,
+      normalMap: walnutNormal,
+      normalScale: new THREE.Vector2(0.55, 0.55),
+      color: new THREE.Color('#BE9574'),
+      roughness: 0.35,
       metalness: 0.02,
-      clearcoat: 0.14,
-      clearcoatRoughness: 0.34,
-      envMapIntensity: 0.42,
+      clearcoat: 0.24,
+      clearcoatRoughness: 0.24,
+      envMapIntensity: 0.35,
     });
 
-    const brassTrim = new THREE.MeshPhysicalMaterial({
-      color: new THREE.Color('#E2B04A'),
-      metalness: 0.92,
-      roughness: 0.24,
-      bumpMap: metalBump,
-      bumpScale: 0.004,
-      clearcoat: 0.1,
-      clearcoatRoughness: 0.26,
-      envMapIntensity: 1.25,
-    });
-
-    const brassRecessed = new THREE.MeshPhysicalMaterial({
-      color: new THREE.Color('#946A22'),
-      metalness: 0.88,
-      roughness: 0.34,
-      bumpMap: metalBump,
-      bumpScale: 0.006,
-      envMapIntensity: 1.1,
-    });
-
-    const silverEmblem = new THREE.MeshPhysicalMaterial({
-      color: new THREE.Color('#DCE2EA'),
-      metalness: 0.95,
-      roughness: 0.18,
-      bumpMap: metalBump,
-      bumpScale: 0.004,
-      clearcoat: 0.14,
-      clearcoatRoughness: 0.2,
-      envMapIntensity: 1.35,
-    });
-
-    const slateTile = new THREE.MeshPhysicalMaterial({
-      color: new THREE.Color('#222730'),
-      roughness: 0.58,
+    // Dark Slate-Indigo Tactical Command Baize & Gold Azimuth Chart Table
+    const baizeTex = createTacticalCommandBaizeTexture();
+    baizeTex.repeat.set(3.2, 2.4);
+    this.tacticalTableMat = new THREE.MeshStandardMaterial({
+      map: baizeTex,
+      emissiveMap: baizeTex,
+      emissive: new THREE.Color('#28384d'),
+      emissiveIntensity: 0.42,
+      normalMap: velvetNormal,
+      normalScale: new THREE.Vector2(0.4, 0.4),
+      color: new THREE.Color('#DCE6F2'),
+      roughness: 0.8,
       metalness: 0.08,
-      bumpMap: slateBump,
-      bumpScale: 0.007,
-      clearcoat: 0.06,
-      clearcoatRoughness: 0.45,
-      envMapIntensity: 0.45,
-    });
-
-    const obsidianGroove = new THREE.MeshStandardMaterial({
-      color: new THREE.Color('#090B0F'),
-      roughness: 0.9,
-      metalness: 0.04,
       envMapIntensity: 0.2,
     });
 
+    this.crateSlateMat = new THREE.MeshStandardMaterial({
+      bumpMap: slateBump,
+      bumpScale: 0.01,
+      color: new THREE.Color('#1E2631'),
+      roughness: 0.62,
+      metalness: 0.45,
+      envMapIntensity: 0.3,
+    });
+
+    this.parchmentScrollMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#C8B48E'),
+      bumpMap: slateBump,
+      bumpScale: 0.004,
+      roughness: 0.82,
+      metalness: 0.0,
+      envMapIntensity: 0.12,
+    });
+
+    this.lanternGlassMat = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color('#ffcf86'),
+      emissive: new THREE.Color('#ff9428'),
+      emissiveIntensity: 1.55,
+      transparent: true,
+      opacity: 0.55,
+      roughness: 0.1,
+      clearcoat: 1.0,
+    });
+
+    const brassTrim = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color('#E6B85C'),
+      emissive: new THREE.Color('#5A3D10'),
+      emissiveIntensity: 0.28,
+      metalness: 0.68,
+      roughness: 0.32,
+      bumpMap: metalBump,
+      bumpScale: 0.004,
+      clearcoat: 0.1,
+      clearcoatRoughness: 0.28,
+      envMapIntensity: 0.72,
+    });
+
+    const enemyBronzeTrim = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color('#C99242'),
+      emissive: new THREE.Color('#4A2E0B'),
+      emissiveIntensity: 0.24,
+      metalness: 0.68,
+      roughness: 0.33,
+      bumpMap: metalBump,
+      bumpScale: 0.004,
+      clearcoat: 0.08,
+      clearcoatRoughness: 0.3,
+      envMapIntensity: 0.68,
+    });
+
+    const brassRecessed = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color('#8E6622'),
+      metalness: 0.86,
+      roughness: 0.36,
+      bumpMap: metalBump,
+      bumpScale: 0.006,
+      envMapIntensity: 0.65,
+    });
+
+    const silverEmblem = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color('#C4CCD8'),
+      metalness: 0.9,
+      roughness: 0.28,
+      bumpMap: metalBump,
+      bumpScale: 0.004,
+      clearcoat: 0.08,
+      clearcoatRoughness: 0.28,
+      envMapIntensity: 0.65,
+    });
+
+    const slateTile = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color('#232934'),
+      roughness: 0.58,
+      metalness: 0.08,
+      bumpMap: slateBump,
+      bumpScale: 0.01,
+      clearcoat: 0.05,
+      clearcoatRoughness: 0.45,
+      envMapIntensity: 0.16,
+    });
+
+    const obsidianGroove = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#040508'),
+      roughness: 0.95,
+      metalness: 0.04,
+      envMapIntensity: 0.05,
+    });
+
+    // Rich, Deep Sculpted Lacquered Cobalt & Imperial Oxblood (low `envMapIntensity` -> zero chalky grey washout!)
     const playerNavy = new THREE.MeshPhysicalMaterial({
-      color: new THREE.Color('#162B4C'),
-      roughness: 0.42,
-      metalness: 0.06,
+      color: new THREE.Color('#132A52'),
+      roughness: 0.38,
+      metalness: 0.08,
       bumpMap: slateBump,
       bumpScale: 0.003,
-      clearcoat: 0.1,
-      clearcoatRoughness: 0.36,
+      clearcoat: 0.18,
+      clearcoatRoughness: 0.32,
       sheen: 0.2,
-      sheenColor: new THREE.Color('#3b68ab'),
-      envMapIntensity: 0.45,
+      sheenColor: new THREE.Color('#3b72bf'),
+      envMapIntensity: 0.2,
+    });
+
+    const playerInset = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#081328'),
+      roughness: 0.55,
+      metalness: 0.12,
+      envMapIntensity: 0.12,
     });
 
     const enemyCrimson = new THREE.MeshPhysicalMaterial({
-      color: new THREE.Color('#5E1723'),
-      roughness: 0.42,
-      metalness: 0.06,
+      color: new THREE.Color('#661524'),
+      roughness: 0.38,
+      metalness: 0.08,
       bumpMap: slateBump,
       bumpScale: 0.003,
-      clearcoat: 0.1,
-      clearcoatRoughness: 0.36,
+      clearcoat: 0.18,
+      clearcoatRoughness: 0.32,
       sheen: 0.2,
-      sheenColor: new THREE.Color('#a13347'),
-      envMapIntensity: 0.45,
+      sheenColor: new THREE.Color('#b03248'),
+      envMapIntensity: 0.2,
+    });
+
+    const enemyInset = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#2B070E'),
+      roughness: 0.55,
+      metalness: 0.12,
+      envMapIntensity: 0.12,
     });
 
     const velvetNavy = new THREE.MeshPhysicalMaterial({
-      color: new THREE.Color('#0B1833'),
-      roughness: 0.9,
+      map: velvetAlbedo,
+      normalMap: velvetNormal,
+      normalScale: new THREE.Vector2(1.4, 1.4),
+      color: new THREE.Color('#132E68'),
+      roughness: 0.96,
       metalness: 0.0,
-      bumpMap: slateBump,
-      bumpScale: 0.014,
-      sheen: 0.85,
-      sheenRoughness: 0.65,
-      sheenColor: new THREE.Color('#2a4e91'),
-      envMapIntensity: 0.25,
+      sheen: 0.65,
+      sheenRoughness: 0.72,
+      sheenColor: new THREE.Color('#3462ba'),
+      envMapIntensity: 0.08,
     });
 
     const velvetCrimson = new THREE.MeshPhysicalMaterial({
-      color: new THREE.Color('#3B0D18'),
-      roughness: 0.9,
+      map: velvetAlbedo,
+      normalMap: velvetNormal,
+      normalScale: new THREE.Vector2(1.4, 1.4),
+      color: new THREE.Color('#641326'),
+      roughness: 0.96,
       metalness: 0.0,
-      bumpMap: slateBump,
-      bumpScale: 0.014,
-      sheen: 0.85,
-      sheenRoughness: 0.65,
-      sheenColor: new THREE.Color('#8a283d'),
-      envMapIntensity: 0.25,
+      sheen: 0.65,
+      sheenRoughness: 0.72,
+      sheenColor: new THREE.Color('#b8324c'),
+      envMapIntensity: 0.08,
     });
 
     const gunmetal = new THREE.MeshPhysicalMaterial({
-      color: new THREE.Color('#39424F'),
-      metalness: 0.84,
-      roughness: 0.28,
+      color: new THREE.Color('#2B313B'),
+      metalness: 0.82,
+      roughness: 0.34,
       bumpMap: metalBump,
       bumpScale: 0.005,
-      clearcoat: 0.18,
-      clearcoatRoughness: 0.22,
-      envMapIntensity: 1.35,
+      clearcoat: 0.12,
+      clearcoatRoughness: 0.28,
+      envMapIntensity: 0.68,
     });
 
     const darkSteel = new THREE.MeshStandardMaterial({
-      color: new THREE.Color('#232933'),
+      color: new THREE.Color('#1B2028'),
       metalness: 0.78,
-      roughness: 0.34,
-      envMapIntensity: 1.35,
+      roughness: 0.36,
+      envMapIntensity: 0.58,
+    });
+
+    const oiledSpringSteel = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#7B8594'),
+      metalness: 0.88,
+      roughness: 0.27,
+      bumpMap: metalBump,
+      bumpScale: 0.004,
+      envMapIntensity: 0.72,
+    });
+
+    const mudTerrain = new THREE.MeshStandardMaterial({
+      map: oakAlbedo,
+      normalMap: oakNormal,
+      normalScale: new THREE.Vector2(1.8, 1.8),
+      color: new THREE.Color('#2E241C'),
+      roughness: 0.92,
+      metalness: 0.04,
+      envMapIntensity: 0.1,
+    });
+
+    const sandbagBurlap = new THREE.MeshStandardMaterial({
+      map: velvetAlbedo,
+      normalMap: velvetNormal,
+      normalScale: new THREE.Vector2(1.5, 1.5),
+      color: new THREE.Color('#8C7654'),
+      roughness: 0.92,
+      metalness: 0.0,
+      envMapIntensity: 0.12,
+    });
+
+    const bunkerConcrete = new THREE.MeshStandardMaterial({
+      bumpMap: slateBump,
+      bumpScale: 0.014,
+      color: new THREE.Color('#2A303A'),
+      roughness: 0.58,
+      metalness: 0.45,
+      envMapIntensity: 0.42,
     });
 
     const contactShadow = new THREE.MeshStandardMaterial({
-      color: new THREE.Color('#070b12'),
+      color: new THREE.Color('#04060a'),
       roughness: 0.95,
       metalness: 0.0,
     });
@@ -250,14 +519,21 @@ export class MeshFactory {
       slateTile,
       obsidianGroove,
       brassTrim,
+      enemyBronzeTrim,
       brassRecessed,
       silverEmblem,
       playerNavy,
+      playerInset,
       enemyCrimson,
+      enemyInset,
       velvetNavy,
       velvetCrimson,
       gunmetal,
       darkSteel,
+      oiledSpringSteel,
+      mudTerrain,
+      sandbagBurlap,
+      bunkerConcrete,
       emblemPalette: {
         brass: brassTrim,
         silver: silverEmblem,
@@ -266,33 +542,243 @@ export class MeshFactory {
       },
     };
 
-    this.wedgeBodyGeo = this.buildPrecisionWedgeGeometry();
+    const wAoCanvas = document.createElement('canvas');
+    wAoCanvas.width = 64;
+    wAoCanvas.height = 64;
+    const wCtx = wAoCanvas.getContext('2d')!;
+    const wGrad = wCtx.createRadialGradient(32, 32, 6, 32, 32, 30);
+    wGrad.addColorStop(0, 'rgba(0, 0, 0, 0.94)');
+    wGrad.addColorStop(0.68, 'rgba(0, 0, 0, 0.58)');
+    wGrad.addColorStop(1, 'rgba(0, 0, 0, 0.0)');
+    wCtx.fillStyle = wGrad;
+    wCtx.fillRect(0, 0, 64, 64);
+    this.wedgeAoGeo = new THREE.PlaneGeometry(0.92, 0.78);
+    this.wedgeAoGeo.rotateX(-Math.PI / 2);
+    this.wedgeAoMat = new THREE.MeshBasicMaterial({
+      map: new THREE.CanvasTexture(wAoCanvas),
+      transparent: true,
+      opacity: 0.88,
+      depthWrite: false,
+    });
+
+    this.fallbackWedgeGeo = this.buildFallbackWedgeGeometry();
   }
 
-  public async preloadBakedModels(): Promise<void> {
+  public async preloadBakedModels(): Promise<BakedArbiterHardwareParts> {
     const loader = new GLTFLoader();
-    try {
-      const shutterGltf = await loader.loadAsync('./models/arbiter_shutter.glb');
-      this.glbShutterTemplate = shutterGltf.scene;
-    } catch {
-      this.glbShutterTemplate = null;
+
+    const [boardRes, arenaRes, tableRes, wedgeRes, watchRes] = await Promise.allSettled([
+      loader.loadAsync('./models/board_cabinet.glb'),
+      loader.loadAsync('./models/warfield_arena.glb'),
+      loader.loadAsync('./models/war_room_table.glb'),
+      loader.loadAsync('./models/command_wedge.glb'),
+      loader.loadAsync('./models/pocket_watch.glb'),
+    ]);
+
+    if (boardRes.status === 'fulfilled') {
+      const scene = boardRes.value.scene;
+      scene.traverse((obj) => {
+        if (!(obj instanceof THREE.Mesh)) return;
+        obj.castShadow = true;
+        obj.receiveShadow = true;
+        const n = obj.name;
+        if (n.includes('Cabinet')) {
+          obj.material = this.materials.walnut;
+        } else if (n.includes('Brass')) {
+          obj.material = this.materials.brassTrim;
+          obj.castShadow = !n.includes('Well');
+        } else if (n.includes('Slate')) {
+          obj.material = this.materials.slateTile;
+          obj.castShadow = true;
+        } else if (n.includes('NavyVelvet')) {
+          obj.material = this.materials.velvetNavy;
+          obj.castShadow = false;
+        } else if (n.includes('CrimsonVelvet')) {
+          obj.material = this.materials.velvetCrimson;
+          obj.castShadow = false;
+        } else {
+          obj.material = this.materials.obsidianGroove;
+          obj.castShadow = false;
+        }
+      });
+
+      // Add 4 Machined Solid-Brass Corner Riser Pedestals + 4 Warm-Amber Corner Sconce Pips
+      // + 6 Tactical Brass Intersection Star-Diamonds on the 9x8 playfield!
+      const footGeo = new THREE.CylinderGeometry(0.46, 0.54, 0.24, 28);
+      const sconceCapGeo = new THREE.CylinderGeometry(0.11, 0.14, 0.045, 20);
+      const sconceGlowMat = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(2.4, 1.55, 0.52),
+        toneMapped: false,
+      });
+      const sconceLensGeo = new THREE.SphereGeometry(0.065, 14, 10);
+
+      for (const [fx, fz, cx, cz] of [
+        [-4.65, 5.05, -4.82, 5.12],
+        [4.65, 5.05, 4.82, 5.12],
+        [-4.65, -5.95, -4.82, -6.12],
+        [4.65, -5.95, 4.82, -6.12],
+      ] as const) {
+        const foot = new THREE.Mesh(footGeo, this.materials.brassTrim);
+        foot.position.set(fx, -0.58, fz);
+        foot.castShadow = true;
+        foot.receiveShadow = true;
+        scene.add(foot);
+
+        // Corner Brass Sconce Bezel & Warm Amber Jewel Pip on the raised bolster corners!
+        const bezel = new THREE.Mesh(sconceCapGeo, this.materials.brassTrim);
+        bezel.position.set(cx, 0.16, cz);
+        scene.add(bezel);
+
+        const lens = new THREE.Mesh(sconceLensGeo, sconceGlowMat);
+        lens.position.set(cx, 0.18, cz);
+        scene.add(lens);
+      }
+
+      // Delicate Brushed-Brass Tactical Waypoint Diamonds inlaid at key intersections of the 9x8 slate grid
+      const pipGeo = new THREE.OctahedronGeometry(0.055, 0);
+      pipGeo.scale(1.0, 0.28, 1.0);
+      for (const gx of [-1.5, 1.5]) {
+        for (const gz of [-1.15, 0.85, 2.85]) {
+          const pip = new THREE.Mesh(pipGeo, this.materials.brassTrim);
+          pip.position.set(gx, 0.022, gz);
+          scene.add(pip);
+        }
+      }
+
+      // Subtle Alternating Hematite-Sheen Overlay Tiles (`(r + c) % 2 === 0`) so the 9x8 grid reads like
+      // a museum onyx-and-slate strategy board instead of uniform grey!
+      const altTileMat = new THREE.MeshPhysicalMaterial({
+        color: new THREE.Color('#303949'),
+        roughness: 0.44,
+        metalness: 0.14,
+        clearcoat: 0.12,
+        clearcoatRoughness: 0.35,
+        envMapIntensity: 0.26,
+        transparent: true,
+        opacity: 0.42,
+      });
+      const altGeo = new THREE.PlaneGeometry(0.89, 0.89);
+      altGeo.rotateX(-Math.PI / 2);
+      for (let r = 0; r < BOARD_ROWS; r++) {
+        for (let c = 0; c < BOARD_COLS; c++) {
+          if ((r + c) % 2 === 0) {
+            const p = gridToWorld(c, r);
+            const m = new THREE.Mesh(altGeo, altTileMat);
+            m.position.set(p.x, 0.021, p.z);
+            m.receiveShadow = true;
+            scene.add(m);
+          }
+        }
+      }
+
+      this.boardContainer.clear();
+      this.boardContainer.add(scene);
     }
+
+    let warfieldArena: THREE.Object3D | null = null;
+    if (arenaRes.status === 'fulfilled') {
+      warfieldArena = arenaRes.value.scene;
+      warfieldArena.traverse((obj) => {
+        if (!(obj instanceof THREE.Mesh)) return;
+        obj.castShadow = true;
+        obj.receiveShadow = true;
+        const n = obj.name;
+        if (n.includes('MudTerrain')) {
+          obj.material = this.materials.mudTerrain;
+        } else if (n.includes('Sandbags')) {
+          obj.material = this.materials.sandbagBurlap;
+        } else if (n.includes('Brass') || n.includes('Barrels')) {
+          obj.material = this.materials.brassTrim;
+        } else if (n.includes('TankTraps') || n.includes('Guns')) {
+          obj.material = this.materials.darkSteel;
+        } else {
+          obj.material = this.materials.bunkerConcrete;
+        }
+      });
+    }
+    this.arbiterParts = { warfieldArena };
+
+    if (tableRes.status === 'fulfilled') {
+      const tScene = tableRes.value.scene;
+      tScene.traverse((obj) => {
+        if (!(obj instanceof THREE.Mesh)) return;
+        const n = obj.name;
+        obj.receiveShadow = true;
+        if (n.includes('OakPlanks')) {
+          obj.material = this.tacticalTableMat;
+          obj.castShadow = false;
+        } else if (n.includes('AmmoCrate')) {
+          obj.material = this.crateSlateMat;
+          obj.castShadow = true;
+        } else if (n.includes('LanternGlass')) {
+          obj.material = this.lanternGlassMat;
+          obj.castShadow = false;
+        } else if (n.includes('MapScrolls')) {
+          obj.material = this.parchmentScrollMat;
+          obj.castShadow = true;
+        } else {
+          obj.material = this.materials.brassTrim;
+          obj.castShadow = true;
+        }
+      });
+      this.tablePropsContainer.clear();
+      this.tablePropsContainer.add(tScene);
+    }
+
+    // 4. Multi-Part Sculpted Brass-Collared Command Monolith (`WedgeBody`, `WedgeBrassPlinth`, `WedgeEscutcheon`)
+    if (wedgeRes.status === 'fulfilled') {
+      wedgeRes.value.scene.traverse((obj) => {
+        if (!(obj instanceof THREE.Mesh)) return;
+        if (obj.name.includes('BrassPlinth')) {
+          this.monolithGeos.brassPlinth = obj.geometry;
+        } else if (obj.name.includes('Escutcheon')) {
+          this.monolithGeos.escutcheon = obj.geometry;
+        } else if (obj.name.includes('Body') || !this.monolithGeos.body) {
+          this.monolithGeos.body = obj.geometry;
+        }
+      });
+
+      for (const ref of this.liveWedges) {
+        if (this.monolithGeos.body) {
+          ref.bodyMesh.geometry = this.monolithGeos.body;
+        }
+        if (this.monolithGeos.brassPlinth) {
+          ref.plinthMesh.geometry = this.monolithGeos.brassPlinth;
+          ref.plinthMesh.visible = true;
+        }
+        if (this.monolithGeos.escutcheon) {
+          ref.insetMesh.geometry = this.monolithGeos.escutcheon;
+          ref.insetMesh.visible = true;
+        }
+      }
+    }
+
+    if (watchRes.status === 'fulfilled') {
+      const wScene = watchRes.value.scene;
+      wScene.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          obj.material = this.materials.brassTrim;
+          obj.castShadow = true;
+          obj.receiveShadow = true;
+        }
+      });
+      const existingFallback = this.watchMountGroup.getObjectByName('fallbackWatchBody');
+      if (existingFallback) this.watchMountGroup.remove(existingFallback);
+      this.watchMountGroup.add(wScene);
+    }
+
+    return this.arbiterParts;
   }
 
-  public getBakedShutterClone(): THREE.Object3D | null {
-    return this.glbShutterTemplate ? this.glbShutterTemplate.clone(true) : null;
-  }
-
-  private buildPrecisionWedgeGeometry(): THREE.BufferGeometry {
+  private buildFallbackWedgeGeometry(): THREE.BufferGeometry {
     const rings: Array<[number, number, number, number, number]> = [
       [0.0, 0.34, 0.322, 0.255, -0.246],
-      [0.045, 0.37, 0.35, 0.275, -0.265],
-      [0.828, 0.254, 0.24, -0.041, -0.099],
-      [0.86, 0.23, 0.218, -0.056, -0.112],
+      [0.042, 0.368, 0.348, 0.278, -0.266],
+      [0.84, 0.254, 0.24, -0.045, -0.098],
+      [0.88, 0.23, 0.218, -0.06, -0.112],
     ];
-
     const ringVerts: THREE.Vector3[][] = rings.map(([y, hwf, hwb, zf, zb]) => {
-      const c = 0.044 * (hwf / 0.37);
+      const c = 0.044 * (hwf / 0.368);
       return [
         new THREE.Vector3(-hwf + c, y, zf),
         new THREE.Vector3(hwf - c, y, zf),
@@ -304,39 +790,24 @@ export class MeshFactory {
         new THREE.Vector3(-hwf, y, zf - c),
       ];
     });
-
     const positions: number[] = [];
     const pushTri = (a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3) => {
       positions.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
     };
-    const pushQuad = (a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, d: THREE.Vector3) => {
-      pushTri(a, b, c);
-      pushTri(a, c, d);
-    };
-
     for (let r = 0; r < ringVerts.length - 1; r++) {
       const lower = ringVerts[r]!;
       const upper = ringVerts[r + 1]!;
       for (let i = 0; i < 8; i++) {
         const ni = (i + 1) % 8;
-        pushQuad(lower[i]!, lower[ni]!, upper[ni]!, upper[i]!);
+        pushTri(lower[i]!, lower[ni]!, upper[ni]!);
+        pushTri(lower[i]!, upper[ni]!, upper[i]!);
       }
     }
-
     const topRing = ringVerts[ringVerts.length - 1]!;
-    const topCenter = new THREE.Vector3(0, 0.862, -0.084);
+    const topCenter = new THREE.Vector3(0, 0.88, -0.086);
     for (let i = 0; i < 8; i++) {
-      const ni = (i + 1) % 8;
-      pushTri(topCenter, topRing[i]!, topRing[ni]!);
+      pushTri(topCenter, topRing[i]!, topRing[(i + 1) % 8]!);
     }
-
-    const botRing = ringVerts[0]!;
-    const botCenter = new THREE.Vector3(0, 0, 0);
-    for (let i = 0; i < 8; i++) {
-      const ni = (i + 1) % 8;
-      pushTri(botCenter, botRing[ni]!, botRing[i]!);
-    }
-
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
     geo.computeVertexNormals();
@@ -348,18 +819,45 @@ export class MeshFactory {
     visibleRank: RankId | 'UNKNOWN'
   ): THREE.Group {
     const root = new THREE.Group();
-    const bodyMat =
-      faction === 'PLAYER' ? this.materials.playerNavy : this.materials.enemyCrimson;
+    const isPlayer = faction === 'PLAYER';
 
-    const body = new THREE.Mesh(this.wedgeBodyGeo, bodyMat);
-    body.castShadow = true;
-    body.receiveShadow = true;
-    root.add(body);
+    const bodyMat = isPlayer ? this.materials.playerNavy : this.materials.enemyCrimson;
+    const plinthMat = isPlayer ? this.materials.brassTrim : this.materials.enemyBronzeTrim;
+    const insetMat = isPlayer ? this.materials.playerInset : this.materials.enemyInset;
+
+    const bodyMesh = new THREE.Mesh(this.monolithGeos.body ?? this.fallbackWedgeGeo, bodyMat);
+    bodyMesh.castShadow = true;
+    bodyMesh.receiveShadow = true;
+    root.add(bodyMesh);
+
+    const plinthMesh = new THREE.Mesh(
+      this.monolithGeos.brassPlinth ?? new THREE.BufferGeometry(),
+      plinthMat
+    );
+    plinthMesh.visible = Boolean(this.monolithGeos.brassPlinth);
+    plinthMesh.castShadow = true;
+    plinthMesh.receiveShadow = true;
+    root.add(plinthMesh);
+
+    const insetMesh = new THREE.Mesh(
+      this.monolithGeos.escutcheon ?? new THREE.BufferGeometry(),
+      insetMat
+    );
+    insetMesh.visible = Boolean(this.monolithGeos.escutcheon);
+    insetMesh.receiveShadow = true;
+    root.add(insetMesh);
+
+    this.liveWedges.add({ faction, bodyMesh, plinthMesh, insetMesh });
+
+    const aoDisc = new THREE.Mesh(this.wedgeAoGeo, this.wedgeAoMat);
+    aoDisc.name = 'wedgeAoDisc';
+    aoDisc.position.set(0.03, 0.004, -0.01);
+    root.add(aoDisc);
 
     if (visibleRank !== 'UNKNOWN') {
       const emblem = buildRankEmblemMesh(visibleRank, this.materials.emblemPalette);
-      // Centered cleanly on the 68.0 deg sloped front face at 72% face scale!
-      emblem.position.set(0, 0.435, 0.118);
+      emblem.scale.setScalar(0.86); // cleanly framed inside the sculpted brass escutcheon shield!
+      emblem.position.set(0, 0.456, 0.126);
       emblem.rotation.x = -THREE.MathUtils.degToRad(22.0);
       root.add(emblem);
     }
@@ -368,6 +866,7 @@ export class MeshFactory {
       root.rotation.y = Math.PI;
     }
 
+    root.scale.setScalar(HERO_WEDGE_SCALE);
     return root;
   }
 
@@ -376,223 +875,204 @@ export class MeshFactory {
   }
 
   public createBoardCabinetGroup(): THREE.Group {
-    const boardGroup = new THREE.Group();
-
-    // 1. Lower stepped walnut plinth (`10.56 × 12.24`) with full open pocket under Arbiter bay
-    const lowerShape = makeRoundedRectPath(0, -0.5, 10.56, 12.24, 0.48, true) as THREE.Shape;
-    lowerShape.holes.push(
-      makeRoundedRectPath(0, ARBITER_BAY_CENTER_Z, 5.1, 2.1, 0.15) as THREE.Path
+    const initBase = new THREE.Mesh(
+      new THREE.BoxGeometry(10.4, 0.68, 12.1),
+      this.materials.walnut
     );
-    const lowerGeo = extrudeRoundedShapeWithHoles(lowerShape, 0.34, 0.045, 0.045, 4, 0.095);
-    const lowerMesh = new THREE.Mesh(lowerGeo, this.materials.walnut);
-    lowerMesh.position.y = -0.68;
-    lowerMesh.castShadow = true;
-    lowerMesh.receiveShadow = true;
-    boardGroup.add(lowerMesh);
-
-    // 2. Upper mitered walnut deck (`10.02 × 11.70`) with 4 precision cutouts
-    const deckShape = makeRoundedRectPath(0, -0.5, 10.02, 11.7, 0.36, true) as THREE.Shape;
-    deckShape.holes.push(
-      makeRoundedRectPath(0, GRID_CENTER_Z, 9.16, 8.16, 0.16) as THREE.Path,
-      makeRoundedRectPath(LEFT_WELL_CENTER.x, ARBITER_BAY_CENTER_Z, 1.42, 2.14, 0.14) as THREE.Path,
-      makeRoundedRectPath(0, ARBITER_BAY_CENTER_Z, 5.14, 2.14, 0.16) as THREE.Path,
-      makeRoundedRectPath(RIGHT_WELL_CENTER.x, ARBITER_BAY_CENTER_Z, 1.42, 2.14, 0.14) as THREE.Path
-    );
-    const deckGeo = extrudeRoundedShapeWithHoles(deckShape, 0.31, 0.035, 0.035, 4, 0.095);
-    const deckMesh = new THREE.Mesh(deckGeo, this.materials.walnut);
-    deckMesh.position.y = -0.34;
-    deckMesh.castShadow = true;
-    deckMesh.receiveShadow = true;
-    boardGroup.add(deckMesh);
-
-    // 3. Gleaming Flush Brushed-Brass Perimeter Collars (`#E2B04A`)
-    const addBrassCollar = (
-      cx: number,
-      cz: number,
-      outerW: number,
-      outerD: number,
-      bandWidth: number,
-      radius: number
-    ) => {
-      const collar = makeRoundedRectPath(cx, cz, outerW, outerD, radius, true) as THREE.Shape;
-      collar.holes.push(
-        makeRoundedRectPath(
-          cx,
-          cz,
-          outerW - bandWidth * 2,
-          outerD - bandWidth * 2,
-          Math.max(0.04, radius - bandWidth * 0.7)
-        ) as THREE.Path
-      );
-      const geo = extrudeRoundedShapeWithHoles(collar, 0.034, 0.009, 0.009, 3, 0.25);
-      const mesh = new THREE.Mesh(geo, this.materials.brassTrim);
-      mesh.position.y = -0.02;
-      mesh.receiveShadow = true;
-      boardGroup.add(mesh);
-    };
-
-    addBrassCollar(0, GRID_CENTER_Z, 9.28, 8.28, 0.115, 0.17);
-    addBrassCollar(LEFT_WELL_CENTER.x, ARBITER_BAY_CENTER_Z, 1.52, 2.24, 0.085, 0.15);
-    addBrassCollar(0, ARBITER_BAY_CENTER_Z, 5.24, 2.24, 0.09, 0.17);
-    addBrassCollar(RIGHT_WELL_CENTER.x, ARBITER_BAY_CENTER_Z, 1.52, 2.24, 0.085, 0.15);
-
-    // 4. Recessed Matte-Obsidian Groove Bed beneath the 9x8 Grid
-    const grooveBed = new THREE.Mesh(
-      new THREE.BoxGeometry(9.08, 0.08, 8.08),
-      this.materials.obsidianGroove
-    );
-    grooveBed.position.set(0, -0.085, GRID_CENTER_Z);
-    grooveBed.receiveShadow = true;
-    boardGroup.add(grooveBed);
-
-    // 5. 72 Individual `0.97 × 0.97` Chamfered Slate Squares via InstancedMesh
-    const tileShape = makeRoundedRectPath(0, 0, 0.95, 0.95, 0.03, true) as THREE.Shape;
-    const singleTileGeo = extrudeRoundedShapeWithHoles(tileShape, 0.055, 0.013, 0.013, 3, 0.5);
-    const tileInstanced = new THREE.InstancedMesh(
-      singleTileGeo,
-      this.materials.slateTile,
-      BOARD_COLS * BOARD_ROWS
-    );
-    tileInstanced.receiveShadow = true;
-    tileInstanced.castShadow = false;
-
-    const dummy = new THREE.Object3D();
-    let idx = 0;
-    for (let row = 0; row < BOARD_ROWS; row++) {
-      for (let col = 0; col < BOARD_COLS; col++) {
-        const pos = gridToWorld(col, row);
-        dummy.position.set(pos.x, -0.064, pos.z);
-        dummy.updateMatrix();
-        tileInstanced.setMatrixAt(idx++, dummy.matrix);
-      }
-    }
-    tileInstanced.instanceMatrix.needsUpdate = true;
-    boardGroup.add(tileInstanced);
-
-    // 6. Twin Velvet Casualty Wells
-    const wellPadGeo = extrudeRoundedShapeWithHoles(
-      makeRoundedRectPath(0, 0, 1.34, 2.06, 0.1, true) as THREE.Shape,
-      0.05,
-      0.012,
-      0.012,
-      2
-    );
-    const navyWellFloor = new THREE.Mesh(wellPadGeo, this.materials.velvetNavy);
-    navyWellFloor.position.set(LEFT_WELL_CENTER.x, -0.34, ARBITER_BAY_CENTER_Z);
-    navyWellFloor.receiveShadow = true;
-    boardGroup.add(navyWellFloor);
-
-    const crimsonWellFloor = new THREE.Mesh(wellPadGeo, this.materials.velvetCrimson);
-    crimsonWellFloor.position.set(RIGHT_WELL_CENTER.x, -0.34, ARBITER_BAY_CENTER_Z);
-    crimsonWellFloor.receiveShadow = true;
-    boardGroup.add(crimsonWellFloor);
-
-    for (const wx of [LEFT_WELL_CENTER.x, RIGHT_WELL_CENTER.x]) {
-      const linerShape = makeRoundedRectPath(
-        wx,
-        ARBITER_BAY_CENTER_Z,
-        1.44,
-        2.16,
-        0.14,
-        true
-      ) as THREE.Shape;
-      linerShape.holes.push(
-        makeRoundedRectPath(wx, ARBITER_BAY_CENTER_Z, 1.32, 2.04, 0.1) as THREE.Path
-      );
-      const liner = new THREE.Mesh(
-        extrudeRoundedShapeWithHoles(linerShape, 0.3, 0.005, 0.005, 1),
-        this.materials.obsidianGroove
-      );
-      liner.position.y = -0.33;
-      boardGroup.add(liner);
-    }
-
-    return boardGroup;
+    initBase.position.set(0, -0.25, -0.5);
+    this.boardContainer.add(initBase);
+    // Physically elevate the entire Walnut & Brass Game Board +0.12 above the table on its brass feet!
+    this.boardContainer.position.y = 0.0;
+    return this.boardContainer;
   }
 
   /**
-   * Guardrail #1: Zero cartoon background primitives or opaque wood slabs!
-   * Uses a transparent `THREE.ShadowMaterial({ opacity: 0.62 })` shadow-catcher plane directly
-   * beneath the walnut cabinet so real 3D shadows fall onto `war_room_backdrop.jpg`'s oak planks,
-   * paired with warm off-screen flickering 2700K lantern `PointLight` pools.
+   * Builds the On-Board 16-Emblem & 4-Angle Turnaround Collector's Showcase Group:
+   * Sits directly on the main `9x8` chamfered slate & walnut board inside the `4096x4096` shadow frustum!
    */
+  public createOnBoardInspectionGroup(): THREE.Group {
+    const group = new THREE.Group();
+
+    // Row 1 (`cols 2, 3, 5, 6`): 4-Angle Sculpted Command Monolith Turnaround (`0°, 90°, 180° Armored Rear, 270°`)
+    const turnaroundCols = [2, 3, 5, 6];
+    const turnaroundAngles = [0, Math.PI * 0.5, Math.PI, -Math.PI * 0.5];
+    turnaroundCols.forEach((col, idx) => {
+      const w = this.createCommandWedge('PLAYER', 'GEN_5');
+      w.position.copy(gridToWorld(col, 1));
+      w.rotation.y = turnaroundAngles[idx]!;
+      group.add(w);
+    });
+
+    // Rows 3..6 (`cols 2..5` — centered `4x4` museum showcase grid on the slate tiles!):
+    ORDERED_RANKS.forEach((rankId, i) => {
+      const col = 2 + (i % 4);
+      const row = 3 + Math.floor(i / 4);
+      const w = this.createCommandWedge('PLAYER', rankId);
+      w.position.copy(gridToWorld(col, row));
+      group.add(w);
+    });
+
+    const med = this.createAttackMedallion();
+    med.position.copy(gridToWorld(5, 6));
+    group.add(med);
+
+    group.visible = false;
+    return group;
+  }
+
   public createWarRoomEnvironment(): WarRoomEnvironmentRefs {
     const root = new THREE.Group();
+    const loader = new THREE.TextureLoader();
 
-    const shadowCatcher = new THREE.Mesh(
-      new THREE.PlaneGeometry(36, 36),
-      new THREE.ShadowMaterial({ opacity: 0.62 })
+    const fbTable = new THREE.Mesh(new THREE.BoxGeometry(50, 0.34, 34), this.tacticalTableMat);
+    fbTable.position.set(0, -0.855, 2.0);
+    fbTable.receiveShadow = true;
+    this.tablePropsContainer.add(fbTable);
+    root.add(this.tablePropsContainer);
+
+    // Deep, Crisp Cast-Shadow Plinth Skirt underneath the elevated Walnut & Brass Board!
+    const aoCanvas = document.createElement('canvas');
+    aoCanvas.width = 128;
+    aoCanvas.height = 128;
+    const aoCtx = aoCanvas.getContext('2d')!;
+    const aoGrad = aoCtx.createRadialGradient(64, 64, 22, 64, 64, 63);
+    aoGrad.addColorStop(0, 'rgba(0,0,0,0.97)');
+    aoGrad.addColorStop(0.78, 'rgba(0,0,0,0.82)');
+    aoGrad.addColorStop(1, 'rgba(0,0,0,0.0)');
+    aoCtx.fillStyle = aoGrad;
+    aoCtx.fillRect(0, 0, 128, 128);
+    const aoPad = new THREE.Mesh(
+      new THREE.PlaneGeometry(12.8, 14.4),
+      new THREE.MeshBasicMaterial({
+        map: new THREE.CanvasTexture(aoCanvas),
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false,
+      })
     );
-    shadowCatcher.rotation.x = -Math.PI / 2;
-    shadowCatcher.position.set(0, -0.682, -0.5);
-    shadowCatcher.receiveShadow = true;
-    root.add(shadowCatcher);
+    aoPad.rotation.x = -Math.PI / 2;
+    aoPad.position.set(0.35, -0.68, -0.4);
+    root.add(aoPad);
 
-    // Off-screen warm 2700K flickering lantern PointLight pools illuminating rear brass & walnut edges
-    const lanternLightLeft = new THREE.PointLight(0xff9b3d, 6.5, 22, 1.5);
-    lanternLightLeft.position.set(-4.8, 3.8, -8.8);
-    root.add(lanternLightLeft);
+    const mapTexL = loader.load('./textures/vintage_war_map_left.jpg');
+    mapTexL.colorSpace = THREE.SRGBColorSpace;
+    mapTexL.anisotropy = 8;
+    const mapMatL = new THREE.MeshStandardMaterial({
+      map: mapTexL,
+      color: new THREE.Color('#B4A184'),
+      roughness: 0.85,
+      metalness: 0.0,
+      envMapIntensity: 0.1,
+    });
 
-    const lanternLightRight = new THREE.PointLight(0xff9636, 5.8, 22, 1.5);
-    lanternLightRight.position.set(5.0, 4.2, -9.2);
+    const mapTexR = loader.load('./textures/vintage_war_map_right.jpg');
+    mapTexR.colorSpace = THREE.SRGBColorSpace;
+    mapTexR.anisotropy = 8;
+    const mapMatR = new THREE.MeshStandardMaterial({
+      map: mapTexR,
+      color: new THREE.Color('#B09D80'),
+      roughness: 0.85,
+      metalness: 0.0,
+      envMapIntensity: 0.1,
+    });
+
+    const mapLeft = new THREE.Mesh(new THREE.BoxGeometry(5.8, 0.026, 4.2), mapMatL);
+    mapLeft.position.set(-2.95, -0.668, -8.85);
+    mapLeft.rotation.y = 0.14;
+    mapLeft.castShadow = true;
+    mapLeft.receiveShadow = true;
+    root.add(mapLeft);
+
+    const mapRight = new THREE.Mesh(new THREE.BoxGeometry(5.9, 0.026, 4.25), mapMatR);
+    mapRight.position.set(3.05, -0.662, -8.75);
+    mapRight.rotation.y = Math.PI - 0.16;
+    mapRight.castShadow = true;
+    mapRight.receiveShadow = true;
+    root.add(mapRight);
+
+    this.watchMountGroup.position.set(6.05, -0.662, -6.55);
+    this.watchMountGroup.rotation.y = -0.45;
+    this.watchMountGroup.scale.setScalar(0.92);
+
+    const fallbackWatch = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.7, 0.72, 0.22, 32),
+      this.materials.brassTrim
+    );
+    fallbackWatch.name = 'fallbackWatchBody';
+    fallbackWatch.position.y = 0.11;
+    fallbackWatch.castShadow = true;
+    this.watchMountGroup.add(fallbackWatch);
+
+    const dialMesh = new THREE.Mesh(
+      new THREE.CircleGeometry(0.61, 36),
+      new THREE.MeshStandardMaterial({
+        map: createWatchDialCanvasTexture(),
+        roughness: 0.46,
+        envMapIntensity: 0.2,
+      })
+    );
+    dialMesh.rotation.x = -Math.PI / 2;
+    dialMesh.position.y = 0.228;
+    this.watchMountGroup.add(dialMesh);
+
+    const watchSecondPivot = new THREE.Group();
+    watchSecondPivot.position.set(0, 0.235, 0);
+    const secondNeedle = new THREE.Mesh(
+      new THREE.BoxGeometry(0.018, 0.008, 0.48),
+      this.materials.brassRecessed
+    );
+    secondNeedle.position.z = -0.16;
+    watchSecondPivot.add(secondNeedle);
+    this.watchMountGroup.add(watchSecondPivot);
+    root.add(this.watchMountGroup);
+
+    const lanternFlameMat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(2.6, 1.65, 0.52),
+      toneMapped: false,
+    });
+    const flameCore = new THREE.Mesh(new THREE.SphereGeometry(0.12, 12, 10), lanternFlameMat);
+    flameCore.position.set(-6.65, 0.46, -6.55);
+    root.add(flameCore);
+
+    const tableLanternShadowLight = new THREE.PointLight(0xff9c3a, 7.5, 24, 1.4);
+    tableLanternShadowLight.position.set(-6.65, 0.84, -6.55);
+    tableLanternShadowLight.castShadow = true;
+    tableLanternShadowLight.shadow.mapSize.set(1024, 1024);
+    tableLanternShadowLight.shadow.bias = -0.0006;
+    root.add(tableLanternShadowLight);
+
+    const lanternLightRight = new THREE.PointLight(0xff9434, 3.8, 22, 1.5);
+    lanternLightRight.position.set(4.2, 2.8, -9.5);
     root.add(lanternLightRight);
+
+    const tentTex = loader.load('./textures/tent_cyclorama.png');
+    tentTex.colorSpace = THREE.SRGBColorSpace;
+    const tentBackdropMat = new THREE.MeshBasicMaterial({
+      map: tentTex,
+      color: new THREE.Color(0.85, 0.8, 0.75),
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const cycGeo = new THREE.PlaneGeometry(26.0, 11.2, 28, 1);
+    const cycPos = cycGeo.attributes.position as THREE.BufferAttribute;
+    for (let i = 0; i < cycPos.count; i++) {
+      const x = cycPos.getX(i);
+      cycPos.setZ(i, x * x * 0.012);
+    }
+    cycGeo.computeVertexNormals();
+    const cycMesh = new THREE.Mesh(cycGeo, tentBackdropMat);
+    cycMesh.position.set(0, 3.15, -11.4);
+    root.add(cycMesh);
 
     return {
       root,
-      lanternLightLeft,
+      tableLanternShadowLight,
       lanternLightRight,
+      lanternFlameMat,
+      tentBackdropMesh: cycMesh,
+      tentBackdropMat,
+      watchSecondHand: watchSecondPivot,
     };
-  }
-
-  public createInspectionGalleryStage(): THREE.Group {
-    const stage = new THREE.Group();
-    stage.position.copy(INSPECT_STAGE_ORIGIN);
-
-    const backing = new THREE.Mesh(
-      new THREE.BoxGeometry(6.6, 0.26, 8.8),
-      this.materials.walnut
-    );
-    backing.position.set(0, -0.15, -0.25);
-    backing.castShadow = true;
-    backing.receiveShadow = true;
-    stage.add(backing);
-
-    const innerSlate = new THREE.Mesh(
-      new THREE.BoxGeometry(6.1, 0.08, 8.3),
-      this.materials.slateTile
-    );
-    innerSlate.position.set(0, -0.01, -0.25);
-    innerSlate.receiveShadow = true;
-    stage.add(innerSlate);
-
-    const turnaroundAngles = [0, Math.PI * 0.5, Math.PI, -Math.PI * 0.5];
-    turnaroundAngles.forEach((ry, idx) => {
-      const w = this.createCommandWedge('PLAYER', 'GEN_5');
-      w.position.set((idx - 1.5) * 1.16, 0.03, -3.05);
-      w.rotation.y = ry;
-      stage.add(w);
-    });
-
-    ORDERED_RANKS.forEach((rankId, i) => {
-      const col = i % 4;
-      const row = Math.floor(i / 4);
-      const x = (col - 1.5) * 1.16;
-      const z = -1.6 + row * 1.22;
-
-      const holder = new THREE.Group();
-      holder.position.set(x, 0.04, z);
-      holder.rotation.x = -0.44;
-      const wedge = this.createCommandWedge('PLAYER', rankId);
-      holder.add(wedge);
-      stage.add(holder);
-    });
-
-    const medHolder = new THREE.Group();
-    medHolder.position.set(1.5 * 1.16, 0.34, -1.6 + 3 * 1.22);
-    medHolder.rotation.x = 0.72;
-    medHolder.add(this.createAttackMedallion());
-    stage.add(medHolder);
-
-    return stage;
   }
 }

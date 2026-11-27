@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 
 export interface WalnutTextureSet {
   readonly map: THREE.CanvasTexture;
@@ -48,33 +47,52 @@ export function createStudioLanternEnvMap(renderer: THREE.WebGLRenderer): THREE.
   const pmrem = new THREE.PMREMGenerator(renderer);
   pmrem.compileEquirectangularShader();
 
-  const roomEnv = new RoomEnvironment();
+  // Bespoke Dark Chiaroscuro War-Room Specular Rig (NO milky white RoomEnvironment walls that wash out piece faces & shadows!):
+  // Deep obsidian ambient enclosure punctuated by crisp warm-gold & cool-steel grazing specular strips so brushed brass,
+  // pewter silver, and beveled edges gleam sharply while shadows and Midnight Navy/Crimson armor stay ultra-rich!
+  const darkStudio = new THREE.Scene();
+  darkStudio.background = new THREE.Color(0.14, 0.11, 0.08);
 
-  // Augment RoomEnvironment with warm 3000K overhead key reflector & twin 2700K lantern kickers
-  const warmTop = new THREE.Mesh(
-    new THREE.PlaneGeometry(14, 10),
-    new THREE.MeshBasicMaterial({ color: new THREE.Color(3.2, 2.55, 1.85), side: THREE.DoubleSide })
+  // Broad warm-gold overhead canopy so horizontal `0.85`-metallic brass plinths & medallions gleam warm gold!
+  const canopy = new THREE.Mesh(
+    new THREE.PlaneGeometry(20, 16),
+    new THREE.MeshBasicMaterial({ color: new THREE.Color(1.45, 1.12, 0.72), side: THREE.DoubleSide })
   );
-  warmTop.position.set(0, 9.5, 5.5);
-  warmTop.lookAt(0, 0, 0);
-  roomEnv.add(warmTop);
+  canopy.position.set(0, 11.0, 2.0);
+  canopy.lookAt(0, 0, 0);
+  darkStudio.add(canopy);
 
-  const lanternCardL = new THREE.Mesh(
-    new THREE.SphereGeometry(1.4, 16, 12),
-    new THREE.MeshBasicMaterial({ color: new THREE.Color(3.6, 2.05, 0.78) })
+  const keyStrip = new THREE.Mesh(
+    new THREE.PlaneGeometry(6.5, 2.8),
+    new THREE.MeshBasicMaterial({ color: new THREE.Color(4.0, 2.95, 1.75), side: THREE.DoubleSide })
   );
-  lanternCardL.position.set(-6.5, 3.2, -9.5);
-  roomEnv.add(lanternCardL);
+  keyStrip.position.set(-8.5, 8.2, 3.5);
+  keyStrip.lookAt(0, 0, 0);
+  darkStudio.add(keyStrip);
 
-  const lanternCardR = new THREE.Mesh(
-    new THREE.SphereGeometry(1.3, 16, 12),
-    new THREE.MeshBasicMaterial({ color: new THREE.Color(3.4, 1.95, 0.75) })
+  const rimStrip = new THREE.Mesh(
+    new THREE.PlaneGeometry(6.5, 1.6),
+    new THREE.MeshBasicMaterial({ color: new THREE.Color(2.6, 2.9, 3.6), side: THREE.DoubleSide })
   );
-  lanternCardR.position.set(6.5, 3.6, -9.5);
-  roomEnv.add(lanternCardR);
+  rimStrip.position.set(8.0, 6.5, -5.5);
+  rimStrip.lookAt(0, 0, 0);
+  darkStudio.add(rimStrip);
 
-  const rt = pmrem.fromScene(roomEnv, 0.035);
-  roomEnv.dispose();
+  const lanternOrbL = new THREE.Mesh(
+    new THREE.SphereGeometry(1.1, 16, 12),
+    new THREE.MeshBasicMaterial({ color: new THREE.Color(4.5, 2.4, 0.85) })
+  );
+  lanternOrbL.position.set(-6.5, 2.8, -8.5);
+  darkStudio.add(lanternOrbL);
+
+  const lanternOrbR = new THREE.Mesh(
+    new THREE.SphereGeometry(1.0, 16, 12),
+    new THREE.MeshBasicMaterial({ color: new THREE.Color(4.0, 2.1, 0.78) })
+  );
+  lanternOrbR.position.set(6.5, 3.2, -8.5);
+  darkStudio.add(lanternOrbR);
+
+  const rt = pmrem.fromScene(darkStudio, 0.03);
   pmrem.dispose();
   return rt.texture;
 }

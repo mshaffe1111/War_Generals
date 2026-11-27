@@ -9,6 +9,7 @@ import { BOARD_COLS, BOARD_ROWS } from '../core/ranks';
 import type {
   AppOptions,
   ArbiterVerdict,
+  BoardViewAngle,
   CameraMode,
   CasualtyView,
   PlayerVisibleView,
@@ -19,7 +20,6 @@ import {
   ARBITER_BAY_CENTER_Z,
   GRID_CENTER_Z,
   gridToWorld,
-  INSPECT_STAGE_ORIGIN,
   LEFT_WELL_CENTER,
   MeshFactory,
   RIGHT_WELL_CENTER,
@@ -37,69 +37,6 @@ interface PieceVisualInstance {
   targetPos: THREE.Vector3;
 }
 
-/**
- * Full-Viewport Clean-Plate Background Quad (`war_room_backdrop.jpg`, 571x1024):
- * - Preserves exact `object-fit: cover` aspect framing on `412x915` through `9:16`.
- * - Smoothly dims cleanly to `35%` brightness (`uBrightness = 0.35`) during Arbiter clashes!
- */
-function createBackdropPlateMesh(): {
-  mesh: THREE.Mesh;
-  mat: THREE.ShaderMaterial;
-} {
-  const loader = new THREE.TextureLoader();
-  const tex = loader.load('./textures/war_room_backdrop.jpg');
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.minFilter = THREE.LinearFilter;
-  tex.magFilter = THREE.LinearFilter;
-
-  const mat = new THREE.ShaderMaterial({
-    uniforms: {
-      uMap: { value: tex },
-      uViewAspect: { value: 412 / 915 },
-      uImgAspect: { value: 571 / 1024 },
-      uBrightness: { value: 1.0 },
-    },
-    vertexShader: /* glsl */ `
-      varying vec2 vUv;
-      void main() {
-        vUv = uv;
-        gl_Position = vec4(position.xy, 0.9999, 1.0);
-      }
-    `,
-    fragmentShader: /* glsl */ `
-      uniform sampler2D uMap;
-      uniform float uViewAspect;
-      uniform float uImgAspect;
-      uniform float uBrightness;
-      varying vec2 vUv;
-
-      void main() {
-        vec2 uv = vUv;
-        if (uViewAspect < uImgAspect) {
-          float scale = uViewAspect / uImgAspect;
-          uv.x = (uv.x - 0.5) * scale + 0.5;
-        } else {
-          float scale = uImgAspect / uViewAspect;
-          uv.y = (uv.y - 0.5) * scale + 0.5;
-        }
-
-        vec4 srgb = texture2D(uMap, uv);
-        // Subtle vignette toward extreme corners + pre-exposure scaling for OutputPass ACESFilmic
-        float vig = 1.0 - 0.16 * dot(vUv - 0.5, vUv - 0.5) * 2.0;
-        vec3 linearCol = pow(srgb.rgb, vec3(2.2)) * uBrightness * vig * 0.82;
-        gl_FragColor = vec4(linearCol, 1.0);
-      }
-    `,
-    depthTest: false,
-    depthWrite: false,
-  });
-
-  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
-  mesh.frustumCulled = false;
-  mesh.renderOrder = -1000;
-  return { mesh, mat };
-}
-
 export class SceneManager {
   public readonly renderer: THREE.WebGLRenderer;
   public readonly scene: THREE.Scene;
@@ -114,16 +51,17 @@ export class SceneManager {
   private readonly composer: EffectComposer;
   private readonly bloomPass: UnrealBloomPass;
   private readonly tiltShiftPass: ReturnType<typeof createTabletopTiltShiftPass>;
-  private readonly backdropMat: THREE.ShaderMaterial;
 
-  private readonly tabletopKeySpot: THREE.SpotLight;
-  private readonly slateFrontFill: THREE.DirectionalLight;
-  private readonly warmBackRim: THREE.DirectionalLight;
+  private readonly keyShadowLight: THREE.DirectionalLight;
+  private readonly insigniaCatchLight: THREE.DirectionalLight;
+  private readonly selectedPieceLight: THREE.PointLight;
+  private readonly rimShadowSpot: THREE.SpotLight;
   private readonly ambientFill: THREE.HemisphereLight;
   private readonly arbiterHeroSpot: THREE.SpotLight;
   private readonly warRoom: WarRoomEnvironmentRefs;
 
   private readonly boardPiecesRoot = new THREE.Group();
+  private readonly onBoardInspectGroup: THREE.Group;
   private readonly casualtyPiecesRoot = new THREE.Group();
   private readonly indicatorLayer = new TileIndicatorLayer();
   private readonly raycastPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
@@ -132,14 +70,16 @@ export class SceneManager {
   private readonly casualtyVisuals = new Map<string, THREE.Group>();
 
   private cameraMode: CameraMode = 'PLAY';
-  private readonly camCurrentPos = new THREE.Vector3(0, 21.5, 11.2);
-  private readonly camCurrentLook = new THREE.Vector3(0, -0.2, -0.45);
-  private readonly camTargetPos = new THREE.Vector3(0, 21.5, 11.2);
-  private readonly camTargetLook = new THREE.Vector3(0, -0.2, -0.45);
+  private boardView: BoardViewAngle = 'COMMAND';
+  private selectedPieceId: string | null = null;
+  private userPitchDeltaDeg = 0;
+
+  private readonly camCurrentPos = new THREE.Vector3(0, 12.5, 16.5);
+  private readonly camCurrentLook = new THREE.Vector3(0, 0.15, -0.55);
+  private readonly camTargetPos = new THREE.Vector3(0, 12.5, 16.5);
+  private readonly camTargetLook = new THREE.Vector3(0, 0.15, -0.55);
   private roomDimFactor = 1.0;
   private targetRoomDimFactor = 1.0;
-  private plateBrightness = 1.0;
-  private targetPlateBrightness = 1.0;
 
   private readonly clock = new THREE.Clock();
   private totalElapsed = 0;
@@ -158,65 +98,83 @@ export class SceneManager {
     });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2.5));
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.02;
+    this.renderer.toneMappingExposure = 1.05;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    // Guardrail #3: Enable local clipping (scoped strictly to Arbiter well meshes!)
     this.renderer.localClippingEnabled = true;
     this.host.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color('#06080c');
+    this.scene.fog = new THREE.FogExp2('#07090e', 0.012);
 
-    // High-contrast warm RoomEnvironment + lantern HDRI via PMREMGenerator
     this.scene.environment = createStudioLanternEnvMap(this.renderer);
 
-    // Guardrail #1: Clean-plate `war_room_backdrop.jpg` background quad
-    const backdrop = createBackdropPlateMesh();
-    this.backdropMat = backdrop.mat;
-    this.scene.add(backdrop.mesh);
-
-    this.camera = new THREE.PerspectiveCamera(40, 9 / 16, 0.25, 95);
+    this.camera = new THREE.PerspectiveCamera(48, 9 / 16, 0.25, 95);
     this.camera.position.copy(this.camCurrentPos);
     this.camera.lookAt(this.camCurrentLook);
 
-    // 1. Warm 3200K Overhead Tabletop Key SpotLight (`2048x2048` soft shadows onto ShadowMaterial plane!)
-    this.tabletopKeySpot = new THREE.SpotLight(0xffe3be, 2.65, 58, Math.PI / 3.1, 0.58, 0.35);
-    this.tabletopKeySpot.position.set(3.2, 21.5, 6.8);
-    this.tabletopKeySpot.target.position.set(0, -0.35, -0.45);
-    this.tabletopKeySpot.castShadow = true;
-    this.tabletopKeySpot.shadow.mapSize.set(2048, 2048);
-    this.tabletopKeySpot.shadow.camera.near = 8.0;
-    this.tabletopKeySpot.shadow.camera.far = 38.0;
-    this.tabletopKeySpot.shadow.bias = -0.00035;
-    this.tabletopKeySpot.shadow.normalBias = 0.016;
-    this.scene.add(this.tabletopKeySpot, this.tabletopKeySpot.target);
+    // PURE SHADOW-DRIVEN CHIAROSCURO LIGHTING (Zero unshadowed overhead wash lights!):
+    // 1. Primary `4096x4096` Raking Warm Key DirectionalLight (`~34 deg` grazing elevation):
+    //    Because non-shadowed ambient/fill is kept near zero (`0.06`), EVERY piece, brass plinth,
+    //    escutcheon frame, raised walnut rail, and table prop casts DEEP, VELVETY 3D SHADOWS!
+    this.keyShadowLight = new THREE.DirectionalLight(0xffe0b5, 3.25);
+    this.keyShadowLight.position.set(-9.2, 6.8, 5.2);
+    this.keyShadowLight.target.position.set(0.4, -0.2, -0.6);
+    this.keyShadowLight.castShadow = true;
+    this.keyShadowLight.shadow.mapSize.set(4096, 4096);
+    this.keyShadowLight.shadow.camera.left = -8.4;
+    this.keyShadowLight.shadow.camera.right = 8.6;
+    this.keyShadowLight.shadow.camera.top = 9.4;
+    this.keyShadowLight.shadow.camera.bottom = -8.8;
+    this.keyShadowLight.shadow.camera.near = 1.5;
+    this.keyShadowLight.shadow.camera.far = 32.0;
+    this.keyShadowLight.shadow.bias = -0.0002;
+    this.keyShadowLight.shadow.normalBias = 0.008;
+    this.keyShadowLight.shadow.radius = 1.8;
+    this.scene.add(this.keyShadowLight, this.keyShadowLight.target);
 
-    // 2. Cool-Slate Front Fill Light sculpting the `68 deg` front wedge bevels & 72% metallic reliefs
-    this.slateFrontFill = new THREE.DirectionalLight(0xa2c0e2, 0.92);
-    this.slateFrontFill.position.set(-2.5, 9.5, 13.5);
-    this.scene.add(this.slateFrontFill);
+    // 2. Secondary Shadow-Casting Cool-Amber Rim SpotLight (`2048x2048` real shadows!) from Rear-Right:
+    //    Sculpts the armored louvers & shoulders of the Enemy Crimson Monoliths without erasing key shadows!
+    this.rimShadowSpot = new THREE.SpotLight(0xffb86b, 4.2, 42, Math.PI / 3.2, 0.72, 0.85);
+    this.rimShadowSpot.position.set(8.5, 8.2, -10.5);
+    this.rimShadowSpot.target.position.set(0, -0.1, 0.5);
+    this.rimShadowSpot.castShadow = true;
+    this.rimShadowSpot.shadow.mapSize.set(2048, 2048);
+    this.rimShadowSpot.shadow.bias = -0.0003;
+    this.rimShadowSpot.shadow.normalBias = 0.01;
+    this.scene.add(this.rimShadowSpot, this.rimShadowSpot.target);
 
-    // 3. Warm Back-Rim Kicker sculpting chamfered slate tile edges, brass collars & wedge top caps
-    this.warmBackRim = new THREE.DirectionalLight(0xffb464, 1.05);
-    this.warmBackRim.position.set(4.5, 8.5, -12.5);
-    this.scene.add(this.warmBackRim);
+    // 3. Dedicated Low-Elevation Front Grazing Insignia Catch-Light (`17 deg` above horizontal!):
+    //    Hits `68 deg` sloped front rank reliefs at `96%` normal alignment so EVERY rank emblem gleams brightly
+    //    anywhere on the board, while barely touching horizontal floor shadows (`sin(17 deg) = 0.29`)!
+    this.insigniaCatchLight = new THREE.DirectionalLight(0xfff0d6, 0.88);
+    this.insigniaCatchLight.position.set(1.6, 4.4, 14.5);
+    this.insigniaCatchLight.target.position.set(0, 0.35, 0.8);
+    this.scene.add(this.insigniaCatchLight, this.insigniaCatchLight.target);
 
-    this.ambientFill = new THREE.HemisphereLight(0xffebd2, 0x1e2838, 0.48);
+    // 4. Dynamic Tracking Hero Spotlight over the Selected / Moving Piece!
+    this.selectedPieceLight = new THREE.PointLight(0xffe6b0, 0.0, 2.05, 2.0);
+    this.scene.add(this.selectedPieceLight);
+
+    // Restrained `0.09` ambient floor so cast shadows stay dark, rich, and dimensional!
+    this.ambientFill = new THREE.HemisphereLight(0xd8e4f8, 0x05070c, 0.09);
     this.scene.add(this.ambientFill);
 
-    // Dedicated warm hero spotlight focused on the Electronic Arbiter during clashes
-    this.arbiterHeroSpot = new THREE.SpotLight(0xffe4bc, 0.0, 22, Math.PI / 3.2, 0.65, 1.25);
+    this.arbiterHeroSpot = new THREE.SpotLight(0xffe0b2, 0.0, 18, Math.PI / 3.4, 0.78, 1.25);
     this.arbiterHeroSpot.castShadow = false;
-    this.arbiterHeroSpot.position.set(0, 7.4, 1.4);
-    this.arbiterHeroSpot.target.position.set(0, 0.12, ARBITER_BAY_CENTER_Z + 0.55);
+    this.arbiterHeroSpot.position.set(-1.5, 5.8, 1.0);
+    this.arbiterHeroSpot.target.position.set(0, -0.1, ARBITER_BAY_CENTER_Z + 0.1);
     this.scene.add(this.arbiterHeroSpot, this.arbiterHeroSpot.target);
 
     this.factory = new MeshFactory();
     this.warRoom = this.factory.createWarRoomEnvironment();
     this.scene.add(this.warRoom.root);
     this.scene.add(this.factory.createBoardCabinetGroup());
-    this.scene.add(this.factory.createInspectionGalleryStage());
+
+    this.onBoardInspectGroup = this.factory.createOnBoardInspectionGroup();
+    this.scene.add(this.onBoardInspectGroup);
 
     this.arbiterStage = new ArbiterStage3D(this.factory, this.sound);
     this.scene.add(this.arbiterStage.root);
@@ -226,8 +184,8 @@ export class SceneManager {
     this.scene.add(this.boardPiecesRoot);
     this.scene.add(this.casualtyPiecesRoot);
 
-    void this.factory.preloadBakedModels().then(() => {
-      this.arbiterStage.attachBakedShutterIfReady();
+    void this.factory.preloadBakedModels().then((parts) => {
+      this.arbiterStage.applyBakedHardwareParts(parts);
     });
 
     const initRect = this.host.getBoundingClientRect();
@@ -237,7 +195,7 @@ export class SceneManager {
     this.composer = new EffectComposer(this.renderer);
     this.composer.addPass(new RenderPass(this.scene, this.camera));
 
-    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.38, 0.28, 1.58);
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.28, 0.25, 2.22);
     this.composer.addPass(this.bloomPass);
 
     this.composer.addPass(new OutputPass());
@@ -262,14 +220,22 @@ export class SceneManager {
     this.tiltShiftPass.enabled =
       options.renderQuality === 'ULTRA' && view.cameraMode !== 'INSPECT_16';
 
+    if (this.boardView !== options.boardView) {
+      this.boardView = options.boardView;
+      this.userPitchDeltaDeg = 0;
+    }
+
+    this.selectedPieceId = view.selectedPieceId;
     this.cameraMode = view.cameraMode;
     this.updateCameraTargets(view.cameraMode);
+    this.targetRoomDimFactor = view.cameraMode === 'ARBITER' ? 0.62 : 1.0;
 
-    // Guardrail #1: Dim `war_room_backdrop.jpg` cleanly to 35% brightness during Arbiter clashes!
-    this.targetRoomDimFactor = view.cameraMode === 'ARBITER' ? 0.45 : 1.0;
-    this.targetPlateBrightness = view.cameraMode === 'ARBITER' ? 0.35 : 1.0;
+    // On-Board `16-Rank Gallery` hides play pieces cleanly and displays the 4-angle turnaround + 16 reliefs
+    // right on the shadowed Walnut & Slate Board!
+    this.onBoardInspectGroup.visible = view.cameraMode === 'INSPECT_16';
+    this.boardPiecesRoot.visible = view.cameraMode === 'PLAY';
+    this.casualtyPiecesRoot.visible = view.cameraMode !== 'INSPECT_16';
 
-    this.boardPiecesRoot.visible = view.cameraMode !== 'ARBITER';
     const activeIds = new Set<string>();
     const clashingIds = new Set<string>();
     if (view.activeClash) {
@@ -333,7 +299,6 @@ export class SceneManager {
     this.camCurrentPos.copy(this.camTargetPos);
     this.camCurrentLook.copy(this.camTargetLook);
     this.roomDimFactor = this.targetRoomDimFactor;
-    this.plateBrightness = this.targetPlateBrightness;
     this.applyLightingAndCamera();
   }
 
@@ -355,30 +320,52 @@ export class SceneManager {
   }
 
   private stepFrame(dt: number, elapsed: number): void {
+    const discreteSec = Math.floor(elapsed);
+    const tickFrac = Math.min(1, (elapsed - discreteSec) * 8);
+    this.warRoom.watchSecondHand.rotation.y = -((discreteSec + tickFrac) / 60) * Math.PI * 2;
+
     const flickerL =
-      1.0 + 0.08 * Math.sin(elapsed * 7.1) + 0.05 * Math.sin(elapsed * 17.3 + 1.2);
+      1.0 + 0.09 * Math.sin(elapsed * 7.4) + 0.06 * Math.sin(elapsed * 18.1 + 1.2);
     const flickerR =
       1.0 + 0.07 * Math.cos(elapsed * 6.3 + 0.7) + 0.05 * Math.sin(elapsed * 14.9);
-    this.warRoom.lanternLightLeft.intensity = 6.5 * flickerL * this.roomDimFactor;
-    this.warRoom.lanternLightRight.intensity = 5.8 * flickerR * this.roomDimFactor;
+    this.warRoom.tableLanternShadowLight.intensity =
+      7.5 * flickerL * (0.76 + 0.24 * this.roomDimFactor);
+    this.warRoom.lanternLightRight.intensity =
+      3.8 * flickerR * (0.72 + 0.28 * this.roomDimFactor);
+    this.warRoom.lanternFlameMat.color.setRGB(
+      2.6 * flickerL,
+      1.65 * flickerL,
+      0.52 * flickerL
+    );
 
     const damp = 1 - Math.exp(-dt * 7.0);
     this.roomDimFactor = THREE.MathUtils.lerp(this.roomDimFactor, this.targetRoomDimFactor, damp);
-    this.plateBrightness = THREE.MathUtils.lerp(
-      this.plateBrightness,
-      this.targetPlateBrightness,
-      damp
-    );
 
     this.arbiterStage.update(dt, elapsed);
     this.indicatorLayer.update(elapsed);
 
+    // Tactile hover levitation + tracking Hero Spotlight on the selected/moving Command Monolith!
     const pieceSlide = 1 - Math.exp(-dt * 14.0);
+    let foundSelPos: THREE.Vector3 | null = null;
     for (const inst of this.pieceVisuals.values()) {
-      inst.group.position.lerp(inst.targetPos, pieceSlide);
+      const isSel = inst.id === this.selectedPieceId && this.cameraMode === 'PLAY';
+      const hoverY = isSel ? 0.11 + 0.025 * Math.sin(elapsed * 4.2) : 0.0;
+      inst.group.position.x = THREE.MathUtils.lerp(inst.group.position.x, inst.targetPos.x, pieceSlide);
+      inst.group.position.z = THREE.MathUtils.lerp(inst.group.position.z, inst.targetPos.z, pieceSlide);
+      inst.group.position.y = THREE.MathUtils.lerp(inst.group.position.y, hoverY, pieceSlide);
+      if (isSel) {
+        foundSelPos = inst.group.position;
+      }
     }
 
-    const speed = this.cameraMode === 'INSPECT_16' ? 14.0 : 8.5;
+    if (foundSelPos) {
+      this.selectedPieceLight.position.set(foundSelPos.x, foundSelPos.y + 1.15, foundSelPos.z + 0.36);
+      this.selectedPieceLight.intensity = 1.45;
+    } else {
+      this.selectedPieceLight.intensity = THREE.MathUtils.lerp(this.selectedPieceLight.intensity, 0, pieceSlide);
+    }
+
+    const speed = this.cameraMode === 'INSPECT_16' ? 12.0 : 8.5;
     const camDamp = 1 - Math.exp(-dt * speed);
     this.camCurrentPos.lerp(this.camTargetPos, camDamp);
     this.camCurrentLook.lerp(this.camTargetLook, camDamp);
@@ -388,67 +375,137 @@ export class SceneManager {
   }
 
   private applyLightingAndCamera(): void {
-    this.tabletopKeySpot.intensity = 1.65 * this.roomDimFactor;
-    this.slateFrontFill.intensity = 0.55 * this.roomDimFactor;
-    this.warmBackRim.intensity = 0.65 * this.roomDimFactor;
-    this.ambientFill.intensity = 0.36 * this.roomDimFactor;
-    this.arbiterHeroSpot.intensity = (1 - this.roomDimFactor) * 4.2;
-    this.backdropMat.uniforms['uBrightness']!.value = this.plateBrightness;
+    this.keyShadowLight.intensity = THREE.MathUtils.lerp(2.15, 3.25, this.roomDimFactor);
+    this.insigniaCatchLight.intensity = THREE.MathUtils.lerp(0.55, 0.92, this.roomDimFactor);
+    this.rimShadowSpot.intensity = 4.2 * this.roomDimFactor;
+    this.ambientFill.intensity = THREE.MathUtils.lerp(0.06, 0.09, this.roomDimFactor);
+    this.arbiterHeroSpot.intensity = (1 - this.roomDimFactor) * 2.1;
+
+    const tentBright = THREE.MathUtils.lerp(0.68, 0.85, this.roomDimFactor);
+    this.warRoom.tentBackdropMat.color.setRGB(tentBright, tentBright * 0.95, tentBright * 0.9);
 
     const shake = this.arbiterStage.getCameraShakeOffset();
     this.camera.position.copy(this.camCurrentPos).add(shake);
     this.camera.lookAt(this.camCurrentLook);
+
+    const dx = this.camCurrentLook.x - this.camCurrentPos.x;
+    const dy = this.camCurrentLook.y - this.camCurrentPos.y;
+    const dz = this.camCurrentLook.z - this.camCurrentPos.z;
+    const pitchCenter = Math.atan2(dy, Math.hypot(dx, dz));
+    const upperRayAngle = pitchCenter + THREE.MathUtils.degToRad(this.camera.fov * 0.5 * 0.68);
+    const distToCycZ = Math.max(4.0, this.camCurrentPos.z - -11.4);
+    const yAtUpper = this.camCurrentPos.y + Math.tan(upperRayAngle) * distToCycZ;
+    // Clamp <= 3.75 so the bottom of the 11.2-tall tent cyclorama ALWAYS meets the rear command table horizon (`y = -0.68`) with zero black sky gap!
+    this.warRoom.tentBackdropMesh.position.y = THREE.MathUtils.clamp(yAtUpper - 1.4, 2.5, 3.75);
   }
 
-  /**
-   * Analytical Viewport Framing:
-   * In `PLAY` mode, solves exact camera distance `R` from viewport `aspect` so the oiled walnut
-   * board (`width = 10.56`) spans **93.5% of viewport width** (`92%–95%`) and **63%–67% of 9:16 height**
-   * dead-center horizontally with zero wasted dead space!
-   */
   private updateCameraTargets(mode: CameraMode): void {
     const rect = this.host.getBoundingClientRect();
     const aspect = Math.max(0.38, (rect.width || 412) / Math.max(1, rect.height || 915));
+    const isLandscape = aspect >= 0.88;
 
     if (mode === 'ARBITER') {
-      const fov = aspect < 0.52 ? THREE.MathUtils.clamp(54 * (0.48 / aspect), 53, 59) : 50;
+      const fov = isLandscape
+        ? 39
+        : aspect < 0.52
+          ? THREE.MathUtils.clamp(56 * (0.49 / aspect), 55, 62)
+          : 50;
       this.camera.fov = fov;
       this.camera.updateProjectionMatrix();
-      this.camTargetPos.set(0, 4.75, 2.3);
-      this.camTargetLook.set(0, 0.14, ARBITER_BAY_CENTER_Z + 0.32);
-      (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.03, 0.78);
+      if (isLandscape) {
+        this.camTargetPos.set(0, 2.75, 1.55);
+        this.camTargetLook.set(0, 0.12, ARBITER_BAY_CENTER_Z - 0.18);
+      } else {
+        this.camTargetPos.set(0, 3.05, 1.95);
+        this.camTargetLook.set(0, 0.14, ARBITER_BAY_CENTER_Z - 0.12);
+      }
+      (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.04, 0.78);
     } else if (mode === 'INSPECT_16') {
-      const fov = aspect < 0.52 ? THREE.MathUtils.clamp(47 * (0.48 / aspect), 47, 52) : 44;
+      const fov = isLandscape ? 34 : aspect < 0.52 ? 42 : 38;
       this.camera.fov = fov;
       this.camera.updateProjectionMatrix();
-      this.camTargetPos.set(INSPECT_STAGE_ORIGIN.x, 12.2, INSPECT_STAGE_ORIGIN.z + 5.7);
-      this.camTargetLook.set(INSPECT_STAGE_ORIGIN.x, 0.1, INSPECT_STAGE_ORIGIN.z - 0.35);
+      this.camTargetLook.set(-0.5, 0.22, isLandscape ? 0.25 : 0.65);
+      this.camTargetPos.set(-0.5, isLandscape ? 9.4 : 8.6, isLandscape ? 9.2 : 8.95);
       (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.02, 0.98);
-    } else {
-      // Analytical `93.5%` horizontal width solver (`92%–95%` target!):
-      const fovDeg = 40;
-      this.camera.fov = fovDeg;
+    } else if (isLandscape) {
+      // FULL-BLEED ANAMORPHIC MOBILE LANDSCAPE FRAMING (`e.g. 915x412` / `844x390`):
+      // Height-locks the Walnut & Brass Console to ~81% of vertical height dead-center while naturally
+      // showcasing the 3D brass hurricane oil lantern & crate on the left wing and pocket watch & scrolls on the right!
+      const landscapePresets: Record<
+        BoardViewAngle,
+        { pitchDeg: number; fovDeg: number; heightOcc: number; lookZ: number }
+      > = {
+        COMMAND: { pitchDeg: 43.0, fovDeg: 38, heightOcc: 0.82, lookZ: -0.25 },
+        TACTICAL: { pitchDeg: 32.5, fovDeg: 38, heightOcc: 0.8, lookZ: 0.05 },
+        OVERHEAD: { pitchDeg: 62.0, fovDeg: 36, heightOcc: 0.83, lookZ: -0.45 },
+      };
+      const lSpec = landscapePresets[this.boardView];
+      const finalPitchDeg = THREE.MathUtils.clamp(
+        lSpec.pitchDeg + this.userPitchDeltaDeg,
+        24.0,
+        70.0
+      );
+      this.camera.fov = lSpec.fovDeg;
       this.camera.updateProjectionMatrix();
 
-      const halfFovRad = THREE.MathUtils.degToRad(fovDeg * 0.5);
-      const pitchRad = THREE.MathUtils.degToRad(62.5);
-      const targetWidthOccupancy = 0.935; // 93.5% of viewport width!
-      const boardOuterWidth = 10.56;
-      const frontViewWidth = boardOuterWidth / targetWidthOccupancy;
+      const halfFovRad = THREE.MathUtils.degToRad(lSpec.fovDeg * 0.5);
+      const pitchRad = THREE.MathUtils.degToRad(finalPitchDeg);
+      const projBoardH = 12.36 * Math.sin(pitchRad) + 1.05 * Math.cos(pitchRad);
+      const rHeight = projBoardH / lSpec.heightOcc / (2 * Math.tan(halfFovRad));
+      const rWidth = 11.2 / (2 * Math.tan(halfFovRad) * aspect);
+      const rDist = Math.max(rHeight, rWidth);
 
-      // Distance to front widest edge (`z = +5.55` vs lookAt `z = -0.35`, deltaZ = 5.90)
-      const rFront = frontViewWidth / (2 * Math.tan(halfFovRad) * aspect);
-      const rCenter = rFront + 5.9 * Math.cos(pitchRad);
-
-      const lookY = -0.22;
-      const lookZ = -0.35;
-      this.camTargetLook.set(0, lookY, lookZ);
+      const lookY = -0.12;
+      this.camTargetLook.set(0, lookY, lSpec.lookZ);
       this.camTargetPos.set(
         0,
-        lookY + rCenter * Math.sin(pitchRad),
-        lookZ + rCenter * Math.cos(pitchRad)
+        lookY + rDist * Math.sin(pitchRad),
+        lSpec.lookZ + rDist * Math.cos(pitchRad)
       );
-      (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.05, 0.84);
+      (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.04, 0.92);
+    } else {
+      // ZERO-WASTED-SPACE ORTHONORMAL BOTTOM-RAIL ANCHOR LOCK (Mobile Portrait `9:16`):
+      // Mathematically locks the front walnut cabinet lip (`P_front = (0, -0.55, 5.65)`) to `ndcY = -0.78`
+      // (kissing right above the bottom Dynamic Island capsule with ZERO dead space below the board!)
+      // while locking the walnut bolster rail (`width = 10.18`) to `97.5%` of viewport width!
+      const presetSpec: Record<
+        BoardViewAngle,
+        { pitchDeg: number; fovDeg: number; widthOcc: number; frontNdcY: number }
+      > = {
+        COMMAND: { pitchDeg: 40.0, fovDeg: 43, widthOcc: 0.98, frontNdcY: -0.75 },
+        TACTICAL: { pitchDeg: 32.5, fovDeg: 46, widthOcc: 0.98, frontNdcY: -0.77 },
+        OVERHEAD: { pitchDeg: 62.0, fovDeg: 41, widthOcc: 0.965, frontNdcY: -0.79 },
+      };
+
+      const spec = presetSpec[this.boardView];
+      const finalPitchDeg = THREE.MathUtils.clamp(
+        spec.pitchDeg + this.userPitchDeltaDeg,
+        24.0,
+        70.0
+      );
+      this.camera.fov = spec.fovDeg;
+      this.camera.updateProjectionMatrix();
+
+      const halfFovRad = THREE.MathUtils.degToRad(spec.fovDeg * 0.5);
+      const pitchRad = THREE.MathUtils.degToRad(finalPitchDeg);
+      const bolsterWidth = 10.18;
+
+      const zEyeFront =
+        bolsterWidth / spec.widthOcc / (2 * Math.tan(halfFovRad) * aspect);
+      const yEyeFront = spec.frontNdcY * zEyeFront * Math.tan(halfFovRad);
+
+      // Camera basis in YZ plane: fwd = (0, -sin(p), -cos(p)), up = (0, cos(p), -sin(p))
+      const sinP = Math.sin(pitchRad);
+      const cosP = Math.cos(pitchRad);
+      const frontY = -0.55;
+      const frontZ = 5.65;
+
+      const camY = frontY - (zEyeFront * -sinP + yEyeFront * cosP);
+      const camZ = frontZ - (zEyeFront * -cosP + yEyeFront * -sinP);
+
+      this.camTargetPos.set(0, camY, camZ);
+      this.camTargetLook.set(0, camY - sinP * zEyeFront, camZ - cosP * zEyeFront);
+      (this.tiltShiftPass.uniforms['uFocusBand']!.value as THREE.Vector2).set(0.04, 0.9);
     }
   }
 
@@ -485,23 +542,24 @@ export class SceneManager {
       if (this.casualtyVisuals.has(key)) continue;
 
       const wedge = this.factory.createCommandWedge(item.faction, item.visibleRank);
-      wedge.scale.setScalar(0.76);
+      wedge.scale.setScalar(0.64);
 
       const idx = item.casualtyIndex;
       const col = idx % 2;
       const row = Math.floor(idx / 2) % 3;
       const layer = Math.floor(idx / 6);
 
-      const ox = (col - 0.5) * 0.52 + Math.sin(idx * 2.3) * 0.05;
-      const oz = (row - 1) * 0.58 + Math.cos(idx * 1.9) * 0.05;
-      const oy = 0.09 + layer * 0.22;
+      const ox = (col - 0.5) * 0.44;
+      const oz = (row - 1) * 0.52;
+      const oy = -0.29 + layer * 0.24;
 
-      wedge.position.set(wellCenter.x + ox, wellCenter.y + oy, wellCenter.z + oz);
-      if (item.faction === 'ENEMY') {
-        wedge.rotation.set(Math.PI / 2 - 0.35, Math.sin(idx * 1.7) * 0.4, 0.12);
-      } else {
-        wedge.rotation.set(-Math.PI / 2 + 0.42, Math.cos(idx * 1.3) * 0.35, -0.1);
-      }
+      wedge.position.set(wellCenter.x + ox, oy, wellCenter.z + oz);
+      const baseYaw = item.faction === 'ENEMY' ? Math.PI : 0;
+      wedge.rotation.set(
+        Math.sin(idx * 1.7) * 0.08,
+        baseYaw + Math.cos(idx * 2.1) * 0.24,
+        col === 0 ? 0.09 : -0.09
+      );
 
       this.casualtyPiecesRoot.add(wedge);
       this.casualtyVisuals.set(key, wedge);
@@ -522,9 +580,43 @@ export class SceneManager {
     const ndc = new THREE.Vector2();
     const hitPoint = new THREE.Vector3();
 
+    let pointerIdDown: number | null = null;
+    let downX = 0;
+    let downY = 0;
+    let startPitchDelta = 0;
+    let draggedCamera = false;
+
     this.renderer.domElement.addEventListener('pointerdown', (ev: PointerEvent) => {
       this.sound.unlock();
       if (this.arbiterStage.isBusy || this.cameraMode !== 'PLAY') return;
+      pointerIdDown = ev.pointerId;
+      downX = ev.clientX;
+      downY = ev.clientY;
+      startPitchDelta = this.userPitchDeltaDeg;
+      draggedCamera = false;
+    });
+
+    this.renderer.domElement.addEventListener('pointermove', (ev: PointerEvent) => {
+      if (pointerIdDown !== ev.pointerId || this.arbiterStage.isBusy || this.cameraMode !== 'PLAY') {
+        return;
+      }
+      const dy = ev.clientY - downY;
+      const dx = ev.clientX - downX;
+      if (!draggedCamera && Math.abs(dy) > 14 && Math.abs(dy) > Math.abs(dx) * 1.25) {
+        draggedCamera = true;
+      }
+      if (draggedCamera) {
+        this.userPitchDeltaDeg = THREE.MathUtils.clamp(startPitchDelta + dy * 0.12, -10, 32);
+        this.updateCameraTargets('PLAY');
+      }
+    });
+
+    const clearPointer = (ev: PointerEvent) => {
+      if (pointerIdDown !== ev.pointerId) return;
+      const wasDrag = draggedCamera;
+      pointerIdDown = null;
+      draggedCamera = false;
+      if (wasDrag || this.arbiterStage.isBusy || this.cameraMode !== 'PLAY') return;
 
       const rect = this.renderer.domElement.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return;
@@ -581,6 +673,12 @@ export class SceneManager {
       } else {
         this.store.selectPiece(null);
       }
+    };
+
+    this.renderer.domElement.addEventListener('pointerup', clearPointer);
+    this.renderer.domElement.addEventListener('pointercancel', () => {
+      pointerIdDown = null;
+      draggedCamera = false;
     });
   }
 
@@ -590,7 +688,6 @@ export class SceneManager {
     const h = Math.max(1, Math.floor(rect.height));
 
     this.camera.aspect = w / h;
-    this.backdropMat.uniforms['uViewAspect']!.value = w / h;
     this.updateCameraTargets(this.cameraMode);
     this.camera.updateProjectionMatrix();
 

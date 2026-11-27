@@ -77,6 +77,7 @@ export interface ArbiterVerdict {
 
 export type CameraMode = 'PLAY' | 'ARBITER' | 'INSPECT_16';
 
+export type BoardViewAngle = 'COMMAND' | 'TACTICAL' | 'OVERHEAD';
 export type AudioEraMode = '1980s' | '1970s';
 export type ArbiterSpeedMode = '1x' | '1.75x';
 export type RenderQualityMode = 'ULTRA' | 'BALANCED';
@@ -86,6 +87,7 @@ export interface AppOptions {
   eraMode: AudioEraMode;
   arbiterSpeed: ArbiterSpeedMode;
   renderQuality: RenderQualityMode;
+  boardView: BoardViewAngle;
 }
 
 export type HudBannerState =

@@ -49,7 +49,20 @@ export class GameStore {
     eraMode: '1980s',
     arbiterSpeed: '1x',
     renderQuality: 'ULTRA',
+    boardView: 'COMMAND',
   };
+
+  public cycleBoardView(): void {
+    const order: AppOptions['boardView'][] = ['COMMAND', 'TACTICAL', 'OVERHEAD'];
+    const idx = order.indexOf(this.options.boardView);
+    const next = order[(idx + 1) % order.length]!;
+    this.options = { ...this.options, boardView: next };
+    if (this.cameraMode === 'INSPECT_16') {
+      this.cameraMode = 'PLAY';
+      this.banner = this.selectedPieceId ? 'SELECT TARGET' : 'TACTICAL COMMAND';
+    }
+    this.emit();
+  }
 
   constructor() {
     this.resetSandbox();

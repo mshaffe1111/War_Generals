@@ -31,18 +31,26 @@ UPLOADED_SHEET = r"C:\Users\mshaf\.gemini\antigravity\brain\f10c17e4-676b-4899-9
 UPLOADED_BACKDROP = r"C:\Users\mshaf\.gemini\antigravity\brain\f10c17e4-676b-4899-9851-d9b61677a348\.user_uploaded\media_1795750965876_4be394a3.jpg"
 
 
-def extract_background_mask_cell(cell_rgb: np.ndarray, bg_rgb: np.ndarray, tol: float = 21.5) -> np.ndarray:
+def extract_background_mask_cell(cell_rgb: np.ndarray, bg_rgb: np.ndarray, tol: float = 22.0) -> np.ndarray:
     """
     Computes clean foreground alpha (0..1) for a single cell using border-seeded flood-fill
-    plus enclosed neutral-grey hole detection (for target rings, Captain twin-bar gap, and hilts).
+    that strips BOTH the neutral [80,80,80] studio background AND dark neutral exterior drop-shadows
+    (preventing grey halos around silver Eagle / Oak Leaf / Captain / Lieutenant emblems!),
+    while preserving 100% of bright silver edges, warm brass edges, and interior crevices.
     """
     h, w, _ = cell_rgb.shape
     diff = np.linalg.norm(cell_rgb - bg_rgb[None, None, :], axis=-1)
-    # Chroma (saturation) check: neutral studio grey has max(R,G,B) - min(R,G,B) <= 5
     chroma = np.max(cell_rgb, axis=-1) - np.min(cell_rgb, axis=-1)
-    is_bg_candidate = (diff < tol) & (chroma < 11.0)
+    warmth = cell_rgb[:, :, 0] - cell_rgb[:, :, 2]
+    lum = 0.299 * cell_rgb[:, :, 0] + 0.587 * cell_rgb[:, :, 1] + 0.114 * cell_rgb[:, :, 2]
+    bg_lum = float(0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2])
 
-    # 1. Flood-fill from all 4 cell borders to capture exterior background
+    # Exterior background OR neutral dark cast-shadow on the grey studio backdrop:
+    # Real brass has warmth > 13; real silver has lum > bg_lum + 22 (i.e. > 102).
+    is_neutral_bg_or_shadow = (chroma < 14.5) & (np.abs(warmth) < 13.0) & (lum < bg_lum + 18.0)
+    is_bg_candidate = ((diff < tol) & (chroma < 12.0)) | is_neutral_bg_or_shadow
+
+    # 1. Flood-fill from all 4 cell borders to capture exterior background + exterior drop shadow
     visited = np.zeros((h, w), dtype=bool)
     q: deque[tuple[int, int]] = deque()
     for x in range(w):
@@ -63,9 +71,8 @@ def extract_background_mask_cell(cell_rgb: np.ndarray, bg_rgb: np.ndarray, tol: 
                 visited[ny, nx] = True
                 q.append((ny, nx))
 
-    # 2. Also capture genuine enclosed background holes (e.g. inside Attack Medallion rings & Captain bars)
-    #    where connected neutral-grey region has >= 36 pixels and tight match to [80, 80, 80]
-    strict_hole = (diff < 12.5) & (chroma < 6.5) & (~visited)
+    # 2. Capture enclosed background holes (e.g. inside Attack Medallion rings & Captain twin bars)
+    strict_hole = (chroma < 12.0) & (np.abs(warmth) < 11.0) & (lum < bg_lum + 14.0) & (~visited)
     checked = np.zeros((h, w), dtype=bool)
     for y in range(h):
         for x in range(w):
@@ -80,20 +87,18 @@ def extract_background_mask_cell(cell_rgb: np.ndarray, bg_rgb: np.ndarray, tol: 
                         if 0 <= ny < h and 0 <= nx < w and strict_hole[ny, nx] and not checked[ny, nx]:
                             checked[ny, nx] = True
                             cq.append((ny, nx))
-                if len(comp) >= 40:
+                if len(comp) >= 48:
                     for py, px in comp:
                         visited[py, px] = True
 
     fg = (~visited).astype(np.float32)
 
-    # Anti-aliased soft edge ramp near silhouette boundary using color distance
-    edge_ramp = np.clip((diff - 10.0) / 14.0, 0.0, 1.0)
-    alpha = np.where(fg > 0.5, np.maximum(0.65, edge_ramp), 0.0)
-    alpha_img = Image.fromarray((alpha * 255.0).astype(np.uint8), mode="L").filter(
-        ImageFilter.GaussianBlur(radius=0.85)
+    # Crisp anti-aliased silhouette (zero wide grey blur fringe!)
+    alpha_img = Image.fromarray((fg * 255.0).astype(np.uint8), mode="L").filter(
+        ImageFilter.GaussianBlur(radius=0.65)
     )
     alpha_smooth = np.array(alpha_img, dtype=np.float32) / 255.0
-    return np.clip((alpha_smooth - 0.12) / 0.82, 0.0, 1.0)
+    return np.clip((alpha_smooth - 0.18) / 0.72, 0.0, 1.0)
 
 
 def repair_five_star_cell(sheet_img: Image.Image, bg_rgb: np.ndarray) -> Image.Image:

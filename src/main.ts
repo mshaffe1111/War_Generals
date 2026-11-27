@@ -32,7 +32,7 @@ sceneManager.startLoop();
 declare global {
   interface Window {
     __WAR_GENERALS_STAGE__?: {
-      poseTabletop: () => void;
+      poseTabletop: (boardView?: 'COMMAND' | 'TACTICAL' | 'OVERHEAD') => void;
       poseInspect16: () => void;
       poseArbiterAct: (preset: ShowcasePreset, actSeconds: number) => void;
     };
@@ -40,9 +40,10 @@ declare global {
 }
 
 window.__WAR_GENERALS_STAGE__ = {
-  poseTabletop: () => {
+  poseTabletop: (boardView = 'COMMAND') => {
     sceneManager.arbiterStage.resetToIdle();
     store.resetSandbox();
+    store.updateOptions({ boardView });
     sceneManager.snapCameraImmediately();
   },
   poseInspect16: () => {
