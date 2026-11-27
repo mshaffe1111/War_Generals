@@ -1,4 +1,4 @@
-import type { CampaignProgressState, CommanderId } from './CommanderProfiles';
+import type { CampaignProgressState, CommanderId } from '../ai/CommanderProfiles';
 import type { Faction, RankId } from './ranks';
 
 export interface GridCoord {

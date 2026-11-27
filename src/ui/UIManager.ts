@@ -3,7 +3,7 @@ import {
   COMMANDER_ROSTER,
   getCommanderProfile,
   type CommanderId,
-} from '../core/CommanderProfiles';
+} from '../ai/CommanderProfiles';
 import { ORDERED_RANKS, RANK_SPECS, type RankId } from '../core/ranks';
 import { ARMY_PIECE_TOTAL } from '../core/RulesEngine';
 import type {
@@ -250,11 +250,14 @@ export class UIManager {
     const skirmishCommanderCardsHtml = COMMANDER_ROSTER.map(
       (c) => `
         <button type="button" class="cmd-select-card" data-skirmish-cmd="${c.id}">
-          <div class="cmd-card-top">
-            <span class="cmd-tier-tag">T${c.tier}</span>
-            <span class="cmd-doctrine-tag">${c.doctrineName}</span>
-          </div>
-          <div class="cmd-card-name">${c.fullName}</div>
+          <span class="cmd-portrait-box">${c.portraitSvg}</span>
+          <span class="cmd-card-meta">
+            <span class="cmd-card-top">
+              <span class="cmd-tier-tag">T${c.tier}</span>
+              <span class="cmd-doctrine-tag">"${c.moniker}"</span>
+            </span>
+            <span class="cmd-card-name">${c.fullName}</span>
+          </span>
         </button>
       `
     ).join('');
@@ -349,6 +352,7 @@ export class UIManager {
             <div class="cmd-grid-6" id="skirmish-cmd-grid">
               ${skirmishCommanderCardsHtml}
             </div>
+            <div class="cmd-dossier-blurb" id="skirmish-cmd-summary"></div>
             <div class="era-inline-row">
               <span class="era-inline-label">ERA RULESET</span>
               <div class="seg-track" id="seg-skirmish-era">
@@ -369,6 +373,7 @@ export class UIManager {
               <button type="button" class="mini-brass-btn" data-back-root="true">← MENU</button>
             </div>
             <div class="cmd-grid-6" id="campaign-cmd-grid"></div>
+            <div class="cmd-dossier-blurb" id="campaign-cmd-summary"></div>
             <button type="button" class="primary-brass-cta cta-sheen" id="btn-launch-campaign">
               LAUNCH CAMPAIGN OPERATION
             </button>
@@ -1113,13 +1118,23 @@ export class UIManager {
     }
     this.campaignStatsBadge.textContent = `MEDALS ${medalsCount}/6 • WIN ${winPct}%`;
 
+    const activeCmd = getCommanderProfile(view.commanderId);
+    const skSummary = this.root.querySelector('#skirmish-cmd-summary');
+    if (skSummary) {
+      skSummary.textContent = `${activeCmd.fullName} ("${activeCmd.moniker}") — ${activeCmd.summary}`;
+    }
+    const campSummary = this.root.querySelector('#campaign-cmd-summary');
+    if (campSummary) {
+      campSummary.textContent = `${activeCmd.fullName} ("${activeCmd.moniker}") — ${activeCmd.summary}`;
+    }
+
     this.skirmishGrid
       .querySelectorAll<HTMLButtonElement>('[data-skirmish-cmd]')
       .forEach((btn) => {
         btn.dataset['selected'] = String(btn.dataset['skirmishCmd'] === view.commanderId);
       });
 
-    // Rebuild Campaign 6-Tier Grid cleanly
+    // Rebuild Campaign 6-Tier Grid cleanly with Tactical Portraits & Monikers
     this.campaignGrid.innerHTML = COMMANDER_ROSTER.map((c) => {
       const unlocked = c.tier <= camp.unlockedTier;
       const rec = camp.records[c.id];
@@ -1133,11 +1148,14 @@ export class UIManager {
           data-locked="${!unlocked}"
           ${!unlocked ? 'disabled' : ''}
         >
-          <div class="cmd-card-top">
-            <span class="cmd-tier-tag">${unlocked ? `T${c.tier}` : '🔒'}</span>
-            <span class="cmd-doctrine-tag">${rec.medalEarned ? '★ MEDAL' : `${rec.wins}W–${rec.losses}L`}</span>
-          </div>
-          <div class="cmd-card-name">${c.fullName}</div>
+          <span class="cmd-portrait-box">${c.portraitSvg}</span>
+          <span class="cmd-card-meta">
+            <span class="cmd-card-top">
+              <span class="cmd-tier-tag">${unlocked ? `T${c.tier}` : '🔒'}</span>
+              <span class="cmd-doctrine-tag">${rec.medalEarned ? '★ MEDAL' : `"${c.moniker}"`}</span>
+            </span>
+            <span class="cmd-card-name">${c.fullName}</span>
+          </span>
         </button>
       `;
     }).join('');
@@ -1155,8 +1173,14 @@ export class UIManager {
 
   private renderIntelLedger(view: PlayerVisibleView): void {
     const L = view.intelLedger;
+    const cmd = getCommanderProfile(view.commanderId);
     const ownLabel = view.viewingFaction === 'PLAYER' ? 'NAVY COMMAND' : 'CRIMSON COMMAND';
-    const oppLabel = view.viewingFaction === 'PLAYER' ? 'CRIMSON (SEALED)' : 'NAVY (SEALED)';
+    const oppLabel =
+      view.matchMode === 'PASS_AND_PLAY'
+        ? view.viewingFaction === 'PLAYER'
+          ? 'CRIMSON (SEALED)'
+          : 'NAVY (SEALED)'
+        : `${cmd.fullName.toUpperCase()} ("${cmd.moniker.toUpperCase()}")`;
     this.intelBody.innerHTML = `
       <div class="intel-col">
         <div class="intel-col-hdr cyan">${ownLabel}</div>

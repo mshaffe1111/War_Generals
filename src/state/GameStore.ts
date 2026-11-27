@@ -1,17 +1,19 @@
-import { AIBeliefState } from '../ai/AIBeliefState';
 import {
-  AIStrategist,
-  type AIOwnPieceInfo,
-  type ObservedPlayerPieceInfo,
-} from '../ai/AIStrategist';
-import { resolveArbiterChallenge } from '../arbiter/ArbiterResolver';
+  BeliefMatrixAI,
+  type AIOwnUnitState,
+  type ObservedPlayerUnitState,
+  type PublicClashOutcomeForAI,
+} from '../ai/BeliefMatrixAI';
 import {
+  generateCommanderDeployment,
   getCommanderProfile,
   loadCampaignProgress,
   recordCampaignMatchResult,
+  recordPostMatchPlayerTendencies,
   type CampaignProgressState,
   type CommanderId,
-} from '../core/CommanderProfiles';
+} from '../ai/CommanderProfiles';
+import { resolveArbiterChallenge } from '../arbiter/ArbiterResolver';
 import {
   BOARD_COLS,
   BOARD_ROWS,
@@ -160,8 +162,9 @@ export class GameStore {
   private matchMode: MatchMode = 'SKIRMISH';
   private viewingFaction: Faction = 'PLAYER';
   private activeTurn: Faction = 'PLAYER';
-  private commanderId: CommanderId = 'REYES';
+  private commanderId: CommanderId = 'MILLER';
   private campaign: CampaignProgressState = loadCampaignProgress();
+  private initialPlayerDeploySlots: DeploymentSlot[] = [];
 
   private matchClockSec = MATCH_CLOCK_DEFAULT_SEC;
   private turnClockSec = TURN_CLOCK_DEFAULT_SEC;
@@ -195,8 +198,7 @@ export class GameStore {
   private replayTimer: number | null = null;
   private aiTurnTimer: number | null = null;
 
-  private readonly aiBelief = new AIBeliefState();
-  private readonly aiStrategist = new AIStrategist();
+  private readonly beliefAI = new BeliefMatrixAI();
   private readonly listeners = new Set<StoreListener>();
 
   public onAIClashTriggered?: (verdict: ArbiterVerdict) => void;
@@ -481,9 +483,8 @@ export class GameStore {
     this.flagPendingGoalFaction = null;
     this.pieceIdCounter = 0;
 
-    // Deploy Enemy AI army on Rows 0..2 using active Commander's preferred tournament doctrine
-    const commander = getCommanderProfile(this.commanderId);
-    const enemySlots = generateEnemyTournamentDeployment(commander.preferredPreset);
+    // Deploy Enemy AI army on Rows 0..2 using active Commander's procedural randomized setup!
+    const enemySlots = generateCommanderDeployment(this.commanderId);
     this.setFactionDeploymentSlots('ENEMY', enemySlots);
 
     if (initialPreset) {
@@ -689,11 +690,7 @@ export class GameStore {
       const playerSlots = this.getFactionDeploymentSlots('PLAYER');
       if (!validateFactionDeployment('PLAYER', playerSlots)) return false;
       this.matchMode = 'SKIRMISH';
-      const commander = getCommanderProfile(this.commanderId);
-      this.setFactionDeploymentSlots(
-        'ENEMY',
-        generateEnemyTournamentDeployment(commander.preferredPreset)
-      );
+      this.setFactionDeploymentSlots('ENEMY', generateCommanderDeployment(this.commanderId));
       this.phase = 'DEPLOY';
     }
 
@@ -723,10 +720,15 @@ export class GameStore {
     this.matchClockSec = MATCH_CLOCK_DEFAULT_SEC;
     this.turnClockSec = TURN_CLOCK_DEFAULT_SEC;
 
-    const playerIds = Array.from(this.#truthPieces.values())
+    this.initialPlayerDeploySlots = this.getFactionDeploymentSlots('PLAYER').map((s) => ({
+      ...s,
+    }));
+
+    const publicPlayerInitialSquares = Array.from(this.#truthPieces.values())
       .filter((p) => p.faction === 'PLAYER' && p.alive)
-      .map((p) => p.id);
-    this.aiBelief.initializeUnknownArmy(playerIds);
+      .map((p) => ({ id: p.id, col: p.col, row: p.row }));
+    const aiInitialUnits = this.collectAIUnitStates();
+    this.beliefAI.initializeMatch(publicPlayerInitialSquares, aiInitialUnits);
 
     this.#replayPlies = [
       {
@@ -1016,6 +1018,16 @@ export class GameStore {
         isClash: false,
       });
 
+      if (mover.faction === 'PLAYER' && this.matchMode !== 'PASS_AND_PLAY') {
+        this.beliefAI.recordPlayerMove(
+          mover.id,
+          fromCoord,
+          toCoord,
+          this.turnCount,
+          this.collectAIUnitStates()
+        );
+      }
+
       this.selectedPieceId = null;
       this.turnClockSec = TURN_CLOCK_DEFAULT_SEC;
 
@@ -1122,7 +1134,21 @@ export class GameStore {
     const sqLabel = formatAlgebraicCoord(toCoord.col, toCoord.row);
 
     const aiPiece = attacker.faction === 'ENEMY' ? attacker : defender;
-    this.aiBelief.recordObservedClash(verdict, aiPiece.trueRank);
+    if (this.matchMode !== 'PASS_AND_PLAY') {
+      const outcomeForAI: PublicClashOutcomeForAI =
+        verdict.resolution === 'MUTUAL_SPLIT'
+          ? 'SPLIT'
+          : verdict.survivorFaction === 'ENEMY'
+            ? 'AI_WON'
+            : 'AI_LOST';
+      this.beliefAI.recordClashOutcome(
+        verdict.playerPieceId,
+        aiPiece.id,
+        aiPiece.trueRank,
+        outcomeForAI,
+        this.turnCount
+      );
+    }
 
     if (verdict.resolution === 'MUTUAL_SPLIT') {
       this.eliminatePiece(attacker);
@@ -1255,13 +1281,20 @@ export class GameStore {
       return;
     }
 
-    const aiUnits: AIOwnPieceInfo[] = [];
-    const observedPlayers: ObservedPlayerPieceInfo[] = [];
+    const aiUnits: AIOwnUnitState[] = [];
+    const observedPlayers: ObservedPlayerUnitState[] = [];
     for (const p of this.#truthPieces.values()) {
       if (!p.alive) continue;
       if (p.faction === 'ENEMY') {
-        aiUnits.push({ id: p.id, ownRank: p.trueRank, col: p.col, row: p.row });
+        aiUnits.push({
+          id: p.id,
+          ownRank: p.trueRank,
+          col: p.col,
+          row: p.row,
+          hasMoved: p.hasMoved,
+        });
       } else {
+        // ZERO Player `trueRank` passed to BeliefMatrixAI!
         observedPlayers.push({
           id: p.id,
           col: p.col,
@@ -1272,12 +1305,11 @@ export class GameStore {
       }
     }
 
-    const commander = getCommanderProfile(this.commanderId);
-    const decision = this.aiStrategist.chooseMove(
+    const decision = this.beliefAI.chooseCommanderMove(
       aiUnits,
       observedPlayers,
-      this.aiBelief,
-      commander
+      this.commanderId,
+      this.turnCount
     );
     if (!decision) {
       this.declareMatchWinner(
@@ -1406,6 +1438,11 @@ export class GameStore {
     this.interactionLocked = false;
 
     const playerWon = winner === 'PLAYER';
+    if (this.matchMode !== 'PASS_AND_PLAY') {
+      // Post-match only: record historical wing tendencies so Marshal Hollis adapts on future matches!
+      recordPostMatchPlayerTendencies(this.initialPlayerDeploySlots);
+    }
+
     let medalUnlocked: string | null = null;
     if (this.matchMode === 'CAMPAIGN') {
       const res = recordCampaignMatchResult(this.commanderId, playerWon, this.turnCount);
@@ -1977,6 +2014,22 @@ export class GameStore {
         casualtyIndex: this.#enemyCasualties.length,
       });
     }
+  }
+
+  private collectAIUnitStates(): AIOwnUnitState[] {
+    const out: AIOwnUnitState[] = [];
+    for (const p of this.#truthPieces.values()) {
+      if (p.alive && p.faction === 'ENEMY') {
+        out.push({
+          id: p.id,
+          ownRank: p.trueRank,
+          col: p.col,
+          row: p.row,
+          hasMoved: p.hasMoved,
+        });
+      }
+    }
+    return out;
   }
 
   private findAliveAt(col: number, row: number): TruthPieceRecord | undefined {

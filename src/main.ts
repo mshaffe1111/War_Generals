@@ -67,7 +67,7 @@ window.__WAR_GENERALS_STAGE__ = {
   },
   poseTabletop: (boardView = 'COMMAND') => {
     sceneManager.arbiterStage.resetToIdle();
-    store.startSkirmish('REYES');
+    store.startSkirmish('MILLER');
     store.applyDeploymentPreset('VACCINATION');
     store.launchBattleFromDeployment();
     store.updateOptions({ boardView });
@@ -90,7 +90,7 @@ window.__WAR_GENERALS_STAGE__ = {
   },
   poseArbiterAct: (preset: ShowcasePreset, actSeconds: number) => {
     sceneManager.arbiterStage.resetToIdle();
-    store.startSkirmish('REYES');
+    store.startSkirmish('MILLER');
     store.applyDeploymentPreset('VACCINATION');
     store.launchBattleFromDeployment();
     const verdict = store.triggerShowcaseClash(preset);
