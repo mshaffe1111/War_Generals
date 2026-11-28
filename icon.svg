@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#182B49"/>
+      <stop offset="100%" stop-color="#0b1322"/>
+    </linearGradient>
+    <linearGradient id="brass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f2cf7e"/>
+      <stop offset="50%" stop-color="#C8963E"/>
+      <stop offset="100%" stop-color="#7c561b"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="96" fill="url(#bg)" stroke="url(#brass)" stroke-width="20"/>
+  <polygon points="156,420 356,420 318,108 194,108" fill="#1d3559" stroke="url(#brass)" stroke-width="10"/>
+  <g fill="url(#brass)">
+    <polygon points="256,142 266,170 296,170 272,188 281,216 256,199 231,216 240,188 216,170 246,170"/>
+    <polygon points="208,228 216,250 240,250 220,264 228,286 208,272 188,286 196,264 176,250 200,250"/>
+    <polygon points="304,228 312,250 336,250 316,264 324,286 304,272 284,286 292,264 272,250 296,250"/>
+    <polygon points="222,312 230,334 254,334 234,348 242,370 222,356 202,370 210,348 190,334 214,334"/>
+    <polygon points="290,312 298,334 322,334 302,348 310,370 290,356 270,370 278,348 258,334 282,334"/>
+  </g>
+</svg>
