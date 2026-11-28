@@ -1,3 +1,4 @@
+import { PIECE_COLOR_ORDER } from '../core/pieceColors';
 import type {
   AppOptions,
   ArbiterSpeedMode,
@@ -7,7 +8,11 @@ import type {
   ClockPresetMode,
   DifficultyTier,
   HandednessMode,
+  PieceColorId,
+  QualityTier,
   RenderQualityMode,
+  TheaterId,
+  ViewportFrameMode,
 } from '../core/types';
 
 const SETTINGS_STORAGE_KEY = 'war_generals_settings_v1';
@@ -49,11 +54,17 @@ export const DEFAULT_APP_OPTIONS: Readonly<AppOptions> = {
   hapticsEnabled: true,
   eraMode: '1980s', // 1980s Electronic Edition default per Block 7 §1.B
   boardFinish: 'WALNUT_SLATE',
+  pieceColor: 'NAVY',
   difficulty: 'GENERAL',
   handedness: 'RIGHT',
   arbiterSpeed: 'THEATRICAL',
   clockPreset: 'STANDARD',
   renderQuality: 'ULTRA',
+  qualityMode: 'AUTO',
+  viewportFrameMode: 'FULL_VIEWPORT',
+  theaterId: 'FIELD_HQ',
+  cameraSensitivity: 1.0,
+  cameraInvertOrbit: false,
   boardView: 'COMMAND',
 };
 
@@ -64,6 +75,11 @@ function isOneOf<T extends string>(val: unknown, allowed: readonly T[]): val is 
 function clampUnit(val: unknown, fallback: number): number {
   if (typeof val !== 'number' || Number.isNaN(val)) return fallback;
   return Math.max(0, Math.min(1, val));
+}
+
+function clampRange(val: unknown, min: number, max: number, fallback: number): number {
+  if (typeof val !== 'number' || Number.isNaN(val)) return fallback;
+  return Math.max(min, Math.min(max, val));
 }
 
 /**
@@ -86,9 +102,24 @@ export class SettingsStore {
   }
 
   public update(patch: Partial<AppOptions>): Readonly<AppOptions> {
+    let nextRenderQuality = patch.renderQuality ?? this.current.renderQuality;
+    let nextQualityMode = patch.qualityMode ?? this.current.qualityMode;
+
+    if (patch.qualityMode !== undefined && patch.renderQuality === undefined) {
+      nextRenderQuality = patch.qualityMode === 'BATTERY_SAVER' ? 'BATTERY_SAVER' : 'ULTRA';
+    } else if (patch.renderQuality !== undefined && patch.qualityMode === undefined) {
+      nextQualityMode = patch.renderQuality === 'BATTERY_SAVER' ? 'BATTERY_SAVER' : 'ULTRA';
+    }
+
     this.current = {
       ...this.current,
       ...patch,
+      renderQuality: nextRenderQuality,
+      qualityMode: nextQualityMode,
+      cameraSensitivity:
+        patch.cameraSensitivity !== undefined
+          ? clampRange(patch.cameraSensitivity, 0.4, 2.0, this.current.cameraSensitivity)
+          : this.current.cameraSensitivity,
       masterVolume:
         patch.masterVolume !== undefined
           ? clampUnit(patch.masterVolume, this.current.masterVolume)
@@ -143,6 +174,9 @@ export class SettingsStore {
       if (isOneOf<BoardFinishMode>(p['boardFinish'], ['WALNUT_SLATE', 'RETRO_BAKELITE'])) {
         base.boardFinish = p['boardFinish'];
       }
+      if (isOneOf<PieceColorId>(p['pieceColor'], PIECE_COLOR_ORDER)) {
+        base.pieceColor = p['pieceColor'];
+      }
       if (
         isOneOf<DifficultyTier>(p['difficulty'], [
           'RECRUIT',
@@ -168,6 +202,39 @@ export class SettingsStore {
         base.renderQuality = p['renderQuality'];
       } else if (p['renderQuality'] === 'BALANCED') {
         base.renderQuality = 'BATTERY_SAVER';
+      }
+      if (
+        isOneOf<QualityTier>(p['qualityMode'], [
+          'AUTO',
+          'ULTRA',
+          'HIGH',
+          'BALANCED',
+          'BATTERY_SAVER',
+        ])
+      ) {
+        base.qualityMode = p['qualityMode'];
+        if (base.qualityMode === 'BATTERY_SAVER') {
+          base.renderQuality = 'BATTERY_SAVER';
+        }
+      } else if (base.renderQuality === 'BATTERY_SAVER') {
+        base.qualityMode = 'BATTERY_SAVER';
+      }
+      if (isOneOf<ViewportFrameMode>(p['viewportFrameMode'], ['FULL_VIEWPORT', 'PHONE_9_16'])) {
+        base.viewportFrameMode = p['viewportFrameMode'];
+      }
+      if (
+        isOneOf<TheaterId>(p['theaterId'], [
+          'FIELD_HQ',
+          'PACIFIC_BRIDGE',
+          'IRON_BUNKER',
+          'NIGHT_OPS',
+        ])
+      ) {
+        base.theaterId = p['theaterId'];
+      }
+      base.cameraSensitivity = clampRange(p['cameraSensitivity'], 0.4, 2.0, base.cameraSensitivity);
+      if (typeof p['cameraInvertOrbit'] === 'boolean') {
+        base.cameraInvertOrbit = p['cameraInvertOrbit'];
       }
       if (isOneOf<BoardViewAngle>(p['boardView'], ['COMMAND', 'TACTICAL', 'OVERHEAD'])) {
         base.boardView = p['boardView'];

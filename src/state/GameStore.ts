@@ -14,6 +14,7 @@ import {
   type CommanderId,
 } from '../ai/CommanderProfiles';
 import { resolveArbiterChallenge } from '../arbiter/ArbiterResolver';
+import { PIECE_COLOR_SPECS } from '../core/pieceColors';
 import {
   BOARD_COLS,
   BOARD_ROWS,
@@ -23,13 +24,20 @@ import {
   type RankId,
 } from '../core/ranks';
 import {
+  getTacticalOperation,
+  loadOperationProgress,
+  recordOperationResult,
+} from '../core/operations';
+import {
   ARMY_PIECE_TOTAL,
   TOURNAMENT_PRESETS,
   checkBackRowFlagTraverse,
+  computePositionRepetitionKey,
   computeUnplacedCounts,
   formatAlgebraicCoord,
   generateEnemyTournamentDeployment,
   generateSmartAutoDeploy,
+  hasAnyLegalMoves,
   isFactionHomeSquare,
   loadCustomBlueprintSlots,
   mirrorDeploymentLR,
@@ -61,12 +69,14 @@ import type {
   MatchMode,
   MatchPhase,
   MoveDirection,
+  OperationProgressState,
   PlayerCombatDoctrine,
   PlayerVisibleView,
   PublicCombatLogEntry,
   ReplayPieceSnapshot,
   ReplayPlyEntry,
   SuspectTag,
+  TheaterId,
   TruthPieceRecord,
   ValidMoveTarget,
   VisiblePieceView,
@@ -161,6 +171,9 @@ export class GameStore {
 
   private phase: MatchPhase = 'TITLE';
   private matchMode: MatchMode = 'SKIRMISH';
+  private activeTheaterId: TheaterId = 'FIELD_HQ';
+  private activeOperationId: string | null = null;
+  private operationsProgress: OperationProgressState = loadOperationProgress();
   private viewingFaction: Faction = 'PLAYER';
   private activeTurn: Faction = 'PLAYER';
   private commanderId: CommanderId = 'MILLER';
@@ -181,6 +194,7 @@ export class GameStore {
   private selectedDeployRank: RankId | null = 'GEN_5';
   private suspectTags = new Map<string, SuspectTag>();
   private activeClash: ArbiterVerdict | null = null;
+  private isShowcaseClash = false;
   private banner: HudBannerState = 'WAR GENERALS';
   private cameraMode: CameraMode = 'TITLE';
   private turnCount = 1;
@@ -193,6 +207,9 @@ export class GameStore {
 
   // Classic 1970s 1-turn deferred back-row Flag traverse tracking (supports simultaneous pending flags!)
   private readonly pendingGoalFlags = new Set<Faction>();
+  // 3-fold repetition & stalemate tracking
+  private readonly repetitionCounts = new Map<string, number>();
+  private quietPliesSinceClash = 0;
 
   // Declassified Replay Scrubber State
   private replayCurrentPly = 0;
@@ -226,6 +243,9 @@ export class GameStore {
   public updateOptions(patch: Partial<AppOptions>): void {
     const prevClock = this.settingsStore.get().clockPreset;
     const next = this.settingsStore.update(patch);
+    if (patch.theaterId !== undefined) {
+      this.activeTheaterId = next.theaterId;
+    }
     if (patch.clockPreset && patch.clockPreset !== prevClock) {
       const spec = CLOCK_PRESET_SPECS[next.clockPreset];
       if (this.phase !== 'PLAY' || spec.isUntimed) {
@@ -277,6 +297,11 @@ export class GameStore {
   public returnToTitleMenu(): void {
     this.clearTimers();
     this.campaign = loadCampaignProgress();
+    this.operationsProgress = loadOperationProgress();
+    this.activeTheaterId = this.settingsStore.get().theaterId;
+    this.activeOperationId = null;
+    this.repetitionCounts.clear();
+    this.quietPliesSinceClash = 0;
     this.#truthPieces.clear();
     this.#playerCasualties = [];
     this.#enemyCasualties = [];
@@ -303,12 +328,20 @@ export class GameStore {
     this.emit();
   }
 
+  public setTheater(theaterId: TheaterId): void {
+    this.activeTheaterId = theaterId;
+    this.settingsStore.update({ theaterId });
+    this.emit();
+  }
+
   /**
    * 1. PLAY SKIRMISH (Commander AI + Era Ruleset -> Mobilization)
    */
   public startSkirmish(commanderId?: CommanderId, eraMode?: AudioEraMode): void {
     if (commanderId) this.commanderId = commanderId;
     if (eraMode) this.settingsStore.update({ eraMode });
+    this.activeOperationId = null;
+    this.activeTheaterId = this.settingsStore.get().theaterId;
     this.matchMode = 'SKIRMISH';
     this.startNewDeployment();
   }
@@ -321,8 +354,123 @@ export class GameStore {
     this.campaign = loadCampaignProgress();
     if (profile.tier > this.campaign.unlockedTier) return false;
     this.commanderId = commanderId;
+    this.activeOperationId = null;
+    this.activeTheaterId = profile.theaterId;
     this.matchMode = 'CAMPAIGN';
     this.startNewDeployment();
+    return true;
+  }
+
+  /**
+   * 2B. TACTICAL OPERATIONS (Curated Salpakan Mid-Game Scenarios & Challenges)
+   */
+  public startOperation(operationId: string): boolean {
+    const op = getTacticalOperation(operationId);
+    if (!op) return false;
+
+    this.clearTimers();
+    this.operationsProgress = loadOperationProgress();
+    this.#truthPieces.clear();
+    this.#playerCasualties = [];
+    this.#enemyCasualties = [];
+    this.#replayPlies = [];
+    this.publicLog = [];
+    this.suspectTags.clear();
+    this.shroud = null;
+    this.dossier = null;
+    this.pendingGoalFlags.clear();
+    this.repetitionCounts.clear();
+    this.quietPliesSinceClash = 0;
+
+    this.matchMode = 'OPERATION';
+    this.activeOperationId = op.id;
+    this.commanderId = op.commanderId;
+    this.activeTheaterId = op.theaterId;
+    this.settingsStore.update({
+      eraMode: op.eraRuleset,
+      difficulty: op.difficulty,
+      theaterId: op.theaterId,
+    });
+
+    this.phase = 'PLAY';
+    this.viewingFaction = 'PLAYER';
+    this.activeTurn = 'PLAYER';
+    this.selectedPieceId = null;
+    this.selectedDeployRank = null;
+    this.activeClash = null;
+    this.cameraMode = 'PLAY';
+    this.banner = 'TACTICAL COMMAND';
+    this.turnCount = 1;
+    this.clashesWonByPlayer = 0;
+    this.clashesWonByEnemy = 0;
+    this.matchWinner = null;
+    this.winReason = null;
+    this.interactionLocked = false;
+    this.pieceIdCounter = 0;
+
+    const cSpec = CLOCK_PRESET_SPECS[this.getOptions().clockPreset];
+    this.matchClockSec = cSpec.matchSec;
+    this.turnClockSec = cSpec.turnSec;
+    this.matchElapsedSec = 0;
+
+    this.setFactionDeploymentSlots(
+      'PLAYER',
+      op.playerPlacements.map((p) => ({ col: p.col, row: p.row, rank: p.rank }))
+    );
+    this.setFactionDeploymentSlots(
+      'ENEMY',
+      op.enemyPlacements.map((p) => ({ col: p.col, row: p.row, rank: p.rank }))
+    );
+
+    this.initialPlayerDeploySlots = this.getFactionDeploymentSlots('PLAYER').map((s) => ({
+      ...s,
+    }));
+
+    // Compute public scenario rank pool totals for AI Belief Matrix (zero per-piece trueRank leakage)
+    const playerPoolCounts: Partial<Record<RankId, number>> = {};
+    for (const p of op.playerPlacements) {
+      playerPoolCounts[p.rank] = (playerPoolCounts[p.rank] ?? 0) + 1;
+    }
+
+    const publicPlayerSquares = Array.from(this.#truthPieces.values())
+      .filter((p) => p.faction === 'PLAYER' && p.alive)
+      .map((p) => ({ id: p.id, col: p.col, row: p.row }));
+    this.beliefAI.initializeMatch(
+      publicPlayerSquares,
+      this.collectAIUnitStates(),
+      playerPoolCounts
+    );
+
+    this.#replayPlies = [
+      {
+        plyIndex: 0,
+        turnNumber: 0,
+        actorFaction: 'SYSTEM',
+        summary: `T0: ${op.codeName} — ${op.title}`,
+        fromCoord: null,
+        toCoord: null,
+        wasClash: false,
+        boardSnapshot: this.captureTruthSnapshot(),
+      },
+    ];
+    this.publicLog = [
+      {
+        turn: 0,
+        actor: 'SYSTEM',
+        text: `${op.codeName}: ${op.objectiveSummary} (${op.eraRuleset} Rules)`,
+        isClash: false,
+      },
+    ];
+
+    const firstPlayerPiece =
+      Array.from(this.#truthPieces.values()).find(
+        (p) => p.faction === 'PLAYER' && p.alive && p.trueRank !== 'FLAG'
+      ) ?? null;
+    this.selectedPieceId = firstPlayerPiece?.id ?? null;
+    this.banner = this.selectedPieceId ? 'SELECT TARGET' : 'TACTICAL COMMAND';
+
+    this.startMatchClocks();
+    this.emit();
     return true;
   }
 
@@ -331,6 +479,9 @@ export class GameStore {
    */
   public startPassAndPlay(): void {
     this.matchMode = 'PASS_AND_PLAY';
+    this.activeOperationId = null;
+    this.repetitionCounts.clear();
+    this.quietPliesSinceClash = 0;
     this.clearTimers();
     this.#truthPieces.clear();
     this.#playerCasualties = [];
@@ -385,6 +536,9 @@ export class GameStore {
   public openFormationArmory(): void {
     this.clearTimers();
     this.matchMode = 'SKIRMISH';
+    this.activeOperationId = null;
+    this.repetitionCounts.clear();
+    this.quietPliesSinceClash = 0;
     this.#truthPieces.clear();
     this.#playerCasualties = [];
     this.#enemyCasualties = [];
@@ -432,7 +586,9 @@ export class GameStore {
   }
 
   public rematchCurrentMode(): void {
-    if (this.matchMode === 'PASS_AND_PLAY') {
+    if (this.matchMode === 'OPERATION' && this.activeOperationId) {
+      this.startOperation(this.activeOperationId);
+    } else if (this.matchMode === 'PASS_AND_PLAY') {
       this.startPassAndPlay();
     } else {
       this.startNewDeployment();
@@ -446,12 +602,13 @@ export class GameStore {
     if (this.phase !== 'PLAY' || this.matchWinner) return;
     const forfeiting = this.matchMode === 'PASS_AND_PLAY' ? this.activeTurn : 'PLAYER';
     const winner: Faction = forfeiting === 'PLAYER' ? 'ENEMY' : 'PLAYER';
+    const playerLabel = this.getPlayerColorSpec().label;
     this.declareMatchWinner(
       winner,
       winner === 'PLAYER' ? 'FLAG CAPTURED — VICTORY' : 'FLAG LOST — DEFEAT',
       'Commander Forfeited',
       forfeiting === 'PLAYER'
-        ? 'Navy High Command signed instrument of surrender'
+        ? `${playerLabel} High Command signed instrument of surrender`
         : 'Crimson High Command signed instrument of surrender'
     );
   }
@@ -462,6 +619,9 @@ export class GameStore {
 
   public startNewDeployment(initialPreset?: DeploymentPresetId): void {
     this.clearTimers();
+    this.activeOperationId = null;
+    this.repetitionCounts.clear();
+    this.quietPliesSinceClash = 0;
     if (this.matchMode === 'PASS_AND_PLAY' && !initialPreset) {
       this.startPassAndPlay();
       return;
@@ -609,8 +769,7 @@ export class GameStore {
     const occupant = this.findAliveAt(col, row);
 
     // Case 1: Moving/swapping an already-placed piece of viewingFaction
-    const movingId =
-      draggedPieceId ?? (!explicitRank && !this.selectedDeployRank ? this.selectedPieceId : null);
+    const movingId = draggedPieceId ?? (!explicitRank ? this.selectedPieceId : null);
     if (movingId) {
       const movingPiece = this.#truthPieces.get(movingId);
       if (!movingPiece || movingPiece.faction !== fac) return false;
@@ -635,23 +794,20 @@ export class GameStore {
       return true;
     }
 
-    // Case 2: Placing from Mobilization Crate
+    // Case 2: Tapping an occupied friendly square during DEPLOY without an explicit crate drop
+    // MUST select/swap cleanly instead of overwriting the placed piece's rank!
+    if (occupant && occupant.faction === fac && explicitRank === undefined) {
+      return false;
+    }
+
+    // Case 3: Placing from Mobilization Crate (or explicit rank drop)
     const rankToPlace = explicitRank ?? this.selectedDeployRank;
     if (!rankToPlace) {
-      if (occupant && occupant.faction === fac) {
-        this.selectedPieceId = occupant.id;
-        this.emit();
-      }
       return false;
     }
 
     const unplaced = computeUnplacedCounts(this.getFactionDeploymentSlots(fac));
     if (unplaced[rankToPlace] <= 0) {
-      if (occupant && occupant.faction === fac) {
-        this.selectedDeployRank = null;
-        this.selectedPieceId = occupant.id;
-        this.emit();
-      }
       return false;
     }
 
@@ -712,15 +868,16 @@ export class GameStore {
     const slots = this.getFactionDeploymentSlots(fac);
     if (!validateFactionDeployment(fac, slots)) return false;
 
-    // 2P Pass & Play Step 1: Navy finished -> Engage Brass Command Shroud for Crimson Deployment!
+    // 2P Pass & Play Step 1: Player finished -> Engage Brass Command Shroud for Crimson Deployment!
     if (this.matchMode === 'PASS_AND_PLAY' && fac === 'PLAYER') {
+      const playerLabel = this.getPlayerColorSpec().label;
       this.selectedPieceId = null;
       this.selectedDeployRank = null;
       this.shroud = {
         active: true,
         nextFaction: 'ENEMY',
         headline: 'PASS DEVICE TO CRIMSON COMMANDER',
-        subline: 'Navy 21-unit formation sealed. Unseal to deploy Crimson forces on your home rows.',
+        subline: `${playerLabel} 21-unit formation sealed. Unseal to deploy Crimson forces on your home rows.`,
       };
       this.emit();
       return true;
@@ -767,11 +924,12 @@ export class GameStore {
     ];
 
     if (this.matchMode === 'PASS_AND_PLAY') {
+      const playerUpper = this.getPlayerColorSpec().upperLabel;
       this.selectedPieceId = null;
       this.shroud = {
         active: true,
         nextFaction: 'PLAYER',
-        headline: 'PASS DEVICE TO NAVY COMMANDER',
+        headline: `PASS DEVICE TO ${playerUpper} COMMANDER`,
         subline: 'Both 21-unit armies deployed. Turn 1 begins upon unsealing.',
       };
     } else {
@@ -827,15 +985,17 @@ export class GameStore {
           winner === 'PLAYER' ? 'FLAG CAPTURED — VICTORY' : 'FLAG LOST — DEFEAT',
           'Match Clock Expired',
           winner === 'PLAYER'
-            ? 'Navy held superior command strength at time limit'
+            ? `${this.getPlayerColorSpec().label} held superior command strength at time limit`
             : 'Crimson held superior command strength at time limit'
         );
         return;
       }
 
       if (this.turnClockSec <= 0) {
-        this.turnClockSec = cSpec.turnSec;
         this.executeAutoFallbackMoveForActiveTurn();
+        if (this.phase === 'PLAY' && !this.interactionLocked) {
+          this.turnClockSec = cSpec.turnSec;
+        }
         return;
       }
 
@@ -851,19 +1011,61 @@ export class GameStore {
   }
 
   private executeAutoFallbackMoveForActiveTurn(): void {
+    if (this.phase !== 'PLAY' || this.interactionLocked || this.matchWinner) return;
     const turnFac = this.activeTurn;
+
+    if (turnFac === 'ENEMY' && this.matchMode !== 'PASS_AND_PLAY') {
+      this.executeEnemyTurnNow();
+      return;
+    }
+
     const ownPieces = Array.from(this.#truthPieces.values()).filter(
       (p) => p.alive && p.faction === turnFac
     );
-    for (const unit of ownPieces) {
-      if (unit.trueRank === 'FLAG') continue;
-      const moves = this.computeValidMovesForFaction(unit.id, turnFac);
-      const quiet = moves.find((m) => m.kind === 'MOVE') ?? moves[0];
-      if (quiet) {
-        this.executeMoveOrChallenge(quiet.col, quiet.row, unit.id);
-        return;
+    const nonFlagUnits = ownPieces.filter((u) => u.trueRank !== 'FLAG');
+    const flagUnits = ownPieces.filter((u) => u.trueRank === 'FLAG');
+
+    const pickFromGroup = (
+      group: TruthPieceRecord[]
+    ): { unit: TruthPieceRecord; move: ValidMoveTarget } | null => {
+      for (const unit of group) {
+        const moves = this.computeValidMovesForFaction(unit.id, turnFac);
+        const quiet = moves.find((m) => m.kind === 'MOVE');
+        if (quiet) return { unit, move: quiet };
       }
+      for (const unit of group) {
+        const moves = this.computeValidMovesForFaction(unit.id, turnFac);
+        const challenge = moves[0];
+        if (challenge) return { unit, move: challenge };
+      }
+      return null;
+    };
+
+    // Prefer moving non-Flag units first; fall back to Flag ONLY if no non-Flag legal move exists!
+    const chosen = pickFromGroup(nonFlagUnits) ?? pickFromGroup(flagUnits);
+    if (chosen) {
+      const outcome = this.executeMoveOrChallenge(
+        chosen.move.col,
+        chosen.move.row,
+        chosen.unit.id
+      );
+      if (outcome?.kind === 'CLASH') {
+        this.onAIClashTriggered?.(outcome.verdict);
+      }
+      return;
     }
+
+    // Zero legal moves across all pieces (including Flag): declare immobilization defeat!
+    const oppFac: Faction = turnFac === 'PLAYER' ? 'ENEMY' : 'PLAYER';
+    const playerLabel = this.getPlayerColorSpec().label;
+    this.declareMatchWinner(
+      oppFac,
+      oppFac === 'PLAYER' ? 'FLAG CAPTURED — VICTORY' : 'FLAG LOST — DEFEAT',
+      turnFac === 'PLAYER' ? `${playerLabel} Immobilized` : 'Enemy Immobilized',
+      turnFac === 'PLAYER'
+        ? `${playerLabel} forces had zero legal maneuvers remaining`
+        : 'Crimson forces had zero legal maneuvers remaining'
+    );
   }
 
   public setCameraMode(mode: CameraMode): void {
@@ -1021,7 +1223,7 @@ export class GameStore {
       mover.row = row;
       mover.hasMoved = true;
 
-      const facName = mover.faction === 'PLAYER' ? 'Navy' : 'Crimson';
+      const facName = mover.faction === 'PLAYER' ? this.getPlayerColorSpec().label : 'Crimson';
       const algMove = `${formatAlgebraicCoord(fromCoord.col, fromCoord.row)}→${formatAlgebraicCoord(col, row)}`;
 
       this.recordReplayPly({
@@ -1052,8 +1254,9 @@ export class GameStore {
       this.selectedPieceId = null;
       this.turnClockSec = CLOCK_PRESET_SPECS[this.getOptions().clockPreset].turnSec;
 
-      if (this.evaluateFlagTraverseAfterMove(mover.faction)) {
-        return { kind: 'MOVED' };
+      const traverseVerdict = this.evaluateFlagTraverseAfterMove(mover.faction);
+      if (traverseVerdict) {
+        return { kind: 'CLASH', verdict: traverseVerdict };
       }
 
       this.advanceTurnAfterQuietMove(mover.faction, algMove);
@@ -1070,15 +1273,18 @@ export class GameStore {
     this.turnCount += 1;
     const nextFac: Faction = justMoved === 'PLAYER' ? 'ENEMY' : 'PLAYER';
 
-    // Check 1970s deferred Flag survival for nextFac!
-    if (this.checkPending1970sSurvivalWin(nextFac)) {
+    if (this.checkTurnStartEndConditions(nextFac)) {
+      return;
+    }
+    if (this.checkRepetitionOrStalemateAfterQuietMove(nextFac)) {
       return;
     }
 
     if (this.matchMode === 'PASS_AND_PLAY') {
+      const colorSpec = this.getPlayerColorSpec();
       this.activeTurn = nextFac;
-      const movedLabel = justMoved === 'PLAYER' ? 'Navy' : 'Crimson';
-      const nextLabel = nextFac === 'PLAYER' ? 'NAVY' : 'CRIMSON';
+      const movedLabel = justMoved === 'PLAYER' ? colorSpec.label : 'Crimson';
+      const nextLabel = nextFac === 'PLAYER' ? colorSpec.upperLabel : 'CRIMSON';
       this.shroud = {
         active: true,
         nextFaction: nextFac,
@@ -1101,12 +1307,35 @@ export class GameStore {
   private initiateClash(
     attacker: TruthPieceRecord,
     defender: TruthPieceRecord,
-    contestedCoord: { col: number; row: number }
+    contestedCoord: { col: number; row: number },
+    isShowcase = false
   ): ArbiterVerdict {
+    this.isShowcaseClash = isShowcase;
     const totalAlive = Array.from(this.#truthPieces.values()).filter((p) => p.alive).length;
     const playerRec = attacker.faction === 'PLAYER' ? attacker : defender;
     const enemyRec = attacker.faction === 'ENEMY' ? attacker : defender;
-    const stakes = computePublicClashStakes(playerRec, enemyRec, attacker.faction, totalAlive);
+
+    let stakes: ClashPublicStakes;
+    if (this.matchMode === 'PASS_AND_PLAY') {
+      // STRICT 2P FOG-OF-WAR WALL: Derive stakes & banner exclusively from public kill counts and turn initiative!
+      const maxPublicKills = Math.max(attacker.challengesWon, defender.challengesWon);
+      const defcon: DefconTier =
+        maxPublicKills >= 2 || totalAlive <= 12
+          ? 1
+          : maxPublicKills >= 1 || totalAlive <= 18
+            ? 2
+            : 3;
+      stakes = {
+        defcon,
+        playerDoctrine: 'UNKNOWN_DOCTRINE',
+        isEnemyInitiatedAmbush: attacker.faction === 'ENEMY',
+        playerPublicKills: playerRec.challengesWon,
+        enemyPublicKills: enemyRec.challengesWon,
+        enemyUnmovedBackRow: false,
+      };
+    } else {
+      stakes = computePublicClashStakes(playerRec, enemyRec, attacker.faction, totalAlive);
+    }
 
     const baseVerdict = resolveArbiterChallenge({
       contestedCoord,
@@ -1116,6 +1345,9 @@ export class GameStore {
       defenderId: defender.id,
       defenderFaction: defender.faction,
       defenderTrueRank: defender.trueRank,
+      matchMode: this.matchMode,
+      attackerPublicKills: attacker.challengesWon,
+      defenderPublicKills: defender.challengesWon,
     });
 
     // In 2P Pass & Play, mask `playerVisibleRank` as `'UNKNOWN'` during the 3-act battle so neither player sees the survivor's face!
@@ -1145,10 +1377,33 @@ export class GameStore {
   public finalizeActiveClash(): void {
     const verdict = this.activeClash;
     if (!verdict) return;
+    const wasShowcase = this.isShowcaseClash;
+    this.isShowcaseClash = false;
+
+    if (verdict.isFlagTraverseVictory) {
+      const winner = verdict.attackerFaction;
+      const playerLabel = this.getPlayerColorSpec().label;
+      this.activeClash = null;
+      this.cameraMode = 'PLAY';
+      this.interactionLocked = false;
+      this.turnClockSec = CLOCK_PRESET_SPECS[this.getOptions().clockPreset].turnSec;
+      this.declareMatchWinner(
+        winner,
+        winner === 'PLAYER' ? 'FLAG TRAVERSE — VICTORY' : 'FLAG LOST — DEFEAT',
+        'Back-Rank Flag Breakthrough',
+        winner === 'PLAYER'
+          ? `${playerLabel} Flag secured the Crimson back rank!`
+          : `Crimson Flag breached the ${playerLabel} home rank!`
+      );
+      return;
+    }
 
     const attacker = this.#truthPieces.get(verdict.attackerId);
     const defender = this.#truthPieces.get(verdict.defenderId);
     if (!attacker || !defender) return;
+
+    this.quietPliesSinceClash = 0;
+    this.repetitionCounts.clear();
 
     const fromCoord = { col: attacker.col, row: attacker.row };
     const toCoord = verdict.contestedCoord;
@@ -1189,17 +1444,18 @@ export class GameStore {
       else this.clashesWonByEnemy += 1;
     }
 
-    const atkName = `${attacker.faction === 'PLAYER' ? 'Navy' : 'Crimson'} ${RANK_SPECS[attacker.trueRank].shortLabel}`;
-    const defName = `${defender.faction === 'PLAYER' ? 'Navy' : 'Crimson'} ${RANK_SPECS[defender.trueRank].shortLabel}`;
+    const playerColor = this.getPlayerColorSpec();
+    const atkName = `${attacker.faction === 'PLAYER' ? playerColor.label : 'Crimson'} ${RANK_SPECS[attacker.trueRank].shortLabel}`;
+    const defName = `${defender.faction === 'PLAYER' ? playerColor.label : 'Crimson'} ${RANK_SPECS[defender.trueRank].shortLabel}`;
     const resText =
       verdict.resolution === 'MUTUAL_SPLIT'
         ? 'Mutual Elimination'
         : verdict.resolution === 'FLAG_CAPTURED_BY_PLAYER'
           ? 'Enemy Flag Captured!'
           : verdict.resolution === 'FLAG_CAPTURED_BY_ENEMY'
-            ? 'Navy Flag Captured!'
+            ? `${playerColor.label} Flag Captured!`
             : verdict.survivorFaction === 'PLAYER'
-              ? 'Navy Wins'
+              ? `${playerColor.label} Wins`
               : 'Crimson Wins';
 
     this.recordReplayPly({
@@ -1217,7 +1473,7 @@ export class GameStore {
       verdict.resolution === 'MUTUAL_SPLIT'
         ? 'Mutual Elimination (both units lost)'
         : verdict.survivorFaction === 'PLAYER'
-          ? 'Navy unit prevailed (ranks sealed)'
+          ? `${playerColor.label} unit prevailed (ranks sealed)`
           : 'Crimson unit prevailed (ranks sealed)';
     this.publicLog.push({
       turn: this.turnCount,
@@ -1245,24 +1501,52 @@ export class GameStore {
         'ENEMY',
         'FLAG LOST — DEFEAT',
         'Enemy Flag Eliminated',
-        `Navy Flag fell in combat at ${sqLabel}`
+        `${playerColor.label} Flag fell in combat at ${sqLabel}`
       );
       return;
     }
 
-    if (this.evaluateFlagTraverseAfterMove(attacker.faction)) {
+    if (this.matchMode === 'OPERATION' && this.activeOperationId) {
+      const op = getTacticalOperation(this.activeOperationId);
+      if (op?.objectiveKind === 'SPY_HUNT') {
+        const enemySpiesRemaining = Array.from(this.#truthPieces.values()).some(
+          (p) => p.alive && p.faction === 'ENEMY' && p.trueRank === 'SPY'
+        );
+        if (!enemySpiesRemaining) {
+          this.declareMatchWinner(
+            'PLAYER',
+            'SPY HUNT COMPLETE — VICTORY',
+            'All Enemy Spies Eliminated',
+            `Neutralized all hostile Spies in ${op.codeName}`
+          );
+          return;
+        }
+      }
+    }
+
+    const traverseVerdict = this.evaluateFlagTraverseAfterMove(attacker.faction);
+    if (traverseVerdict) {
+      if (this.onAIClashTriggered) {
+        this.onAIClashTriggered(traverseVerdict);
+      } else {
+        this.finalizeActiveClash();
+      }
       return;
     }
 
     this.turnCount += 1;
-    const nextFac: Faction = attacker.faction === 'PLAYER' ? 'ENEMY' : 'PLAYER';
-    if (this.checkPending1970sSurvivalWin(nextFac)) {
+    const nextFac: Faction = wasShowcase
+      ? 'PLAYER'
+      : attacker.faction === 'PLAYER'
+        ? 'ENEMY'
+        : 'PLAYER';
+    if (this.checkTurnStartEndConditions(nextFac)) {
       return;
     }
 
     if (this.matchMode === 'PASS_AND_PLAY') {
       this.activeTurn = nextFac;
-      const nextLabel = nextFac === 'PLAYER' ? 'NAVY' : 'CRIMSON';
+      const nextLabel = nextFac === 'PLAYER' ? playerColor.upperLabel : 'CRIMSON';
       this.shroud = {
         active: true,
         nextFaction: nextFac,
@@ -1273,7 +1557,11 @@ export class GameStore {
       return;
     }
 
-    if (attacker.faction === 'PLAYER') {
+    if (wasShowcase) {
+      this.activeTurn = 'PLAYER';
+      this.banner = 'TACTICAL COMMAND';
+      this.emit();
+    } else if (attacker.faction === 'PLAYER') {
       this.scheduleEnemyTurn(680);
     } else {
       this.activeTurn = 'PLAYER';
@@ -1298,7 +1586,7 @@ export class GameStore {
   private executeEnemyTurnNow(): void {
     if (this.phase !== 'PLAY' || this.activeTurn !== 'ENEMY' || this.interactionLocked) return;
 
-    if (this.checkPending1970sSurvivalWin('ENEMY')) {
+    if (this.checkTurnStartEndConditions('ENEMY')) {
       return;
     }
 
@@ -1384,18 +1672,157 @@ export class GameStore {
     });
 
     this.turnClockSec = CLOCK_PRESET_SPECS[opts.clockPreset].turnSec;
-    if (this.evaluateFlagTraverseAfterMove('ENEMY')) {
+    const traverseVerdict = this.evaluateFlagTraverseAfterMove('ENEMY');
+    if (traverseVerdict) {
+      if (this.onAIClashTriggered) {
+        this.onAIClashTriggered(traverseVerdict);
+      } else {
+        this.finalizeActiveClash();
+      }
       return;
     }
 
     this.turnCount += 1;
-    if (this.checkPending1970sSurvivalWin('PLAYER')) {
+    if (this.checkTurnStartEndConditions('PLAYER')) {
+      return;
+    }
+    if (this.checkRepetitionOrStalemateAfterQuietMove('PLAYER')) {
       return;
     }
 
     this.activeTurn = 'PLAYER';
     this.banner = 'TACTICAL COMMAND';
     this.emit();
+  }
+
+  private checkTurnStartEndConditions(nextFac: Faction): boolean {
+    // 1. 1970s Classic deferred back-row Flag survival ALWAYS takes precedence over immobilization!
+    if (this.checkPending1970sSurvivalWin(nextFac)) {
+      return true;
+    }
+
+    // 2. Tactical Operation turnLimit evaluation
+    if (this.matchMode === 'OPERATION' && this.activeOperationId) {
+      const op = getTacticalOperation(this.activeOperationId);
+      if (op && this.turnCount > op.turnLimit) {
+        if (op.objectiveKind === 'SURVIVAL_DEFENSE') {
+          const playerFlagAlive = Array.from(this.#truthPieces.values()).some(
+            (p) => p.alive && p.faction === 'PLAYER' && p.trueRank === 'FLAG'
+          );
+          if (playerFlagAlive) {
+            this.declareMatchWinner(
+              'PLAYER',
+              'SIEGE SURVIVED — VICTORY',
+              'Perimeter Held',
+              `Survived ${op.turnLimit} plies with the ${this.getPlayerColorSpec().label} Flag intact`
+            );
+            return true;
+          }
+        }
+        this.declareMatchWinner(
+          'ENEMY',
+          'OPERATION FAILED — TURN LIMIT',
+          'Mission Clock Expired',
+          `Failed to complete ${op.codeName} within ${op.turnLimit} plies`
+        );
+        return true;
+      }
+    }
+
+    // 3. Immobilization check for incoming faction
+    if (!hasAnyLegalMoves(Array.from(this.#truthPieces.values()), nextFac)) {
+      const oppFac: Faction = nextFac === 'PLAYER' ? 'ENEMY' : 'PLAYER';
+      const playerLabel = this.getPlayerColorSpec().label;
+      this.declareMatchWinner(
+        oppFac,
+        oppFac === 'PLAYER' ? 'FLAG CAPTURED — VICTORY' : 'FLAG LOST — DEFEAT',
+        nextFac === 'PLAYER' ? `${playerLabel} Immobilized` : 'Enemy Immobilized',
+        nextFac === 'PLAYER'
+          ? `${playerLabel} forces had zero legal maneuvers remaining`
+          : 'Crimson forces had zero legal maneuvers remaining'
+      );
+      return true;
+    }
+
+    return false;
+  }
+
+  private checkRepetitionOrStalemateAfterQuietMove(nextFac: Faction): boolean {
+    if (this.matchMode === 'OPERATION' && this.activeOperationId) {
+      const op = getTacticalOperation(this.activeOperationId);
+      if (op?.objectiveKind === 'SURVIVAL_DEFENSE') {
+        return false;
+      }
+    }
+
+    this.quietPliesSinceClash += 1;
+    const key = computePositionRepetitionKey(Array.from(this.#truthPieces.values()), nextFac);
+    const count = (this.repetitionCounts.get(key) ?? 0) + 1;
+    this.repetitionCounts.set(key, count);
+
+    if (count >= 3 || this.quietPliesSinceClash >= 80) {
+      const pScore = this.computeRemainingForceScore('PLAYER');
+      const eScore = this.computeRemainingForceScore('ENEMY');
+      const winner: Faction = pScore >= eScore ? 'PLAYER' : 'ENEMY';
+      const winMethod = count >= 3 ? 'Threefold Repetition' : 'Stalemate Turn Limit';
+      const playerLabel = this.getPlayerColorSpec().label;
+      this.declareMatchWinner(
+        winner,
+        'STALEMATE ADJUDICATED',
+        winMethod,
+        winner === 'PLAYER'
+          ? `${playerLabel} held superior force strength on stalemate adjudication`
+          : 'Crimson held superior force strength on stalemate adjudication'
+      );
+      return true;
+    }
+
+    return false;
+  }
+
+  private initiateFlagTraverseVerdict(winner: Faction): ArbiterVerdict | null {
+    const flag = Array.from(this.#truthPieces.values()).find(
+      (p) => p.alive && p.faction === winner && p.trueRank === 'FLAG'
+    );
+    if (!flag) return null;
+
+    const verdict: ArbiterVerdict = {
+      resolution: winner === 'PLAYER' ? 'FLAG_CAPTURED_BY_PLAYER' : 'FLAG_CAPTURED_BY_ENEMY',
+      choreography: 'FLAG_BREACH',
+      isFlagTraverseVictory: true,
+      contestedCoord: { col: flag.col, row: flag.row },
+      attackerId: flag.id,
+      attackerFaction: winner,
+      defenderId: flag.id,
+      defenderFaction: winner === 'PLAYER' ? 'ENEMY' : 'PLAYER',
+      playerPieceId: winner === 'PLAYER' ? flag.id : '',
+      playerVisibleRank:
+        winner === 'PLAYER' && this.matchMode !== 'PASS_AND_PLAY' ? 'FLAG' : 'UNKNOWN',
+      enemyPieceId: winner === 'ENEMY' ? flag.id : '',
+      survivorId: flag.id,
+      survivorFaction: winner,
+      stakes: {
+        defcon: 1,
+        playerDoctrine:
+          this.matchMode === 'PASS_AND_PLAY'
+            ? 'UNKNOWN_DOCTRINE'
+            : winner === 'PLAYER'
+              ? 'FLAG_LAST_STAND'
+              : 'INFANTRY',
+        isEnemyInitiatedAmbush: winner === 'ENEMY',
+        playerPublicKills: winner === 'PLAYER' ? flag.challengesWon : 0,
+        enemyPublicKills: winner === 'ENEMY' ? flag.challengesWon : 0,
+        enemyUnmovedBackRow: false,
+      },
+    };
+
+    this.activeClash = verdict;
+    this.interactionLocked = true;
+    this.cameraMode = 'ARBITER';
+    this.selectedPieceId = null;
+    this.banner = winner === 'PLAYER' ? 'FLAG TRAVERSE — VICTORY' : 'FLAG LOST — DEFEAT';
+    this.emit();
+    return verdict;
   }
 
   private checkPending1970sSurvivalWin(turnStartingFaction: Faction): boolean {
@@ -1406,13 +1833,21 @@ export class GameStore {
         p.alive && p.faction === turnStartingFaction && p.trueRank === 'FLAG' && p.row === goalRow
     );
     if (survivingFlag) {
+      if (this.onAIClashTriggered) {
+        const verdict = this.initiateFlagTraverseVerdict(turnStartingFaction);
+        if (verdict) {
+          this.onAIClashTriggered(verdict);
+          return true;
+        }
+      }
+      const playerLabel = this.getPlayerColorSpec().label;
       this.declareMatchWinner(
         turnStartingFaction,
         turnStartingFaction === 'PLAYER' ? 'FLAG TRAVERSE — VICTORY' : 'FLAG LOST — DEFEAT',
         'Back-Rank Flag Breakthrough',
         turnStartingFaction === 'PLAYER'
-          ? 'Navy Flag survived opponent final turn on the Crimson back rank!'
-          : 'Crimson Flag survived your final turn on the Navy back rank!'
+          ? `${playerLabel} Flag survived opponent final turn on the Crimson back rank!`
+          : `Crimson Flag survived your final turn on the ${playerLabel} back rank!`
       );
       return true;
     }
@@ -1420,7 +1855,7 @@ export class GameStore {
     return false;
   }
 
-  private evaluateFlagTraverseAfterMove(movedFaction: Faction): boolean {
+  private evaluateFlagTraverseAfterMove(movedFaction: Faction): ArbiterVerdict | null {
     const all = Array.from(this.#truthPieces.values());
     const era = this.getOptions().eraMode;
     const winner = checkBackRowFlagTraverse(
@@ -1430,15 +1865,7 @@ export class GameStore {
       this.pendingGoalFlags.has(movedFaction)
     );
     if (winner) {
-      this.declareMatchWinner(
-        winner,
-        winner === 'PLAYER' ? 'FLAG TRAVERSE — VICTORY' : 'FLAG LOST — DEFEAT',
-        'Back-Rank Flag Breakthrough',
-        winner === 'PLAYER'
-          ? 'Navy Flag secured the Crimson back rank!'
-          : 'Crimson Flag breached the Navy home rank!'
-      );
-      return true;
+      return this.initiateFlagTraverseVerdict(winner);
     }
 
     // `1970s Classic Edition`: If `movedFaction`'s Flag just arrived on `goalRow` with >=1 adjacent enemy,
@@ -1452,7 +1879,7 @@ export class GameStore {
         this.pendingGoalFlags.add(movedFaction);
       }
     }
-    return false;
+    return null;
   }
 
   private declareMatchWinner(
@@ -1477,10 +1904,24 @@ export class GameStore {
     }
 
     let medalUnlocked: string | null = null;
+    let starsEarned: 0 | 1 | 2 | 3 | undefined = undefined;
     if (this.matchMode === 'CAMPAIGN') {
       const res = recordCampaignMatchResult(this.commanderId, playerWon, this.turnCount);
       this.campaign = res.state;
       medalUnlocked = res.newlyEarnedMedal;
+      starsEarned = res.starsEarned;
+    } else if (this.matchMode === 'OPERATION' && this.activeOperationId) {
+      const playerSurvivors = Array.from(this.#truthPieces.values()).filter(
+        (p) => p.alive && p.faction === 'PLAYER'
+      ).length;
+      const opRes = recordOperationResult(
+        this.activeOperationId,
+        playerWon,
+        this.turnCount,
+        playerSurvivors
+      );
+      this.operationsProgress = opRes.state;
+      starsEarned = opRes.starsEarned;
     }
 
     const highOfficer = this.findHighestSurvivingRankName(winner);
@@ -1492,7 +1933,7 @@ export class GameStore {
       winnerLabel:
         this.matchMode === 'PASS_AND_PLAY'
           ? winner === 'PLAYER'
-            ? 'NAVY COMMAND VICTORY'
+            ? `${this.getPlayerColorSpec().upperLabel} COMMAND VICTORY`
             : 'CRIMSON COMMAND VICTORY'
           : playerWon
             ? 'VICTORY — MISSION ACCOMPLISHED'
@@ -1505,6 +1946,8 @@ export class GameStore {
       survivingHighOfficer: highOfficer,
       matchDurationFormatted: formatClockMMSS(elapsedSec),
       campaignMedalUnlocked: medalUnlocked,
+      starsEarned,
+      operationId: this.activeOperationId,
     };
 
     this.emit();
@@ -1622,7 +2065,7 @@ export class GameStore {
     const attacker = attackerFaction === 'PLAYER' ? playerPiece : enemyPiece;
     const defender = attackerFaction === 'PLAYER' ? enemyPiece : playerPiece;
 
-    return this.initiateClash(attacker, defender, contestedCoord);
+    return this.initiateClash(attacker, defender, contestedCoord, true);
   }
 
   public setArbiterBanner(banner: HudBannerState): void {
@@ -1747,10 +2190,10 @@ export class GameStore {
       viewFac === 'PLAYER' ? this.#enemyCasualties.length : this.#playerCasualties.length;
 
     const intelLedger: IntelLedgerSummary = {
-      ownOfficersAlive,
-      ownPrivatesAlive,
-      ownSpiesAlive,
-      ownFlagAlive,
+      ownOfficersAlive: shroudMaskAll ? 0 : ownOfficersAlive,
+      ownPrivatesAlive: shroudMaskAll ? 0 : ownPrivatesAlive,
+      ownSpiesAlive: shroudMaskAll ? 0 : ownSpiesAlive,
+      ownFlagAlive: shroudMaskAll ? false : ownFlagAlive,
       ownCasualtiesTotal: ownCasualties,
       enemyUnconfirmedAlive,
       enemyEliminatedTotal: oppCasualties,
@@ -1782,13 +2225,25 @@ export class GameStore {
       visibleRank: 'UNKNOWN' as const,
     }));
 
-    const cSpec = CLOCK_PRESET_SPECS[this.getOptions().clockPreset];
+    const opts = this.getOptions();
+    const cSpec = CLOCK_PRESET_SPECS[opts.clockPreset];
+    const activeOp =
+      this.matchMode === 'OPERATION' && this.activeOperationId
+        ? getTacticalOperation(this.activeOperationId) ?? null
+        : null;
 
     return {
       phase: this.phase,
       matchMode: this.matchMode,
+      theaterId: this.activeTheaterId,
+      activeOperationId: this.activeOperationId,
+      operationTurnLimit: activeOp?.turnLimit ?? null,
+      operationObjective: activeOp?.objectiveKind ?? null,
+      operationsProgress: this.operationsProgress,
       viewingFaction: viewFac,
       activeTurn: this.activeTurn,
+      playerPieceColor: opts.pieceColor,
+      enemyPieceColor: 'CRIMSON',
       commanderId: this.commanderId,
       campaign: this.campaign,
       matchClockSec: this.matchClockSec,
@@ -1831,6 +2286,10 @@ export class GameStore {
   // ---------------------------------------------------------------------------
   // Internal Helpers & Live 3D Start Screen Attract Staging
   // ---------------------------------------------------------------------------
+
+  private getPlayerColorSpec() {
+    return PIECE_COLOR_SPECS[this.getOptions().pieceColor];
+  }
 
   private stageMidGameAttractBoard(): void {
     this.pieceIdCounter = 0;
@@ -1950,6 +2409,7 @@ export class GameStore {
       },
     ];
 
+    const pLbl = this.getPlayerColorSpec().label;
     const p5Star = baseSnap.find((p) => p.faction === 'PLAYER' && p.trueRank === 'GEN_5');
     const eFront = baseSnap.find((p) => p.faction === 'ENEMY' && p.row === 2);
     if (p5Star) {
@@ -1959,7 +2419,7 @@ export class GameStore {
         plyIndex: 1,
         turnNumber: 1,
         actorFaction: 'PLAYER',
-        summary: `T1: Navy 5★ GEN (${formatAlgebraicCoord(f.col, f.row)}→${formatAlgebraicCoord(p5Star.col, p5Star.row)})`,
+        summary: `T1: ${pLbl} 5★ GEN (${formatAlgebraicCoord(f.col, f.row)}→${formatAlgebraicCoord(p5Star.col, p5Star.row)})`,
         fromCoord: f,
         toCoord: { col: p5Star.col, row: p5Star.row },
         wasClash: false,
@@ -1977,7 +2437,7 @@ export class GameStore {
         plyIndex: 2,
         turnNumber: 2,
         actorFaction: 'ENEMY',
-        summary: `T2: Crimson ${RANK_SPECS[eFront.trueRank].shortLabel} vs. Navy 5★ GEN (${formatAlgebraicCoord(p5Star.col, p5Star.row)}) — Navy Wins`,
+        summary: `T2: Crimson ${RANK_SPECS[eFront.trueRank].shortLabel} vs. ${pLbl} 5★ GEN (${formatAlgebraicCoord(p5Star.col, p5Star.row)}) — ${pLbl} Wins`,
         fromCoord: ef,
         toCoord: { col: p5Star.col, row: p5Star.row },
         wasClash: true,
@@ -1998,7 +2458,7 @@ export class GameStore {
         plyIndex: plies.length,
         turnNumber: 3,
         actorFaction: 'PLAYER',
-        summary: `T3: Navy PRIVATE vs. Crimson SPY (${formatAlgebraicCoord(eSpy.col, eSpy.row)}) — Spy Intercepted!`,
+        summary: `T3: ${pLbl} PRIVATE vs. Crimson SPY (${formatAlgebraicCoord(eSpy.col, eSpy.row)}) — Spy Intercepted!`,
         fromCoord: pf,
         toCoord: { col: eSpy.col, row: eSpy.row },
         wasClash: true,
@@ -2019,7 +2479,7 @@ export class GameStore {
         plyIndex: plies.length,
         turnNumber: 4,
         actorFaction: 'PLAYER',
-        summary: `T4: Navy SPY vs. Crimson FLAG (${formatAlgebraicCoord(eFlag.col, eFlag.row)}) — Enemy Flag Captured!`,
+        summary: `T4: ${pLbl} SPY vs. Crimson FLAG (${formatAlgebraicCoord(eFlag.col, eFlag.row)}) — Enemy Flag Captured!`,
         fromCoord: sf,
         toCoord: { col: eFlag.col, row: eFlag.row },
         wasClash: true,
@@ -2076,6 +2536,7 @@ export class GameStore {
   }
 
   private clearTimers(): void {
+    this.isShowcaseClash = false;
     this.stopMatchClocks();
     this.stopReplayAutoPlay();
     if (this.aiTurnTimer !== null) {

@@ -17,7 +17,7 @@ bevel-weighted `.glb` assemblies into `public/models/`:
                             recessed V-grooves between planks!) + 3D wooden field ammo crate (`AmmoCrate`) +
                             3D brass hurricane oil lantern (`LanternBrass`, `LanternGlass`) + rolled parchment
                             command map scrolls & brass map weights (`MapScrolls`, `BrassWeights`).
-  4. `command_wedge.glb`  — Sculpted 4-bevel Command Wedge (`68 deg` front slope, `78 deg` rear shield).
+  4. `command_wedge.glb`  — Sculpted 4-bevel Command Wedge (`57 deg` front slope, `78 deg` rear shield).
   5. `pocket_watch.glb`   — High-poly beveled antique brass pocket watch.
 """
 
@@ -638,31 +638,31 @@ def build_command_wedge_glb():
     mat_brass = make_pbr_mat("WedgeBrass", (0.80, 0.62, 0.28, 1.0), metallic=0.92, roughness=0.24)
     mat_inset = make_pbr_mat("WedgeInset", (0.04, 0.08, 0.16, 1.0), metallic=0.12, roughness=0.48)
 
-    # 1. Weighted Stepped Brushed-Brass Pedestal Plinth (`Z_bl = 0.00 .. 0.088`)
+    # 1. Weighted Stepped Brushed-Brass Pedestal Plinth (`Z_bl = 0.00 .. 0.075`)
     plinth_parts = []
-    p_low = create_rounded_box("PlinthLow", 0.78, 0.60, 0.046, corner_r=0.11, loc=(0, -0.005, 0.023), bevel_z=0.012)
+    p_low = create_rounded_box("PlinthLow", 0.76, 0.58, 0.042, corner_r=0.105, loc=(0, -0.005, 0.021), bevel_z=0.009)
     p_low.data.materials.append(mat_brass)
     plinth_parts.append(p_low)
 
-    p_step = create_rounded_box("PlinthStep", 0.72, 0.54, 0.044, corner_r=0.09, loc=(0, -0.005, 0.064), bevel_z=0.010)
+    p_step = create_rounded_box("PlinthStep", 0.70, 0.52, 0.038, corner_r=0.088, loc=(0, -0.005, 0.056), bevel_z=0.008)
     p_step.data.materials.append(mat_brass)
     plinth_parts.append(p_step)
 
-    # 2. Main Sculpted Tapered Monolith Body (`Z_bl = 0.075 .. 0.90`)
+    # 2. Main Sculpted Tapered Monolith Body (`Z_bl = 0.068 .. 0.710`, crest top `0.735u`)
     mesh = bpy.data.meshes.new("CommandMonolithMesh")
     bm = bmesh.new()
 
-    z0 = 0.075
-    z_shoulder = 0.79
-    z_crown = 0.91
+    z0 = 0.068
+    z_shoulder = 0.620
+    z_crown = 0.710
 
-    # Blender -Y -> Three.js +Z (front 68 deg face toward player camera)
-    yf0 = -0.268
-    yb0 = 0.256
-    yf_sh = yf0 + (z_shoulder - z0) / math.tan(math.radians(68.0))
+    # Blender -Y -> Three.js +Z (front 57 deg face toward player camera)
+    yf0 = -0.295
+    yb0 = 0.275
+    yf_sh = yf0 + (z_shoulder - z0) / math.tan(math.radians(57.0))
     yb_sh = yb0 - (z_shoulder - z0) / math.tan(math.radians(78.0))
-    yf_cr = yf_sh + 0.032
-    yb_cr = yb_sh - 0.026
+    yf_cr = yf_sh + 0.022
+    yb_cr = yb_sh - 0.016
 
     def make_octagon_ring(hw_f, hw_b, yf, yb, z, cham):
         return [
@@ -676,9 +676,9 @@ def build_command_wedge_glb():
             bm.verts.new((-hw_f, yf + cham * 0.9, z)),
         ]
 
-    r0 = make_octagon_ring(0.352, 0.332, yf0, yb0, z0, 0.075)
-    r1 = make_octagon_ring(0.262, 0.246, yf_sh, yb_sh, z_shoulder, 0.062)
-    r2 = make_octagon_ring(0.205, 0.192, yf_cr, yb_cr, z_crown, 0.048)
+    r0 = make_octagon_ring(0.352, 0.332, yf0, yb0, z0, 0.074)
+    r1 = make_octagon_ring(0.258, 0.242, yf_sh, yb_sh, z_shoulder, 0.058)
+    r2 = make_octagon_ring(0.194, 0.180, yf_cr, yb_cr, z_crown, 0.044)
 
     bm.faces.new(list(reversed(r0)))
     for ring_a, ring_b in ((r0, r1), (r1, r2)):
@@ -693,31 +693,31 @@ def build_command_wedge_glb():
 
     body = bpy.data.objects.new("WedgeBody", mesh)
     bpy.context.collection.objects.link(body)
-    apply_bevel_and_weighted_normals(body, width=0.016, segments=4, angle_deg=22.0)
+    apply_bevel_and_weighted_normals(body, width=0.014, segments=4, angle_deg=22.0)
 
     # Sculpted Crown Ridge Cap & Rear Armored Spine/Louvers (gives Enemy back faces awesome 3D detail!)
     body_addons = [body]
     crown_bar = create_rounded_box(
-        "CrownCrest", 0.28, 0.085, 0.036, corner_r=0.025, loc=(0, (yf_cr + yb_cr) * 0.5, z_crown + 0.012), bevel_z=0.01
+        "CrownCrest", 0.26, 0.068, 0.029, corner_r=0.02, loc=(0, (yf_cr + yb_cr) * 0.5, z_crown + 0.0105), bevel_z=0.006
     )
     crown_bar.data.materials.append(mat_resin)
     body_addons.append(crown_bar)
 
     # 3 Rear Horizontal Armor Louvers + Central Rear Spine (`+Y_bl` rear face, 78 deg slope = 12 deg from vertical)
-    for idx, lz in enumerate((0.26, 0.44, 0.62)):
+    for idx, lz in enumerate((0.20, 0.34, 0.48)):
         t_frac = (lz - z0) / (z_shoulder - z0)
         ly = yb0 * (1.0 - t_frac) + yb_sh * t_frac + 0.008
-        lw = 0.42 - idx * 0.045
+        lw = 0.41 - idx * 0.045
         louver = create_rounded_box(
-            f"RearLouver_{idx}", lw, 0.036, 0.048, corner_r=0.01, loc=(0, ly, lz), bevel_z=0.009
+            f"RearLouver_{idx}", lw, 0.034, 0.044, corner_r=0.01, loc=(0, ly, lz), bevel_z=0.006
         )
         louver.rotation_euler = (math.radians(12.0), 0, 0)
         louver.data.materials.append(mat_resin)
         body_addons.append(louver)
 
-    spine_y = (yb0 + yb_sh) * 0.5 + 0.012
+    spine_y = (yb0 + yb_sh) * 0.5 + 0.011
     spine = create_rounded_box(
-        "RearSpine", 0.068, 0.042, 0.56, corner_r=0.015, loc=(0, spine_y, 0.44), bevel_z=0.01
+        "RearSpine", 0.064, 0.036, 0.41, corner_r=0.014, loc=(0, spine_y, 0.345), bevel_z=0.006
     )
     spine.rotation_euler = (math.radians(12.0), 0, 0)
     spine.data.materials.append(mat_resin)
@@ -726,9 +726,9 @@ def build_command_wedge_glb():
     # Side Shoulder Epaulet Ribs (`+/-X` flanks)
     for sx in (-1, 1):
         flank = create_rounded_box(
-            f"SideRib_{sx}", 0.038, 0.22, 0.52, corner_r=0.012, loc=(sx * 0.305, 0.01, 0.42), bevel_z=0.009
+            f"SideRib_{sx}", 0.036, 0.17, 0.40, corner_r=0.012, loc=(sx * 0.296, 0.008, 0.335), bevel_z=0.006
         )
-        flank.rotation_euler = (0, math.radians(-sx * 7.2), 0)
+        flank.rotation_euler = (0, math.radians(-sx * 9.5), 0)
         flank.data.materials.append(mat_resin)
         body_addons.append(flank)
 
@@ -736,23 +736,28 @@ def build_command_wedge_glb():
     joined_body = join_objects(body_addons, "WedgeBody")
     box_uv_project(joined_body, scale=0.8)
 
-    # 3. Delicate Raised Brass Escutcheon Frame + Dark Satin Shield Plate on the `68 deg` Front Slope!
-    #    Normal of 68 deg front slope in Blender (-Y forward, +Z up): tilted +22 deg around X!
-    front_mid_z = 0.455
+    # 3. Delicate Raised Brass Escutcheon Frame + Dark Satin Shield Plate on the `57 deg` Front Slope!
+    front_mid_z = 0.355
     t_mid = (front_mid_z - z0) / (z_shoulder - z0)
     front_mid_y = yf0 * (1.0 - t_mid) + yf_sh * t_mid
 
     escutcheon_frame = create_brass_inlay_frame(
-        "EscutcheonBrass", 0, 0, 0.016, 0.50, 0.58, 0.026, 0.022, 0.055, mat_brass
+        "EscutcheonBrass", 0, 0, 0.014, 0.47, 0.45, 0.024, 0.022, 0.052, mat_brass
     )
-    escutcheon_frame.rotation_euler = (math.radians(68.0), 0, 0)
-    escutcheon_frame.location = (0, front_mid_y - 0.004, front_mid_z)
+    escutcheon_frame.rotation_euler = (math.radians(57.0), 0, 0)
+    escutcheon_frame.location = (0, front_mid_y - 0.005, front_mid_z + 0.003)
     apply_all_transforms(escutcheon_frame)
     plinth_parts.append(escutcheon_frame)
 
+    crown_finial = create_rounded_box(
+        "CrownBrassBar", 0.19, 0.042, 0.020, corner_r=0.011, loc=(0, (yf_cr + yb_cr) * 0.5, 0.725), bevel_z=0.004
+    )
+    crown_finial.data.materials.append(mat_brass)
+    plinth_parts.append(crown_finial)
+
     # Rear Brass Command Rivet Bar on plinth heel
     rear_brass_bar = create_rounded_box(
-        "RearBrassHeel", 0.36, 0.032, 0.038, corner_r=0.01, loc=(0, yb0 + 0.012, 0.115), bevel_z=0.008
+        "RearBrassHeel", 0.36, 0.034, 0.036, corner_r=0.01, loc=(0, yb0 + 0.009, 0.105), bevel_z=0.006
     )
     rear_brass_bar.data.materials.append(mat_brass)
     plinth_parts.append(rear_brass_bar)
@@ -761,10 +766,10 @@ def build_command_wedge_glb():
     box_uv_project(joined_brass, scale=0.9)
 
     inset_plate = create_rounded_box(
-        "WedgeEscutcheon", 0.452, 0.532, 0.012, corner_r=0.042, loc=(0, 0, 0), bevel_z=0.004
+        "WedgeEscutcheon", 0.425, 0.405, 0.012, corner_r=0.042, loc=(0, 0, 0), bevel_z=0.003
     )
-    inset_plate.rotation_euler = (math.radians(68.0), 0, 0)
-    inset_plate.location = (0, front_mid_y - 0.002, front_mid_z)
+    inset_plate.rotation_euler = (math.radians(57.0), 0, 0)
+    inset_plate.location = (0, front_mid_y - 0.0025, front_mid_z + 0.0016)
     apply_all_transforms(inset_plate)
     box_uv_project(inset_plate, scale=1.0)
     inset_plate.data.materials.append(mat_inset)

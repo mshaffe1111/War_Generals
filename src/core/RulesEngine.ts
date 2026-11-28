@@ -121,6 +121,53 @@ export function isOrthogonalSingleStep(from: GridCoord, to: GridCoord): boolean 
   return Math.abs(from.col - to.col) + Math.abs(from.row - to.row) === 1;
 }
 
+export function hasAnyLegalMoves(
+  pieces: ReadonlyArray<{ faction: Faction; col: number; row: number; alive: boolean }>,
+  faction: Faction
+): boolean {
+  const friendlyCoords = new Set<string>();
+  const ownPieces: Array<{ col: number; row: number }> = [];
+
+  for (const p of pieces) {
+    if (!p.alive) continue;
+    if (p.faction === faction) {
+      friendlyCoords.add(`${p.col},${p.row}`);
+      ownPieces.push({ col: p.col, row: p.row });
+    }
+  }
+
+  const dirs = [
+    { dc: 0, dr: -1 },
+    { dc: 0, dr: 1 },
+    { dc: -1, dr: 0 },
+    { dc: 1, dr: 0 },
+  ];
+
+  for (const unit of ownPieces) {
+    for (const d of dirs) {
+      const nc = unit.col + d.dc;
+      const nr = unit.row + d.dr;
+      if (nc < 0 || nc >= BOARD_COLS || nr < 0 || nr >= BOARD_ROWS) continue;
+      if (!friendlyCoords.has(`${nc},${nr}`)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+export function computePositionRepetitionKey(
+  pieces: ReadonlyArray<{ id: string; col: number; row: number; alive: boolean }>,
+  activeTurn: Faction
+): string {
+  const alive = pieces
+    .filter((p) => p.alive)
+    .map((p) => `${p.id}:${p.col},${p.row}`)
+    .sort();
+  return `${activeTurn}|${alive.join(';')}`;
+}
+
 export function formatAlgebraicCoord(col: number, row: number): string {
   const file = String.fromCharCode(65 + Math.max(0, Math.min(8, col)));
   const rankFromPlayer = BOARD_ROWS - row; // row 7 -> 1, row 0 -> 8
@@ -312,6 +359,163 @@ export const TOURNAMENT_PRESETS: Readonly<Record<DeploymentPresetId, readonly De
     { col: 6, row: 7, rank: 'PRIVATE' },
     { col: 8, row: 7, rank: 'FLAG' }, // Real Mirage Bluff Flag!
   ],
+
+  SHADOW_PINCER: [
+    // Twin-flank Spy pincers + central 4★/Colonel/Lt.Col hammer protecting back-center Flag
+    { col: 0, row: 5, rank: 'PRIVATE' },
+    { col: 1, row: 5, rank: 'SPY' },
+    { col: 3, row: 5, rank: 'COLONEL' },
+    { col: 4, row: 5, rank: 'GEN_4' },
+    { col: 5, row: 5, rank: 'LT_COLONEL' },
+    { col: 7, row: 5, rank: 'SPY' },
+    { col: 8, row: 5, rank: 'PRIVATE' },
+
+    { col: 0, row: 6, rank: 'LT_1ST' },
+    { col: 1, row: 6, rank: 'PRIVATE' },
+    { col: 2, row: 6, rank: 'GEN_5' },
+    { col: 3, row: 6, rank: 'MAJOR' },
+    { col: 5, row: 6, rank: 'CAPTAIN' },
+    { col: 6, row: 6, rank: 'GEN_3' },
+    { col: 7, row: 6, rank: 'PRIVATE' },
+    { col: 8, row: 6, rank: 'LT_2ND' },
+
+    { col: 1, row: 7, rank: 'GEN_2' },
+    { col: 3, row: 7, rank: 'PRIVATE' },
+    { col: 4, row: 7, rank: 'FLAG' },
+    { col: 5, row: 7, rank: 'PRIVATE' },
+    { col: 6, row: 7, rank: 'SERGEANT' },
+    { col: 7, row: 7, rank: 'GEN_1' },
+  ],
+
+  CITADEL_PHALANX: [
+    // Hardened left-corner Flag vault with alternating Private/General phalanx wall
+    { col: 0, row: 5, rank: 'SERGEANT' },
+    { col: 2, row: 5, rank: 'PRIVATE' },
+    { col: 3, row: 5, rank: 'GEN_5' },
+    { col: 4, row: 5, rank: 'PRIVATE' },
+    { col: 5, row: 5, rank: 'GEN_4' },
+    { col: 6, row: 5, rank: 'PRIVATE' },
+    { col: 8, row: 5, rank: 'CAPTAIN' },
+
+    { col: 0, row: 6, rank: 'PRIVATE' },
+    { col: 1, row: 6, rank: 'COLONEL' },
+    { col: 2, row: 6, rank: 'SPY' },
+    { col: 3, row: 6, rank: 'GEN_3' },
+    { col: 5, row: 6, rank: 'LT_COLONEL' },
+    { col: 6, row: 6, rank: 'SPY' },
+    { col: 7, row: 6, rank: 'GEN_2' },
+    { col: 8, row: 6, rank: 'MAJOR' },
+
+    { col: 0, row: 7, rank: 'FLAG' },
+    { col: 1, row: 7, rank: 'PRIVATE' },
+    { col: 2, row: 7, rank: 'PRIVATE' },
+    { col: 4, row: 7, rank: 'GEN_1' },
+    { col: 6, row: 7, rank: 'LT_1ST' },
+    { col: 7, row: 7, rank: 'LT_2ND' },
+  ],
+
+  SILENT_CORRIDOR: [
+    // Left-heavy heavy echelon + right-corner hidden Flag behind triple Private cordon
+    { col: 0, row: 5, rank: 'GEN_5' },
+    { col: 1, row: 5, rank: 'SPY' },
+    { col: 2, row: 5, rank: 'GEN_4' },
+    { col: 3, row: 5, rank: 'COLONEL' },
+    { col: 5, row: 5, rank: 'PRIVATE' },
+    { col: 6, row: 5, rank: 'MAJOR' },
+    { col: 7, row: 5, rank: 'PRIVATE' },
+
+    { col: 0, row: 6, rank: 'PRIVATE' },
+    { col: 1, row: 6, rank: 'GEN_3' },
+    { col: 2, row: 6, rank: 'SPY' },
+    { col: 3, row: 6, rank: 'LT_COLONEL' },
+    { col: 4, row: 6, rank: 'GEN_2' },
+    { col: 6, row: 6, rank: 'CAPTAIN' },
+    { col: 8, row: 6, rank: 'SERGEANT' },
+
+    { col: 1, row: 7, rank: 'GEN_1' },
+    { col: 2, row: 7, rank: 'PRIVATE' },
+    { col: 4, row: 7, rank: 'LT_1ST' },
+    { col: 5, row: 7, rank: 'PRIVATE' },
+    { col: 6, row: 7, rank: 'LT_2ND' },
+    { col: 7, row: 7, rank: 'PRIVATE' },
+    { col: 8, row: 7, rank: 'FLAG' },
+  ],
+
+  SOVEREIGN_GAMBIT: [
+    // Second-row offset Flag screened by Privates + shadowed 5★ General ambush on Row 7
+    { col: 0, row: 5, rank: 'PRIVATE' },
+    { col: 2, row: 5, rank: 'CAPTAIN' },
+    { col: 3, row: 5, rank: 'GEN_4' },
+    { col: 4, row: 5, rank: 'SPY' },
+    { col: 5, row: 5, rank: 'COLONEL' },
+    { col: 7, row: 5, rank: 'PRIVATE' },
+    { col: 8, row: 5, rank: 'LT_1ST' },
+
+    { col: 0, row: 6, rank: 'LT_2ND' },
+    { col: 1, row: 6, rank: 'PRIVATE' },
+    { col: 2, row: 6, rank: 'GEN_3' },
+    { col: 4, row: 6, rank: 'MAJOR' },
+    { col: 5, row: 6, rank: 'SPY' },
+    { col: 6, row: 6, rank: 'PRIVATE' },
+    { col: 7, row: 6, rank: 'FLAG' },
+    { col: 8, row: 6, rank: 'GEN_2' },
+
+    { col: 0, row: 7, rank: 'PRIVATE' },
+    { col: 1, row: 7, rank: 'GEN_5' },
+    { col: 2, row: 7, rank: 'PRIVATE' },
+    { col: 4, row: 7, rank: 'LT_COLONEL' },
+    { col: 6, row: 7, rank: 'SERGEANT' },
+    { col: 7, row: 7, rank: 'GEN_1' },
+  ],
+};
+
+export interface DeploymentPresetMeta {
+  readonly label: string;
+  readonly summary: string;
+  readonly archetype: string;
+}
+
+export const DEPLOYMENT_PRESET_META: Readonly<Record<DeploymentPresetId, DeploymentPresetMeta>> = {
+  VACCINATION: {
+    label: 'Vaccination',
+    summary: 'Balanced central 5★/4★/Colonel spearhead with flanked Spies.',
+    archetype: 'BALANCED',
+  },
+  MOTHERSHIP: {
+    label: 'Mothership',
+    summary: 'Fortified back-corner Flag ringed by Privates and roaming Spy escorts.',
+    archetype: 'FORTRESS',
+  },
+  IRON_BLITZ: {
+    label: 'Iron Blitz',
+    summary: 'Aggressive 5★, Spy, and 4★ triad on frontline Row 5.',
+    archetype: 'BLITZ',
+  },
+  MIRAGE_DECOY: {
+    label: 'Mirage Decoy',
+    summary: 'Heavily guarded fake Flag on the left; real Flag unguarded on the right.',
+    archetype: 'DECEPTION',
+  },
+  SHADOW_PINCER: {
+    label: 'Shadow Pincer',
+    summary: 'Twin outer-wing Spies pinning flanks around a central armored wedge.',
+    archetype: 'ASSASSIN',
+  },
+  CITADEL_PHALANX: {
+    label: 'Citadel Phalanx',
+    summary: 'Interlocking Private-General shield wall protecting a corner vault.',
+    archetype: 'DEFENSE',
+  },
+  SILENT_CORRIDOR: {
+    label: 'Silent Corridor',
+    summary: 'Left-wing heavy General echelon masking a deep right-corner Flag.',
+    archetype: 'ASYMMETRIC',
+  },
+  SOVEREIGN_GAMBIT: {
+    label: 'Sovereign Gambit',
+    summary: 'Unorthodox Row-6 Flag decoyed by a motionless back-row 5★ General.',
+    archetype: 'COUNTER_BLUFF',
+  },
 };
 
 export function mirrorDeploymentLR(slots: readonly DeploymentSlot[]): DeploymentSlot[] {
@@ -323,7 +527,7 @@ export function mirrorDeploymentLR(slots: readonly DeploymentSlot[]): Deployment
 }
 
 export function generateSmartAutoDeploy(): DeploymentSlot[] {
-  const keys: DeploymentPresetId[] = ['VACCINATION', 'MOTHERSHIP', 'IRON_BLITZ', 'MIRAGE_DECOY'];
+  const keys = Object.keys(TOURNAMENT_PRESETS) as DeploymentPresetId[];
   const pick = keys[Math.floor(Math.random() * keys.length)]!;
   const base = TOURNAMENT_PRESETS[pick].map((s) => ({ ...s }));
   return Math.random() < 0.5 ? mirrorDeploymentLR(base) : base;

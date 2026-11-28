@@ -4,15 +4,26 @@ import {
   getCommanderProfile,
   type CommanderId,
 } from '../ai/CommanderProfiles';
+import { PIECE_COLOR_ORDER, PIECE_COLOR_SPECS } from '../core/pieceColors';
+import { getTacticalOperation, TACTICAL_OPERATIONS } from '../core/operations';
 import { ORDERED_RANKS, RANK_SPECS, type RankId } from '../core/ranks';
-import { ARMY_PIECE_TOTAL } from '../core/RulesEngine';
+import {
+  ARMY_PIECE_TOTAL,
+  DEPLOYMENT_PRESET_META,
+  TOURNAMENT_PRESETS,
+} from '../core/RulesEngine';
+import { BATTLE_THEATERS, getBattleTheater } from '../core/theaters';
 import type {
   AppOptions,
   ArbiterVerdict,
   BoardViewAngle,
   DeploymentPresetId,
+  PieceColorId,
   PlayerVisibleView,
+  QualityTier,
   SuspectTag,
+  TheaterId,
+  ViewportFrameMode,
 } from '../core/types';
 import type { GameStore, ShowcasePreset } from '../state/GameStore';
 
@@ -68,6 +79,18 @@ const ICON_FULLSCREEN_EXIT = `
   </svg>
 `;
 
+const ICON_REFRESH = `
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+    <polyline points="21 3 21 9 15 9" />
+  </svg>
+`;
+
+const LOCAL_BUILD_ID = typeof __APP_BUILD_ID__ !== 'undefined' ? __APP_BUILD_ID__ : 'dev';
+const LOCAL_BUILD_SHORT = (LOCAL_BUILD_ID.split('-').pop() || LOCAL_BUILD_ID)
+  .slice(0, 6)
+  .toUpperCase();
+
 interface WebkitDocument extends Document {
   webkitFullscreenElement?: Element | null;
   webkitExitFullscreen?: () => Promise<void> | void;
@@ -88,12 +111,19 @@ function clampVal(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v));
 }
 
+function renderStarsText(stars: number): string {
+  const s = Math.max(0, Math.min(3, stars));
+  return `${'★'.repeat(s)}${'☆'.repeat(3 - s)}`;
+}
+
 export interface UIManagerCallbacks {
   readonly onTriggerVerdict: (verdict: ArbiterVerdict) => void;
   readonly onStartCrateDrag: (rank: RankId, clientX: number, clientY: number) => void;
+  readonly onSkipArbiter?: () => void;
+  readonly onResetCamera?: () => void;
 }
 
-type TitleSubView = 'ROOT' | 'SKIRMISH' | 'CAMPAIGN';
+type TitleSubView = 'ROOT' | 'SKIRMISH' | 'CAMPAIGN' | 'OPERATIONS';
 type ActiveDrawer = 'NONE' | 'INTEL' | 'LOG' | 'OPTIONS' | 'SHOWCASE';
 type OptionsTab = 'RULES' | 'AUDIO_GPU';
 
@@ -109,23 +139,38 @@ export class UIManager {
   private fullscreenActive = false;
   private saveSlotArmed = false;
   private suspectTargetPieceId: string | null = null;
+  private selectedOperationId: string = TACTICAL_OPERATIONS[0]!.id;
 
-  // 2-Step Hold-to-Confirm Surrender State
+  // 2-Step Hold-to-Confirm Surrender State + Touch Click-Through Guard
   private surrenderArmedUntil = 0;
   private surrenderHoldRaf = 0;
-  private surrenderHoldStart = 0;
+  private surrenderHoldAccumMs = 0;
+  private surrenderLastTickMs = 0;
+  private surrenderHoldTicks = 0;
   private surrenderHolding = false;
+  private surrenderHoldingPointerId: number | null = null;
+  private surrenderClickGuardActive = false;
+  private surrenderClickGuardTimer = 0;
 
   // Cached DOM references
   private readonly titleScreen: HTMLElement;
   private readonly titleMainCards: HTMLElement;
   private readonly titleSkirmishPanel: HTMLElement;
   private readonly titleCampaignPanel: HTMLElement;
+  private readonly titleOpsPanel: HTMLElement;
   private readonly skirmishGrid: HTMLElement;
   private readonly campaignGrid: HTMLElement;
   private readonly campaignStatsBadge: HTMLElement;
+  private readonly opsGrid: HTMLElement;
+  private readonly opsBriefingBox: HTMLElement;
+  private readonly opsStatsBadge: HTMLElement;
   private readonly titleFsBtn: HTMLButtonElement;
   private readonly titleMuteBtn: HTMLButtonElement;
+  private readonly titleRefreshBtn: HTMLButtonElement;
+  private readonly titleUpdateDot: HTMLElement;
+  private readonly titleUpdateToast: HTMLElement;
+  private updateToastTimer = 0;
+  private updateCheckInFlight = false;
 
   private readonly topUtilityBar: HTMLElement;
   private readonly modeTitleLabel: HTMLElement;
@@ -138,9 +183,11 @@ export class UIManager {
   private readonly countdownVal: HTMLElement;
   private readonly centerStatePill: HTMLElement;
   private readonly centerStateText: HTMLElement;
+  private readonly opTurnCounter: HTMLElement;
   private readonly turnProgressFill: HTMLElement;
   private readonly roundTimerPill: HTMLElement;
   private readonly roundTimerVal: HTMLElement;
+  private readonly skipCutsceneBtn: HTMLButtonElement;
 
   private readonly suspectWheel: HTMLElement;
   private readonly shroudOverlay: HTMLElement;
@@ -165,6 +212,7 @@ export class UIManager {
   private readonly armoryBackBtn: HTMLButtonElement;
 
   private readonly manualSheet: HTMLElement;
+  private readonly manualRankThumb: HTMLImageElement;
   private readonly manualRankTitle: HTMLElement;
   private readonly manualRankRule: HTMLElement;
   private readonly manualStatsRow: HTMLElement;
@@ -175,6 +223,7 @@ export class UIManager {
   private readonly dossierTitle: HTMLElement;
   private readonly dossierMethod: HTMLElement;
   private readonly dossierMedalBanner: HTMLElement;
+  private readonly dossierCasualtiesStrip: HTMLElement;
   private readonly dossierStatTurns: HTMLElement;
   private readonly dossierStatClashes: HTMLElement;
   private readonly dossierStatOfficer: HTMLElement;
@@ -209,7 +258,7 @@ export class UIManager {
       const spec = RANK_SPECS[r];
       return `
         <button type="button" class="crate-rank-chip" data-rank="${r}" title="${spec.name}">
-          <span class="chip-metal-dot" data-metal="${spec.metal}"></span>
+          <img class="chip-rank-thumb" src="./ranks/${r}.webp" alt="${spec.name}" />
           <span class="chip-code">${COMPACT_CHIP_LABEL[r]}</span>
           <span class="chip-qty" data-qty-for="${r}">×${spec.countPerArmy}</span>
         </button>
@@ -217,10 +266,33 @@ export class UIManager {
     }).join('');
 
     const manualChipsHtml = ORDERED_RANKS.map((r) => {
+      const spec = RANK_SPECS[r];
       return `
         <button type="button" class="manual-rank-pill" data-manual-rank="${r}">
+          <img class="manual-pill-thumb" src="./ranks/${r}.webp" alt="${spec.name}" />
           <span class="manual-pill-code">${COMPACT_CHIP_LABEL[r]}</span>
           <span class="manual-pill-tag" data-manual-tag="${r}">—</span>
+        </button>
+      `;
+    }).join('');
+
+    const presetButtonsHtml = (Object.keys(TOURNAMENT_PRESETS) as DeploymentPresetId[])
+      .map((id) => {
+        const meta = DEPLOYMENT_PRESET_META[id];
+        return `<button type="button" class="mob-preset-pill" data-dep-preset="${id}" title="${meta.summary}">${meta.label}</button>`;
+      })
+      .join('');
+
+    const theaterButtonsHtml = BATTLE_THEATERS.map(
+      (t) => `<button type="button" data-theater="${t.id}" title="${t.subtitle}">${t.name.split(' ')[0]}</button>`
+    ).join('');
+
+    const pieceColorSwatchesHtml = PIECE_COLOR_ORDER.map((id) => {
+      const c = PIECE_COLOR_SPECS[id];
+      return `
+        <button type="button" class="piece-swatch-btn" data-piece-color="${c.id}" title="${c.label}">
+          <span class="piece-swatch-pip" style="--swatch:${c.swatchHex};--swatch-hi:${c.swatchHighlightHex};"></span>
+          <span class="piece-swatch-lbl">${c.shortLabel}</span>
         </button>
       `;
     }).join('');
@@ -252,7 +324,9 @@ export class UIManager {
     const skirmishCommanderCardsHtml = COMMANDER_ROSTER.map(
       (c) => `
         <button type="button" class="cmd-select-card" data-skirmish-cmd="${c.id}">
-          <span class="cmd-portrait-box">${c.portraitSvg}</span>
+          <span class="cmd-portrait-box">
+            <img src="${c.portraitUrl}" alt="${c.fullName}" loading="eager" />
+          </span>
           <span class="cmd-card-meta">
             <span class="cmd-card-top">
               <span class="cmd-tier-tag">T${c.tier}</span>
@@ -266,82 +340,109 @@ export class UIManager {
 
     this.root.innerHTML = `
       <!-- =====================================================================
-           1. LIVE 3D TITLE & START SCREEN (Upper Crest + Lower 42% Thumb Deck)
+           1. LIVE 3D HEROIC START SCREEN (Centerpiece Seal + Asymmetric Blades)
            ===================================================================== -->
       <section class="title-screen-layer" id="title-screen">
         <div class="title-top-bar">
-          <div class="war-generals-crest">
-            <div class="crest-kicker">ELECTRONIC STRATEGY • SALPAKAN</div>
-            <h1 class="crest-heading">WAR GENERALS</h1>
-            <div class="crest-brass-rule">
-              <span class="crest-star">★</span>
+          <div class="title-top-spacer" aria-hidden="true"></div>
+          <div class="hero-title-centerpiece">
+            <svg class="hero-telemetry-arc" viewBox="0 0 260 150" aria-hidden="true">
+              <path d="M 30 124 A 108 108 0 0 1 230 124" fill="none" stroke="rgba(229,185,104,0.34)" stroke-width="1" stroke-dasharray="4 6" />
+              <path d="M 54 128 A 84 84 0 0 1 206 128" fill="none" stroke="rgba(98,230,255,0.22)" stroke-width="1" />
+              <line x1="130" y1="6" x2="130" y2="18" stroke="rgba(229,185,104,0.55)" stroke-width="1.2" />
+              <line x1="28" y1="88" x2="38" y2="92" stroke="rgba(229,185,104,0.45)" stroke-width="1.2" />
+              <line x1="232" y1="88" x2="222" y2="92" stroke="rgba(229,185,104,0.45)" stroke-width="1.2" />
+            </svg>
+            <div class="hero-crest-halo">
+              <img class="hero-crest-seal" src="./portraits/hero_crest.png" alt="War Generals Command Seal" decoding="sync" />
+            </div>
+            <div class="hero-title-lockup">
+              <div class="crest-kicker">ELECTRONIC STRATEGY • SALPAKAN</div>
+              <h1 class="crest-heading">WAR GENERALS</h1>
+              <div class="crest-brass-rule">
+                <span class="crest-star">★</span>
+              </div>
             </div>
           </div>
           <div class="title-utility-orbs">
-            <button type="button" class="glass-icon-btn" id="btn-title-mute" aria-label="Toggle Audio" title="Mute / Unmute">
+            <button type="button" class="glass-icon-btn utility-glyph-btn" id="btn-title-refresh" aria-label="Check for updates and refresh" title="Check for Updates">
+              ${ICON_REFRESH}
+              <span class="update-dot" id="title-update-dot" hidden></span>
+            </button>
+            <button type="button" class="glass-icon-btn utility-glyph-btn" id="btn-title-mute" aria-label="Toggle Audio" title="Mute / Unmute">
               ${ICON_AUDIO_ON}
             </button>
-            <button type="button" class="glass-icon-btn" id="btn-title-fs" aria-label="Toggle Fullscreen" title="Toggle Fullscreen (F)">
+            <button type="button" class="glass-icon-btn utility-glyph-btn" id="btn-title-fs" aria-label="Toggle Fullscreen" title="Toggle Fullscreen (F)">
               ${ICON_FULLSCREEN_ENTER}
             </button>
           </div>
+          <div class="title-update-toast" id="title-update-toast" role="status" aria-live="polite" hidden></div>
         </div>
 
         <div class="title-thumb-deck" id="title-thumb-deck">
-          <!-- Root 6 Command Cards (100% inside lower 42% thumb zone!) -->
+          <!-- Asymmetric Sculpted Command-Blade Composition -->
           <div class="title-card-stack" id="title-main-cards">
-            <button type="button" class="menu-command-card cta-sheen" id="btn-menu-skirmish" data-primary="true">
-              <span class="mc-icon">⚔</span>
-              <span class="mc-copy">
-                <span class="mc-title">PLAY SKIRMISH</span>
-                <span class="mc-sub">Select Commander AI &amp; Era Rules → Mobilization</span>
+            <button type="button" class="cmd-blade cmd-blade-hero cta-sheen" id="btn-menu-skirmish" data-primary="true" data-blade="01">
+              <span class="blade-index">01</span>
+              <span class="blade-copy">
+                <span class="blade-title">PLAY SKIRMISH</span>
+                <span class="blade-sub">Commanders &amp; Era Rules → Mobilization</span>
               </span>
-              <span class="mc-arrow">›</span>
+              <span class="blade-chevron">›</span>
             </button>
 
-            <button type="button" class="menu-command-card" id="btn-menu-campaign">
-              <span class="mc-icon">★</span>
-              <span class="mc-copy">
-                <span class="mc-title">COMMAND CAMPAIGN</span>
-                <span class="mc-sub" id="menu-campaign-sub">6-Tier Rival General Gauntlet &amp; Medals</span>
+            <button type="button" class="cmd-blade cmd-blade-odd" id="btn-menu-operations" data-menu-operations="true" data-mode="OPERATION" data-blade="02">
+              <span class="blade-index">02</span>
+              <span class="blade-copy">
+                <span class="blade-title">TACTICAL OPS</span>
+                <span class="blade-sub">8 Operations &amp; Stars</span>
               </span>
-              <span class="mc-arrow">›</span>
+              <span class="blade-chevron">›</span>
             </button>
 
-            <button type="button" class="menu-command-card" id="btn-menu-passplay">
-              <span class="mc-icon">⇄</span>
-              <span class="mc-copy">
-                <span class="mc-title">PASS &amp; PLAY (2P LOCAL)</span>
-                <span class="mc-sub">Hotseat Clash with Brass Command Shroud</span>
+            <button type="button" class="cmd-blade cmd-blade-even" id="btn-menu-campaign" data-blade="03">
+              <span class="blade-index">03</span>
+              <span class="blade-copy">
+                <span class="blade-title">CAMPAIGN</span>
+                <span class="blade-sub" id="menu-campaign-sub">6-Tier Rival Gauntlet</span>
               </span>
-              <span class="mc-arrow">›</span>
+              <span class="blade-chevron">›</span>
             </button>
 
-            <button type="button" class="menu-command-card" id="btn-menu-armory">
-              <span class="mc-icon">▦</span>
-              <span class="mc-copy">
-                <span class="mc-title">FORMATION ARMORY</span>
-                <span class="mc-sub">Build, Mirror &amp; Save 21-Unit Blueprints</span>
+            <button type="button" class="cmd-blade cmd-blade-odd" id="btn-menu-passplay" data-blade="04">
+              <span class="blade-index">04</span>
+              <span class="blade-copy">
+                <span class="blade-title">PASS &amp; PLAY</span>
+                <span class="blade-sub">2P Brass Shroud</span>
               </span>
-              <span class="mc-arrow">›</span>
+              <span class="blade-chevron">›</span>
             </button>
 
-            <button type="button" class="menu-command-card" id="btn-menu-manual">
-              <span class="mc-icon">◈</span>
-              <span class="mc-copy">
-                <span class="mc-title">FIELD MANUAL &amp; RANKS</span>
-                <span class="mc-sub">Interactive 3D Rank &amp; Spy/Private Hierarchy</span>
+            <button type="button" class="cmd-blade cmd-blade-even" id="btn-menu-armory" data-blade="05">
+              <span class="blade-index">05</span>
+              <span class="blade-copy">
+                <span class="blade-title">ARMORY</span>
+                <span class="blade-sub">21-Unit Blueprints</span>
               </span>
-              <span class="mc-arrow">›</span>
+              <span class="blade-chevron">›</span>
             </button>
 
-            <button type="button" class="menu-command-card" id="btn-menu-options">
-              <span class="mc-icon">⚙</span>
-              <span class="mc-copy">
-                <span class="mc-title">OPTIONS &amp; ERA RULES</span>
-                <span class="mc-sub">1980s / 1970s Ruleset, Mixer &amp; Display</span>
+            <button type="button" class="cmd-blade cmd-blade-odd" id="btn-menu-manual" data-blade="06">
+              <span class="blade-index">06</span>
+              <span class="blade-copy">
+                <span class="blade-title">FIELD MANUAL</span>
+                <span class="blade-sub">15-Rank Hierarchy</span>
               </span>
-              <span class="mc-arrow">›</span>
+              <span class="blade-chevron">›</span>
+            </button>
+
+            <button type="button" class="cmd-blade cmd-blade-even" id="btn-menu-options" data-blade="07">
+              <span class="blade-index">07</span>
+              <span class="blade-copy">
+                <span class="blade-title">OPTIONS</span>
+                <span class="blade-sub">Era, Theaters &amp; GPU</span>
+              </span>
+              <span class="blade-chevron">›</span>
             </button>
           </div>
 
@@ -371,6 +472,12 @@ export class UIManager {
                 <button type="button" data-sk-diff="SUPREME_MARSHAL">Marshal</button>
               </div>
             </div>
+            <div class="era-inline-row">
+              <span class="era-inline-label">PIECE COAT</span>
+              <div class="color-swatch-track" id="seg-skirmish-color">
+                ${pieceColorSwatchesHtml}
+              </div>
+            </div>
             <button type="button" class="primary-brass-cta cta-sheen" id="btn-start-skirmish">
               DEPLOY FORCES — MOBILIZE
             </button>
@@ -379,14 +486,28 @@ export class UIManager {
           <!-- Sub-Panel B: 6-Tier Command Campaign Gauntlet -->
           <div class="title-sub-sheet" id="title-sub-campaign" hidden>
             <div class="sub-sheet-header">
-              <span class="sub-sheet-title">COMMAND CAMPAIGN</span>
-              <span class="mono-stat-pill" id="campaign-stats-badge">MEDALS 0/6 • WIN 0%</span>
+              <span class="sub-sheet-title">CAMPAIGN</span>
+              <span class="mono-stat-pill" id="campaign-stats-badge">0/6 MEDALS • 0/18★ • 0%</span>
               <button type="button" class="mini-brass-btn" data-back-root="true">← MENU</button>
             </div>
             <div class="cmd-grid-6" id="campaign-cmd-grid"></div>
             <div class="cmd-dossier-blurb" id="campaign-cmd-summary"></div>
             <button type="button" class="primary-brass-cta cta-sheen" id="btn-launch-campaign">
               LAUNCH CAMPAIGN OPERATION
+            </button>
+          </div>
+
+          <!-- Sub-Panel C: 8 Tactical Operations & Challenges -->
+          <div class="title-sub-sheet operations-panel" id="title-sub-operations" hidden>
+            <div class="sub-sheet-header">
+              <span class="sub-sheet-title">TACTICAL OPERATIONS</span>
+              <span class="mono-stat-pill" id="ops-stats-badge">0/8 CLEARED • 0★</span>
+              <button type="button" class="mini-brass-btn" data-back-root="true">← MENU</button>
+            </div>
+            <div class="ops-grid" id="ops-grid"></div>
+            <div class="cmd-dossier-blurb" id="ops-briefing-box"></div>
+            <button type="button" class="primary-brass-cta cta-sheen" id="btn-start-operation" data-launch-operation="true">
+              LAUNCH TACTICAL OPERATION
             </button>
           </div>
         </div>
@@ -411,6 +532,9 @@ export class UIManager {
         </div>
 
         <div class="hud-orb-cluster">
+          <button type="button" class="glass-icon-btn" id="btn-top-cam-reset" data-reset-camera="true" aria-label="Reset Camera Orbit" title="Reset Camera Orbit">
+            ⌖
+          </button>
           <button type="button" class="glass-icon-btn" id="btn-top-view" aria-label="Cycle Camera Angle" title="Cycle Camera Angle">
             <span id="top-view-badge">40°</span>
           </button>
@@ -424,7 +548,7 @@ export class UIManager {
       </header>
 
       <!-- =====================================================================
-           3. IN-MATCH SAFE-ZONE TOP TRIO (COUNTDOWN | STATE + BAR | ROUND)
+           3. IN-MATCH SAFE-ZONE TOP TRIO (COUNTDOWN | STATE + BAR | ROUND | CAM RESET)
            ===================================================================== -->
       <header class="play-top-trio" id="play-top-trio" hidden>
         <div class="clock-pill">
@@ -434,6 +558,7 @@ export class UIManager {
 
         <div class="state-banner-pill" id="pill-turn-state" data-tone="player">
           <span class="state-banner-text" id="text-turn-state">YOUR TURN</span>
+          <span class="op-turn-counter" id="op-turn-counter" hidden></span>
           <div class="turn-progress-track">
             <div class="turn-progress-fill" id="turn-progress-fill"></div>
           </div>
@@ -443,7 +568,27 @@ export class UIManager {
           <span class="clock-micro-label">ROUND</span>
           <span class="clock-mono-val" id="val-round-timer">00:45</span>
         </div>
+
+        <button
+          type="button"
+          class="glass-icon-btn cam-reset-pill"
+          id="btn-reset-camera"
+          data-reset-camera="true"
+          aria-label="Reset Camera Orbit"
+          title="Reset Camera Orbit"
+        >⌖</button>
       </header>
+
+      <!-- Instant Any-Time Cutscene Skip Pill (Visible whenever cameraMode === 'ARBITER') -->
+      <button
+        type="button"
+        class="arbiter-skip-pill arbiter-skip-btn cta-sheen"
+        id="btn-skip-cutscene"
+        data-skip-cutscene="true"
+        hidden
+      >
+        SKIP &gt;&gt;
+      </button>
 
       <!-- Radial Brass Deduction Wheel (320ms Hold or Double-Tap on Enemy Wedge) -->
       <div class="suspect-wheel" id="suspect-wheel" hidden>
@@ -513,7 +658,7 @@ export class UIManager {
           </div>
         </div>
 
-        <!-- Pop-up Sheet: Options, Era Editions, Difficulty, Ergonomics & 5-Control Audio/GPU -->
+        <!-- Pop-up Sheet: Options, Era Editions, Theaters, Quality & Audio -->
         <div class="smoked-sheet" id="sheet-options" hidden>
           <div class="sub-sheet-header">
             <div class="seg-track" id="seg-opt-tabs">
@@ -544,6 +689,12 @@ export class UIManager {
               <div class="seg-track" id="seg-finish">
                 <button type="button" data-finish="WALNUT_SLATE">Oiled Walnut</button>
                 <button type="button" data-finish="RETRO_BAKELITE">1980 Bakelite</button>
+              </div>
+            </div>
+            <div class="setting-row">
+              <span>Piece Color</span>
+              <div class="color-swatch-track" id="seg-piece-color">
+                ${pieceColorSwatchesHtml}
               </div>
             </div>
             <div class="setting-row">
@@ -579,27 +730,46 @@ export class UIManager {
             </div>
           </div>
 
-          <!-- Tab 2: Graphics / Battery Saver, Camera, Fullscreen & 4-Bus + Master Audio Mixer -->
+          <!-- Tab 2: Quality Governor (5 Tiers), Battle Theaters, Frame Mode, Camera & Mixer -->
           <div class="options-grid" id="opt-pane-audio" hidden>
             <div class="setting-row">
               <span>Graphics &amp; FPS</span>
-              <div class="seg-track" id="seg-quality">
-                <button type="button" data-quality="ULTRA">Ultra 60FPS</button>
-                <button type="button" data-quality="BATTERY_SAVER">Battery 30FPS</button>
+              <div class="seg-track seg-track-compact" id="seg-quality">
+                <button type="button" data-quality="AUTO">Auto</button>
+                <button type="button" data-quality="ULTRA">Ultra</button>
+                <button type="button" data-quality="HIGH">High</button>
+                <button type="button" data-quality="BALANCED">Bal</button>
+                <button type="button" data-quality="BATTERY_SAVER">30fps</button>
               </div>
             </div>
             <div class="setting-row">
-              <span>Display &amp; Tilt</span>
+              <span>Battle Theater</span>
+              <div class="seg-track seg-track-compact" id="seg-theater">
+                ${theaterButtonsHtml}
+              </div>
+            </div>
+            <div class="setting-row">
+              <span>Viewport Frame</span>
               <div class="hud-orb-cluster">
-                <div class="seg-track" id="seg-fullscreen">
-                  <button type="button" data-fs="false">Framed</button>
-                  <button type="button" data-fs="true">Full</button>
+                <div class="seg-track" id="seg-frame-mode">
+                  <button type="button" data-frame-mode="FULL_VIEWPORT" data-viewport-frame="FULL_VIEWPORT">Full</button>
+                  <button type="button" data-frame-mode="PHONE_9_16" data-viewport-frame="PHONE_9_16">9:16</button>
                 </div>
+                <div class="seg-track" id="seg-fullscreen">
+                  <button type="button" data-fs="false">Win</button>
+                  <button type="button" data-fs="true">FS</button>
+                </div>
+              </div>
+            </div>
+            <div class="setting-row">
+              <span>Camera &amp; Orbit</span>
+              <div class="hud-orb-cluster">
                 <div class="seg-track" id="seg-view">
                   <button type="button" data-view="COMMAND">40°</button>
                   <button type="button" data-view="TACTICAL">32°</button>
                   <button type="button" data-view="OVERHEAD">62°</button>
                 </div>
+                <button type="button" class="mini-brass-btn" id="btn-opt-cam-reset" data-reset-camera="true">Reset</button>
               </div>
             </div>
             <div class="setting-row">
@@ -650,10 +820,7 @@ export class UIManager {
 
           <div class="mob-toolbar-rows">
             <div class="mob-preset-row">
-              <button type="button" class="mob-preset-pill" data-dep-preset="VACCINATION">Vaccination</button>
-              <button type="button" class="mob-preset-pill" data-dep-preset="MOTHERSHIP">Mothership</button>
-              <button type="button" class="mob-preset-pill" data-dep-preset="IRON_BLITZ">Iron Blitz</button>
-              <button type="button" class="mob-preset-pill" data-dep-preset="MIRAGE_DECOY">Mirage</button>
+              ${presetButtonsHtml}
             </div>
             <div class="mob-blueprint-row">
               <span class="mob-sub-label">BLUEPRINTS</span>
@@ -683,10 +850,13 @@ export class UIManager {
         <!-- Interactive 3D Field Manual & Spy/Private Hierarchy Sheet -->
         <div class="manual-thumb-sheet" id="manual-sheet" hidden>
           <div class="manual-top-row">
-            <div>
-              <div class="manual-rank-title" id="manual-rank-title">SPY (SECRET AGENT)</div>
-              <div class="manual-rank-rule" id="manual-rank-rule">
-                Eliminates all Officers (5★ down to Sergeant) &amp; Flag • Eliminated ONLY by Private!
+            <div class="manual-hero-head">
+              <img class="manual-hero-thumb" id="manual-rank-thumb" src="./ranks/SPY.webp" alt="Selected Rank Emblem" />
+              <div>
+                <div class="manual-rank-title" id="manual-rank-title">SPY (SECRET AGENT)</div>
+                <div class="manual-rank-rule" id="manual-rank-rule">
+                  Eliminates all Officers (5★ down to Sergeant) &amp; Flag • Eliminated ONLY by Private!
+                </div>
               </div>
             </div>
             <div class="manual-legend-badges" id="manual-stats-row"></div>
@@ -724,6 +894,8 @@ export class UIManager {
             </div>
           </div>
 
+          <div class="dossier-casualties-strip" id="dossier-casualties" hidden></div>
+
           <div class="dossier-actions-row">
             <button type="button" class="primary-brass-cta cta-sheen" id="btn-dossier-replay">
               DECLASSIFIED X-RAY REPLAY
@@ -753,14 +925,14 @@ export class UIManager {
           </div>
         </div>
 
-        <!-- Selected Friendly Unit Micro-Strip (Floats cleanly above Bottom Safe-Zone Dock) -->
+        <!-- Selected Friendly Unit Micro-Strip -->
         <div class="selected-unit-strip" id="selected-unit-strip" hidden>
           <span class="sel-unit-name" id="sel-unit-name">5-STAR GENERAL</span>
           <span class="sel-unit-sep">•</span>
           <span class="sel-unit-rule" id="sel-unit-rule">Outranks all officers &amp; Privates</span>
         </div>
 
-        <!-- In-Match Safe-Zone Bottom Dock (INTEL LEDGER | DECLASSIFIED LOG | SURRENDER | SETTINGS) -->
+        <!-- In-Match Safe-Zone Bottom Dock -->
         <nav class="play-bottom-dock" id="play-bottom-dock" aria-label="Tactical Command Controls" hidden>
           <button type="button" class="dock-btn" id="btn-dock-intel">
             <span class="dock-btn-icon">▤</span>
@@ -790,11 +962,18 @@ export class UIManager {
     this.titleMainCards = this.root.querySelector('#title-main-cards')!;
     this.titleSkirmishPanel = this.root.querySelector('#title-sub-skirmish')!;
     this.titleCampaignPanel = this.root.querySelector('#title-sub-campaign')!;
+    this.titleOpsPanel = this.root.querySelector('#title-sub-operations')!;
     this.skirmishGrid = this.root.querySelector('#skirmish-cmd-grid')!;
     this.campaignGrid = this.root.querySelector('#campaign-cmd-grid')!;
     this.campaignStatsBadge = this.root.querySelector('#campaign-stats-badge')!;
+    this.opsGrid = this.root.querySelector('#ops-grid')!;
+    this.opsBriefingBox = this.root.querySelector('#ops-briefing-box')!;
+    this.opsStatsBadge = this.root.querySelector('#ops-stats-badge')!;
     this.titleFsBtn = this.root.querySelector('#btn-title-fs')!;
     this.titleMuteBtn = this.root.querySelector('#btn-title-mute')!;
+    this.titleRefreshBtn = this.root.querySelector('#btn-title-refresh')!;
+    this.titleUpdateDot = this.root.querySelector('#title-update-dot')!;
+    this.titleUpdateToast = this.root.querySelector('#title-update-toast')!;
 
     this.topUtilityBar = this.root.querySelector('#top-utility-bar')!;
     this.modeTitleLabel = this.root.querySelector('#mode-title-label')!;
@@ -807,9 +986,11 @@ export class UIManager {
     this.countdownVal = this.root.querySelector('#val-countdown')!;
     this.centerStatePill = this.root.querySelector('#pill-turn-state')!;
     this.centerStateText = this.root.querySelector('#text-turn-state')!;
+    this.opTurnCounter = this.root.querySelector('#op-turn-counter')!;
     this.turnProgressFill = this.root.querySelector('#turn-progress-fill')!;
     this.roundTimerPill = this.root.querySelector('#pill-round-timer')!;
     this.roundTimerVal = this.root.querySelector('#val-round-timer')!;
+    this.skipCutsceneBtn = this.root.querySelector('#btn-skip-cutscene')!;
 
     this.suspectWheel = this.root.querySelector('#suspect-wheel')!;
     this.shroudOverlay = this.root.querySelector('#command-shroud')!;
@@ -834,6 +1015,7 @@ export class UIManager {
     this.armoryBackBtn = this.root.querySelector('#btn-armory-back')!;
 
     this.manualSheet = this.root.querySelector('#manual-sheet')!;
+    this.manualRankThumb = this.root.querySelector('#manual-rank-thumb')!;
     this.manualRankTitle = this.root.querySelector('#manual-rank-title')!;
     this.manualRankRule = this.root.querySelector('#manual-rank-rule')!;
     this.manualStatsRow = this.root.querySelector('#manual-stats-row')!;
@@ -844,6 +1026,7 @@ export class UIManager {
     this.dossierTitle = this.root.querySelector('#dossier-title')!;
     this.dossierMethod = this.root.querySelector('#dossier-method')!;
     this.dossierMedalBanner = this.root.querySelector('#dossier-medal')!;
+    this.dossierCasualtiesStrip = this.root.querySelector('#dossier-casualties')!;
     this.dossierStatTurns = this.root.querySelector('#d-stat-turns')!;
     this.dossierStatClashes = this.root.querySelector('#d-stat-clashes')!;
     this.dossierStatOfficer = this.root.querySelector('#d-stat-officer')!;
@@ -864,6 +1047,7 @@ export class UIManager {
     this.surrenderFill = this.root.querySelector('#surrender-hold-fill')!;
 
     this.bindEvents();
+    void this.checkForUpdates(false);
   }
 
   public openSuspectWheel(pieceId: string, clientX: number, clientY: number): void {
@@ -890,9 +1074,10 @@ export class UIManager {
   }
 
   public render(view: PlayerVisibleView, options: Readonly<AppOptions>): void {
-    const inTitle = view.phase === 'TITLE';
     const inArbiter = view.cameraMode === 'ARBITER';
     const inInspect = view.cameraMode === 'INSPECT_16';
+    // Bug 1 Fix: Hide Start Screen whenever 16-Rank Gallery or Arbiter Showcase is open from TITLE
+    const inTitle = view.phase === 'TITLE' && !inInspect && !inArbiter;
     const inPlay = view.phase === 'PLAY' && !inInspect;
     const inDeploy = (view.phase === 'DEPLOY' || view.phase === 'ARMORY') && !inInspect && !inArbiter;
     const inManual = view.phase === 'FIELD_MANUAL' && !inInspect;
@@ -903,26 +1088,37 @@ export class UIManager {
     document.body.dataset['handedness'] = options.handedness;
     document.body.dataset['era'] = options.eraMode;
 
+    // Bug 3 Fix: Preserve SHOWCASE & OPTIONS drawers when a background AI turn triggers ARBITER
     if (inArbiter) {
-      this.activeDrawer = 'NONE';
+      if (this.activeDrawer !== 'SHOWCASE' && this.activeDrawer !== 'OPTIONS') {
+        this.activeDrawer = 'NONE';
+      }
       this.closeSuspectWheel();
     }
 
-    // 1. Live 3D Start Screen
+    // F19 Any-Time Cutscene Skip Pill
+    this.skipCutsceneBtn.hidden = !inArbiter;
+
+    // 1. Live 3D Heroic Start Screen
     this.titleScreen.hidden = !inTitle;
+    this.titleScreen.dataset['subview'] = this.titleSubView;
     if (inTitle) {
       this.titleMainCards.hidden = this.titleSubView !== 'ROOT';
       this.titleSkirmishPanel.hidden = this.titleSubView !== 'SKIRMISH';
       this.titleCampaignPanel.hidden = this.titleSubView !== 'CAMPAIGN';
+      this.titleOpsPanel.hidden = this.titleSubView !== 'OPERATIONS';
       this.titleMuteBtn.innerHTML = options.audioMuted ? ICON_AUDIO_MUTED : ICON_AUDIO_ON;
       this.titleFsBtn.innerHTML = this.fullscreenActive
         ? ICON_FULLSCREEN_EXIT
         : ICON_FULLSCREEN_ENTER;
 
       this.syncTitleCampaignAndSkirmish(view, options);
+      if (this.titleSubView === 'OPERATIONS') {
+        this.syncOperationsPanel(view);
+      }
     }
 
-    // 2. Top Utility Header (Non-Title, Non-Play screens)
+    // 2. Top Utility Header (Non-Title, Non-Play screens — including INSPECT_16 launched from TITLE)
     const showUtilityTop = !inTitle && !inPlay && !inArbiter;
     this.topUtilityBar.hidden = !showUtilityTop;
     if (showUtilityTop) {
@@ -937,10 +1133,11 @@ export class UIManager {
       } else if (inGameOver) {
         this.modeTitleLabel.textContent = 'AFTER-ACTION DOSSIER';
       } else {
+        const playerUpper = PIECE_COLOR_SPECS[view.playerPieceColor].upperLabel;
         const facTag =
           view.matchMode === 'PASS_AND_PLAY'
             ? view.viewingFaction === 'PLAYER'
-              ? 'NAVY DEPLOYMENT'
+              ? `${playerUpper} DEPLOYMENT`
               : 'CRIMSON DEPLOYMENT'
             : 'TACTICAL DEPLOYMENT';
         this.modeTitleLabel.textContent = facTag;
@@ -960,7 +1157,7 @@ export class UIManager {
         : ICON_FULLSCREEN_ENTER;
     }
 
-    // 3. In-Match Top Safe-Zone Trio (`COUNTDOWN` | `STATE + PROGRESS` | `ROUND TIMER`)
+    // 3. In-Match Top Safe-Zone Trio
     const showTopTrio = inPlay || inArbiter;
     this.playTopTrio.hidden = !showTopTrio;
     if (showTopTrio) {
@@ -979,17 +1176,15 @@ export class UIManager {
         this.turnProgressFill.style.width = `${inArbiter ? 100 : pct}%`;
       }
 
-      document.body.dataset['handedness'] = options.handedness;
-    document.body.dataset['era'] = options.eraMode;
-
-    if (inArbiter) {
+      if (inArbiter) {
         this.centerStateText.textContent =
           view.banner === 'ARBITRATING' ? 'ARBITRATING' : view.banner;
         this.centerStatePill.dataset['tone'] =
           view.banner.includes('VICTORY') || view.banner === 'BATTLE WINNER' ? 'gold' : 'crimson';
       } else if (view.matchMode === 'PASS_AND_PLAY') {
+        const playerUpper = PIECE_COLOR_SPECS[view.playerPieceColor].upperLabel;
         this.centerStateText.textContent =
-          view.activeTurn === 'PLAYER' ? 'NAVY TURN' : 'CRIMSON TURN';
+          view.activeTurn === 'PLAYER' ? `${playerUpper} TURN` : 'CRIMSON TURN';
         this.centerStatePill.dataset['tone'] =
           view.activeTurn === 'PLAYER' ? 'player' : 'enemy';
       } else if (view.activeTurn === 'ENEMY') {
@@ -999,20 +1194,29 @@ export class UIManager {
         this.centerStateText.textContent = 'YOUR TURN';
         this.centerStatePill.dataset['tone'] = 'player';
       }
+
+      // Sibling Operation Turn-Limit Counter (keeps `#text-turn-state` strictly pure)
+      if (view.matchMode === 'OPERATION' && view.operationTurnLimit !== null && !inArbiter) {
+        this.opTurnCounter.hidden = false;
+        this.opTurnCounter.textContent = `OP PLY ${view.turnCount} / ${view.operationTurnLimit}`;
+      } else {
+        this.opTurnCounter.hidden = true;
+      }
     }
 
     // 4. Pass & Play Brass Privacy Command Shroud
     this.shroudOverlay.hidden = !shrouded;
     if (shrouded && view.shroud) {
+      const playerUpper = PIECE_COLOR_SPECS[view.playerPieceColor].upperLabel;
       this.shroudBadge.textContent =
         view.shroud.nextFaction === 'PLAYER'
-          ? 'EYES ONLY // NAVY HIGH COMMAND'
+          ? `EYES ONLY // ${playerUpper} HIGH COMMAND`
           : 'EYES ONLY // CRIMSON HIGH COMMAND';
       this.shroudHeadline.textContent = view.shroud.headline;
       this.shroudSubline.textContent = view.shroud.subline;
     }
 
-    // 5. Pop-up Smoked-Glass Sheets (`INTEL`, `LOG`, `OPTIONS`, `SHOWCASE`)
+    // 5. Pop-up Smoked-Glass Sheets
     this.bottomStack.hidden = shrouded;
     this.sheetIntel.hidden = this.activeDrawer !== 'INTEL';
     this.sheetLog.hidden = this.activeDrawer !== 'LOG';
@@ -1026,16 +1230,17 @@ export class UIManager {
       this.renderCombatLog(view);
     }
 
-    // 6. Mobilization Crate Drawer (`DEPLOY` & `ARMORY`)
-    this.mobilizationDrawer.hidden = !inDeploy || shrouded;
+    // 6. Mobilization Crate Drawer (hide whenever an overlay drawer is open)
+    this.mobilizationDrawer.hidden = !inDeploy || shrouded || this.activeDrawer !== 'NONE';
     if (inDeploy && !shrouded) {
+      const playerUpper = PIECE_COLOR_SPECS[view.playerPieceColor].upperLabel;
       const ready = view.deployedCount === ARMY_PIECE_TOTAL;
       const isArmory = view.phase === 'ARMORY';
       this.mobHeaderLabel.textContent = isArmory
         ? 'ARMORY WORKSHOP'
         : view.matchMode === 'PASS_AND_PLAY'
           ? view.viewingFaction === 'PLAYER'
-            ? 'NAVY CRATE'
+            ? `${playerUpper} CRATE`
             : 'CRIMSON CRATE'
           : 'MOBILIZATION';
       this.deployCountBadge.textContent = `${view.deployedCount} / ${ARMY_PIECE_TOTAL}`;
@@ -1070,16 +1275,19 @@ export class UIManager {
       } else if (isArmory) {
         this.launchBattleBtn.textContent = 'TEST FORMATION IN SKIRMISH';
       } else if (view.matchMode === 'PASS_AND_PLAY' && view.viewingFaction === 'PLAYER') {
-        this.launchBattleBtn.textContent = 'SEAL NAVY & PASS TO CRIMSON';
+        const playerUpper = PIECE_COLOR_SPECS[view.playerPieceColor].upperLabel;
+        this.launchBattleBtn.textContent = `SEAL ${playerUpper} & PASS TO CRIMSON`;
       } else {
         this.launchBattleBtn.textContent = 'READY TO LAUNCH — ENGAGE';
       }
     }
 
-    // 7. Interactive 3D Field Manual & Ranks Sheet
-    this.manualSheet.hidden = !inManual;
+    // 7. Interactive 3D Field Manual & Ranks Sheet (hide whenever an overlay drawer is open)
+    this.manualSheet.hidden = !inManual || this.activeDrawer !== 'NONE';
     if (inManual) {
       const selSpec = RANK_SPECS[view.manualSelectedRank];
+      this.manualRankThumb.src = `./ranks/${view.manualSelectedRank}.webp`;
+      this.manualRankThumb.alt = selSpec.name;
       this.manualRankTitle.textContent = selSpec.name.toUpperCase();
       this.manualRankRule.textContent = selSpec.tacticalRule;
 
@@ -1113,8 +1321,9 @@ export class UIManager {
         });
     }
 
-    // 8. End-of-War Classified Military Dossier
-    this.dossierCard.hidden = !inGameOver || !view.dossier;
+    // 8. End-of-War Classified Military Dossier (hide whenever an overlay drawer is open)
+    this.dossierCard.hidden =
+      !inGameOver || !view.dossier || shrouded || this.activeDrawer !== 'NONE';
     if (inGameOver && view.dossier) {
       const d = view.dossier;
       this.dossierCard.dataset['victory'] = String(d.playerWon);
@@ -1123,7 +1332,12 @@ export class UIManager {
       this.dossierMethod.textContent = `${d.winMethod} • ${d.detailNote}`;
       if (d.campaignMedalUnlocked) {
         this.dossierMedalBanner.hidden = false;
-        this.dossierMedalBanner.textContent = `★ CAMPAIGN MEDAL AWARDED: ${d.campaignMedalUnlocked.toUpperCase()}`;
+        const starsStr = d.starsEarned ? ` • ${renderStarsText(d.starsEarned)}` : '';
+        this.dossierMedalBanner.textContent = `★ CAMPAIGN MEDAL AWARDED: ${d.campaignMedalUnlocked.toUpperCase()}${starsStr}`;
+      } else if (d.operationId && d.starsEarned) {
+        this.dossierMedalBanner.hidden = false;
+        const opSpec = getTacticalOperation(d.operationId);
+        this.dossierMedalBanner.textContent = `${opSpec?.codeName ?? 'OPERATION'} CLEARED • ${renderStarsText(d.starsEarned)}`;
       } else {
         this.dossierMedalBanner.hidden = true;
       }
@@ -1133,10 +1347,36 @@ export class UIManager {
       );
       this.dossierStatOfficer.textContent = d.survivingHighOfficer;
       this.dossierStatTime.textContent = d.matchDurationFormatted;
+
+      // Render non-leaking casualty rank thumbnails (`enemyCasualties` strictly uses `UNKNOWN.webp`)
+      const pCas = view.playerCasualties.slice(0, 8);
+      const eCas = view.enemyCasualties.slice(0, 8);
+      if (pCas.length > 0 || eCas.length > 0) {
+        this.dossierCasualtiesStrip.hidden = false;
+        const playerUpper = PIECE_COLOR_SPECS[view.playerPieceColor].upperLabel;
+        const pHtml = pCas
+          .map(
+            (c) =>
+              `<img class="cas-rank-thumb navy" src="./ranks/${c.visibleRank}.webp" alt="${playerUpper} Casualty" />`
+          )
+          .join('');
+        const eHtml = eCas
+          .map(
+            (c) =>
+              `<img class="cas-rank-thumb crimson" src="./ranks/${c.visibleRank}.webp" alt="Enemy Casualty" />`
+          )
+          .join('');
+        this.dossierCasualtiesStrip.innerHTML = `
+          <span class="cas-group"><span class="cas-lbl">${playerUpper} LOSSES</span>${pHtml || '<span class="cas-none">0</span>'}</span>
+          <span class="cas-group"><span class="cas-lbl">CRIMSON LOSSES</span>${eHtml || '<span class="cas-none">0</span>'}</span>
+        `;
+      } else {
+        this.dossierCasualtiesStrip.hidden = true;
+      }
     }
 
-    // 9. Declassified X-Ray Replay Scrubber
-    this.replayBar.hidden = !inReplay || !view.replay;
+    // 9. Declassified X-Ray Replay Scrubber (hide whenever an overlay drawer is open)
+    this.replayBar.hidden = !inReplay || !view.replay || this.activeDrawer !== 'NONE';
     if (inReplay && view.replay) {
       const rep = view.replay;
       const curEntry = rep.plies[rep.currentPly];
@@ -1148,11 +1388,11 @@ export class UIManager {
       this.replayPlayBtn.dataset['active'] = String(rep.playing);
     }
 
-    // 10. In-Match Safe-Zone Bottom Dock + Selected Unit Strip
+    // 10. In-Match Safe-Zone Bottom Dock + Selected Unit Strip (hide strip whenever an overlay drawer is open)
     const showPlayDock = inPlay && !inArbiter && !shrouded;
     this.playBottomDock.hidden = !showPlayDock;
 
-    if (showPlayDock && view.selectedPieceId) {
+    if (showPlayDock && this.activeDrawer === 'NONE' && view.selectedPieceId) {
       const sel = view.pieces.find((p) => p.id === view.selectedPieceId);
       if (sel && sel.visibleRank !== 'UNKNOWN') {
         const spec = RANK_SPECS[sel.visibleRank];
@@ -1186,16 +1426,23 @@ export class UIManager {
           : '1970s Classic: Contested Flag on back rank stays unrevealed & must survive 1 opponent turn!';
     }
 
+    const effectiveTheater =
+      view.phase === 'PLAY' || view.phase === 'DEPLOY' ? view.theaterId : options.theaterId;
+
     this.syncSeg('#seg-skirmish-era button', 'skEra', options.eraMode);
     this.syncSeg('#seg-skirmish-diff button', 'skDiff', options.difficulty);
+    this.syncSeg('#seg-skirmish-color button', 'pieceColor', options.pieceColor);
     this.syncSeg('#seg-fullscreen button', 'fs', String(this.fullscreenActive));
+    this.syncSeg('#seg-frame-mode button', 'frameMode', options.viewportFrameMode);
     this.syncSeg('#seg-view button', 'view', options.boardView);
     this.syncSeg('#seg-era button', 'era', options.eraMode);
     this.syncSeg('#seg-finish button', 'finish', options.boardFinish);
+    this.syncSeg('#seg-piece-color button', 'pieceColor', options.pieceColor);
     this.syncSeg('#seg-difficulty button', 'diff', options.difficulty);
     this.syncSeg('#seg-handedness button', 'hand', options.handedness);
     this.syncSeg('#seg-clocks button', 'clock', options.clockPreset);
-    this.syncSeg('#seg-quality button', 'quality', options.renderQuality);
+    this.syncSeg('#seg-quality button', 'quality', options.qualityMode);
+    this.syncSeg('#seg-theater button', 'theater', effectiveTheater);
     this.syncSeg('#seg-haptics button', 'haptics', String(options.hapticsEnabled));
     this.syncSeg('#seg-speed button', 'speed', options.arbiterSpeed);
     this.syncSeg('#seg-mute button', 'mute', String(options.audioMuted));
@@ -1216,64 +1463,142 @@ export class UIManager {
   ): void {
     const camp = view.campaign;
     const medalsCount = Object.values(camp.records).filter((r) => r.medalEarned).length;
+    const totalStars = Object.values(camp.records).reduce((sum, r) => sum + (r.stars ?? 0), 0);
     const totalGames = camp.totalWins + camp.totalLosses;
     const winPct = totalGames > 0 ? Math.round((camp.totalWins / totalGames) * 100) : 0;
 
     const menuSub = this.root.querySelector('#menu-campaign-sub');
     if (menuSub) {
-      menuSub.textContent = `Tier ${camp.unlockedTier}/6 Unlocked • ${medalsCount}/6 Medals • ${winPct}% Win`;
+      menuSub.textContent = `T${camp.unlockedTier}/6 • ${medalsCount}/6 Medals • ${totalStars}/18★`;
     }
-    this.campaignStatsBadge.textContent = `MEDALS ${medalsCount}/6 • WIN ${winPct}%`;
+    this.campaignStatsBadge.textContent = `${medalsCount}/6 MEDALS • ${totalStars}/18★ • ${winPct}%`;
 
     const activeCmd = getCommanderProfile(view.commanderId);
-    const skSummary = this.root.querySelector('#skirmish-cmd-summary');
-    if (skSummary) {
-      skSummary.textContent = `${activeCmd.fullName} ("${activeCmd.moniker}") — ${activeCmd.summary}`;
-    }
-    const campSummary = this.root.querySelector('#campaign-cmd-summary');
-    if (campSummary) {
-      campSummary.textContent = `${activeCmd.fullName} ("${activeCmd.moniker}") — ${activeCmd.summary}`;
+    const activeTheater = getBattleTheater(activeCmd.theaterId);
+
+    if (this.titleSubView === 'SKIRMISH') {
+      const skSummary = this.root.querySelector('#skirmish-cmd-summary');
+      if (skSummary) {
+        skSummary.innerHTML = `
+          <span class="cmd-dossier-portrait">
+            <img src="${activeCmd.portraitUrl}" alt="${activeCmd.fullName}" />
+          </span>
+          <span class="cmd-dossier-copy">
+            <strong class="cmd-dossier-name">${activeCmd.fullName} — "${activeCmd.moniker}"</strong>
+            <span class="cmd-dossier-text">${activeCmd.tacticalBriefing}</span>
+          </span>
+        `;
+      }
+
+      this.skirmishGrid
+        .querySelectorAll<HTMLButtonElement>('[data-skirmish-cmd]')
+        .forEach((btn) => {
+          btn.dataset['selected'] = String(btn.dataset['skirmishCmd'] === view.commanderId);
+        });
     }
 
-    this.skirmishGrid
-      .querySelectorAll<HTMLButtonElement>('[data-skirmish-cmd]')
-      .forEach((btn) => {
-        btn.dataset['selected'] = String(btn.dataset['skirmishCmd'] === view.commanderId);
-      });
+    if (this.titleSubView === 'CAMPAIGN') {
+      const campSummary = this.root.querySelector('#campaign-cmd-summary');
+      if (campSummary) {
+        campSummary.innerHTML = `
+          <span class="cmd-dossier-portrait">
+            <img src="${activeCmd.portraitUrl}" alt="${activeCmd.fullName}" />
+          </span>
+          <span class="cmd-dossier-copy">
+            <strong class="cmd-dossier-name">${activeCmd.fullName} • ${activeTheater.name}</strong>
+            <span class="cmd-dossier-text">${activeCmd.missionModifier.label}: ${activeCmd.tacticalBriefing}</span>
+          </span>
+        `;
+      }
 
-    // Rebuild Campaign 6-Tier Grid cleanly with Tactical Portraits & Monikers
-    this.campaignGrid.innerHTML = COMMANDER_ROSTER.map((c) => {
-      const unlocked = c.tier <= camp.unlockedTier;
-      const rec = camp.records[c.id];
-      const selected = view.commanderId === c.id && unlocked;
+      this.campaignGrid.innerHTML = COMMANDER_ROSTER.map((c) => {
+        const unlocked = c.tier <= camp.unlockedTier;
+        const rec = camp.records[c.id];
+        const selected = view.commanderId === c.id && unlocked;
+        const starsBadge = rec.stars > 0 ? renderStarsText(rec.stars) : rec.medalEarned ? '★ MEDAL' : `"${c.moniker}"`;
+        return `
+          <button
+            type="button"
+            class="cmd-select-card"
+            data-campaign-cmd="${c.id}"
+            data-selected="${selected}"
+            data-locked="${!unlocked}"
+            ${!unlocked ? 'disabled' : ''}
+          >
+            <span class="cmd-portrait-box">
+              <img src="${c.portraitUrl}" alt="${c.fullName}" loading="eager" />
+            </span>
+            <span class="cmd-card-meta">
+              <span class="cmd-card-top">
+                <span class="cmd-tier-tag">${unlocked ? `T${c.tier}` : '🔒'}</span>
+                <span class="cmd-doctrine-tag">${starsBadge}</span>
+              </span>
+              <span class="cmd-card-name">${c.fullName}</span>
+            </span>
+          </button>
+        `;
+      }).join('');
+
+      this.campaignGrid
+        .querySelectorAll<HTMLButtonElement>('[data-campaign-cmd]')
+        .forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const cid = btn.dataset['campaignCmd'] as CommanderId;
+            this.sound.playUiClick();
+            this.store.setSelectedCommander(cid);
+          });
+        });
+    }
+  }
+
+  private syncOperationsPanel(view: PlayerVisibleView): void {
+    const progress = view.operationsProgress;
+    let cleared = 0;
+    let totalStars = 0;
+    for (const op of TACTICAL_OPERATIONS) {
+      const rec = progress[op.id];
+      if (rec?.completed) cleared += 1;
+      totalStars += rec?.bestStars ?? 0;
+    }
+    this.opsStatsBadge.textContent = `${cleared}/${TACTICAL_OPERATIONS.length} CLEARED • ${totalStars}/${TACTICAL_OPERATIONS.length * 3}★`;
+
+    this.opsGrid.innerHTML = TACTICAL_OPERATIONS.map((op) => {
+      const rec = progress[op.id];
+      const stars = rec?.bestStars ?? 0;
+      const theater = getBattleTheater(op.theaterId);
+      const selected = this.selectedOperationId === op.id;
       return `
         <button
           type="button"
-          class="cmd-select-card"
-          data-campaign-cmd="${c.id}"
+          class="op-select-card operation-card"
+          data-operation-id="${op.id}"
+          data-operation="${op.id}"
+          data-objective="${op.objectiveKind}"
           data-selected="${selected}"
-          data-locked="${!unlocked}"
-          ${!unlocked ? 'disabled' : ''}
         >
-          <span class="cmd-portrait-box">${c.portraitSvg}</span>
-          <span class="cmd-card-meta">
-            <span class="cmd-card-top">
-              <span class="cmd-tier-tag">${unlocked ? `T${c.tier}` : '🔒'}</span>
-              <span class="cmd-doctrine-tag">${rec.medalEarned ? '★ MEDAL' : `"${c.moniker}"`}</span>
-            </span>
-            <span class="cmd-card-name">${c.fullName}</span>
+          <span class="op-card-top">
+            <span class="op-code">${op.codeName}</span>
+            <span class="op-stars">${stars > 0 ? renderStarsText(stars) : `${op.turnLimit}P`}</span>
           </span>
+          <span class="op-title">${op.title}</span>
+          <span class="op-meta">${theater.name} • ${op.eraRuleset}</span>
         </button>
       `;
     }).join('');
 
-    this.campaignGrid
-      .querySelectorAll<HTMLButtonElement>('[data-campaign-cmd]')
+    const activeOp = getTacticalOperation(this.selectedOperationId) ?? TACTICAL_OPERATIONS[0]!;
+    const activeTheater = getBattleTheater(activeOp.theaterId);
+    const activeCmd = getCommanderProfile(activeOp.commanderId);
+    this.opsBriefingBox.textContent =
+      `${activeOp.title} vs ${activeCmd.fullName} (${activeTheater.name}, ${activeOp.eraRuleset}): ${activeOp.briefing} Objective: ${activeOp.objectiveSummary}`;
+
+    this.opsGrid
+      .querySelectorAll<HTMLButtonElement>('[data-operation-id]')
       .forEach((btn) => {
         btn.addEventListener('click', () => {
-          const cid = btn.dataset['campaignCmd'] as CommanderId;
+          this.selectedOperationId = btn.dataset['operationId'] ?? TACTICAL_OPERATIONS[0]!.id;
           this.sound.playUiClick();
-          this.store.setSelectedCommander(cid);
+          this.render(this.store.getVisibleView(), this.store.getOptions());
         });
       });
   }
@@ -1281,13 +1606,23 @@ export class UIManager {
   private renderIntelLedger(view: PlayerVisibleView): void {
     const L = view.intelLedger;
     const cmd = getCommanderProfile(view.commanderId);
-    const ownLabel = view.viewingFaction === 'PLAYER' ? 'NAVY COMMAND' : 'CRIMSON COMMAND';
+    const playerUpper = PIECE_COLOR_SPECS[view.playerPieceColor].upperLabel;
+    const ownLabel = view.viewingFaction === 'PLAYER' ? `${playerUpper} COMMAND` : 'CRIMSON COMMAND';
     const oppLabel =
       view.matchMode === 'PASS_AND_PLAY'
         ? view.viewingFaction === 'PLAYER'
           ? 'CRIMSON (SEALED)'
-          : 'NAVY (SEALED)'
+          : `${playerUpper} (SEALED)`
         : `${cmd.fullName.toUpperCase()} ("${cmd.moniker.toUpperCase()}")`;
+    const ownCasHtml = view.playerCasualties
+      .slice(0, 8)
+      .map((c) => `<img class="cas-rank-thumb navy" src="./ranks/${c.visibleRank}.webp" alt="Loss" />`)
+      .join('');
+    const enemyCasHtml = view.enemyCasualties
+      .slice(0, 8)
+      .map((c) => `<img class="cas-rank-thumb crimson" src="./ranks/${c.visibleRank}.webp" alt="Unconfirmed Loss" />`)
+      .join('');
+
     this.intelBody.innerHTML = `
       <div class="intel-col">
         <div class="intel-col-hdr cyan">${ownLabel}</div>
@@ -1295,6 +1630,7 @@ export class UIManager {
         <div class="intel-kv"><span>Privates Active</span><strong>${L.ownPrivatesAlive}</strong></div>
         <div class="intel-kv"><span>Spies Active</span><strong>${L.ownSpiesAlive}</strong></div>
         <div class="intel-kv"><span>Flag Status</span><strong>${L.ownFlagAlive ? 'SECURED' : 'LOST'}</strong></div>
+        <div class="intel-casualty-row">${ownCasHtml}</div>
       </div>
       <div class="intel-col">
         <div class="intel-col-hdr crimson">${oppLabel}</div>
@@ -1302,6 +1638,7 @@ export class UIManager {
         <div class="intel-kv"><span>Confirmed Eliminated</span><strong>${L.enemyEliminatedTotal}</strong></div>
         <div class="intel-kv"><span>Blooded Veterans (★)</span><strong>${L.enemyVeteranCount}</strong></div>
         <div class="intel-kv"><span>Tagged Suspects</span><strong>${L.enemyTaggedCount}</strong></div>
+        <div class="intel-casualty-row">${enemyCasHtml}</div>
       </div>
     `;
   }
@@ -1362,11 +1699,18 @@ export class UIManager {
   }
 
   private bindEvents(): void {
-    // 1. Title Screen Main 6 Command Cards
+    // 1. Title Screen Sculpted Command Blades
     this.root.querySelector('#btn-menu-skirmish')?.addEventListener('click', () => {
       this.sound.unlock();
       this.sound.playDrawerSlide(true);
       this.titleSubView = 'SKIRMISH';
+      this.render(this.store.getVisibleView(), this.store.getOptions());
+    });
+
+    this.root.querySelector('#btn-menu-operations')?.addEventListener('click', () => {
+      this.sound.unlock();
+      this.sound.playDrawerSlide(true);
+      this.titleSubView = 'OPERATIONS';
       this.render(this.store.getVisibleView(), this.store.getOptions());
     });
 
@@ -1442,6 +1786,16 @@ export class UIManager {
       });
     });
 
+    this.root
+      .querySelectorAll<HTMLButtonElement>('#seg-skirmish-color button, #seg-piece-color button')
+      .forEach((b) => {
+        b.addEventListener('click', () => {
+          const pieceColor = b.dataset['pieceColor'] as PieceColorId;
+          this.sound.playUiClick();
+          this.store.updateOptions({ pieceColor });
+        });
+      });
+
     this.root.querySelector('#btn-start-skirmish')?.addEventListener('click', () => {
       this.sound.playDrawerSlide(true);
       this.titleSubView = 'ROOT';
@@ -1460,6 +1814,18 @@ export class UIManager {
       }
     });
 
+    this.root.querySelector('#btn-start-operation')?.addEventListener('click', () => {
+      this.sound.playDrawerSlide(true);
+      this.titleSubView = 'ROOT';
+      this.activeDrawer = 'NONE';
+      this.store.startOperation(this.selectedOperationId);
+    });
+
+    this.titleRefreshBtn.addEventListener('click', () => {
+      this.sound.unlock();
+      this.sound.playUiClick();
+      void this.checkForUpdates(true);
+    });
     this.titleFsBtn.addEventListener('click', () => {
       this.sound.playUiClick();
       this.setFullscreenState(!this.fullscreenActive);
@@ -1471,7 +1837,7 @@ export class UIManager {
       this.store.updateOptions({ audioMuted: nextMute });
     });
 
-    // 2. Top Utility Header Controls
+    // 2. Top Utility Header & Camera Reset Controls
     const goMainMenu = () => {
       this.sound.playDrawerSlide(false);
       this.activeDrawer = 'NONE';
@@ -1490,6 +1856,19 @@ export class UIManager {
     });
     this.root.querySelector('#btn-opt-showcase')?.addEventListener('click', () => {
       this.toggleDrawer('SHOWCASE');
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>('[data-reset-camera]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        this.sound.playUiClick();
+        this.callbacks.onResetCamera?.();
+      });
+    });
+
+    this.skipCutsceneBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      this.sound.playUiClick();
+      this.callbacks.onSkipArbiter?.();
     });
 
     this.topViewBtn.addEventListener('click', () => {
@@ -1511,7 +1890,7 @@ export class UIManager {
       this.store.unsealCommandShroud();
     });
 
-    // 4. Bottom Dock Controls + 2-Step Hold-to-Confirm Surrender!
+    // 4. Bottom Dock Controls + 2-Step Hold-to-Confirm Surrender
     this.root.querySelector('#btn-dock-intel')?.addEventListener('click', () => {
       this.toggleDrawer('INTEL');
     });
@@ -1710,11 +2089,14 @@ export class UIManager {
       this.store.setReplayPly(maxPly);
     });
 
-    // 9. Showcase & Options Bindings
+    // 9. Showcase & Options Bindings (Bug 3 + Bug 1 Fixes)
     this.sheetShowcase.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const preset = btn.dataset['preset'] as ShowcasePreset;
         this.activeDrawer = 'NONE';
+        if (this.store.getVisibleView().cameraMode === 'ARBITER') {
+          this.callbacks.onSkipArbiter?.();
+        }
         const verdict = this.store.triggerShowcaseClash(preset);
         if (verdict) {
           this.callbacks.onTriggerVerdict(verdict);
@@ -1725,8 +2107,16 @@ export class UIManager {
     this.root.querySelector('#btn-inspect-16')?.addEventListener('click', () => {
       this.sound.playUiClick();
       this.activeDrawer = 'NONE';
-      const cur = this.store.getVisibleView().cameraMode;
-      this.store.setCameraMode(cur === 'INSPECT_16' ? 'PLAY' : 'INSPECT_16');
+      const view = this.store.getVisibleView();
+      if (view.cameraMode === 'INSPECT_16') {
+        if (view.phase === 'TITLE') {
+          this.store.returnToTitleMenu();
+        } else {
+          this.store.setCameraMode('PLAY');
+        }
+      } else {
+        this.store.setCameraMode('INSPECT_16');
+      }
     });
 
     const onFsChange = () => {
@@ -1747,6 +2137,13 @@ export class UIManager {
 
     window.addEventListener('keydown', (ev) => {
       if (ev.repeat || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+      if (this.store.getVisibleView().cameraMode === 'ARBITER') {
+        if (ev.key === ' ' || ev.code === 'Space' || ev.key === 'Enter' || ev.key === 'Escape') {
+          ev.preventDefault();
+          this.callbacks.onSkipArbiter?.();
+          return;
+        }
+      }
       if (ev.key === 'f' || ev.key === 'F') {
         this.sound.playUiClick();
         this.setFullscreenState(!this.fullscreenActive);
@@ -1762,6 +2159,14 @@ export class UIManager {
       b.addEventListener('click', () => {
         this.sound.playUiClick();
         this.setFullscreenState(b.dataset['fs'] === 'true');
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>('#seg-frame-mode button').forEach((b) => {
+      b.addEventListener('click', () => {
+        const viewportFrameMode = b.dataset['frameMode'] as ViewportFrameMode;
+        this.sound.playUiClick();
+        this.store.updateOptions({ viewportFrameMode });
       });
     });
 
@@ -1827,9 +2232,17 @@ export class UIManager {
 
     this.root.querySelectorAll<HTMLButtonElement>('#seg-quality button').forEach((b) => {
       b.addEventListener('click', () => {
-        const renderQuality = b.dataset['quality'] as AppOptions['renderQuality'];
+        const qualityMode = b.dataset['quality'] as QualityTier;
         this.sound.playUiClick();
-        this.store.updateOptions({ renderQuality });
+        this.store.updateOptions({ qualityMode });
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>('#seg-theater button').forEach((b) => {
+      b.addEventListener('click', () => {
+        const theaterId = b.dataset['theater'] as TheaterId;
+        this.sound.playUiClick();
+        this.store.setTheater(theaterId);
       });
     });
 
@@ -1880,7 +2293,27 @@ export class UIManager {
   }
 
   private bindTwoStepSurrender(): void {
-    const HOLD_DURATION_MS = 780;
+    const HOLD_DURATION_MS = 740;
+
+    // Bug 2 Fix: Block synthetic post-touchend click-through onto #dossier-card / #btn-dossier-menu
+    this.dossierCard.addEventListener(
+      'click',
+      (ev) => {
+        if (this.surrenderClickGuardActive) {
+          ev.preventDefault();
+          ev.stopPropagation();
+        }
+      },
+      true
+    );
+
+    const releaseClickGuard = (delayMs: number) => {
+      window.clearTimeout(this.surrenderClickGuardTimer);
+      this.surrenderClickGuardTimer = window.setTimeout(() => {
+        this.surrenderClickGuardActive = false;
+        this.dossierCard.style.pointerEvents = '';
+      }, delayMs);
+    };
 
     const resetHold = () => {
       this.surrenderHolding = false;
@@ -1897,16 +2330,25 @@ export class UIManager {
 
     const tickHold = () => {
       if (!this.surrenderHolding) return;
-      const elapsed = performance.now() - this.surrenderHoldStart;
-      const pct = Math.min(100, (elapsed / HOLD_DURATION_MS) * 100);
+      const tickNow = performance.now();
+      // Keep single-frame stall guard (`surrenderHoldTicks >= 3`) while allowing 3 FPS WebGL batch frames (`<= 480ms`) to complete a real 1150ms hold.
+      const frameDelta = Math.min(480, Math.max(0, tickNow - this.surrenderLastTickMs));
+      this.surrenderLastTickMs = tickNow;
+      this.surrenderHoldTicks += 1;
+      this.surrenderHoldAccumMs += frameDelta;
+      const pct = Math.min(100, (this.surrenderHoldAccumMs / HOLD_DURATION_MS) * 100);
       this.surrenderFill.style.width = `${pct}%`;
 
-      if (pct >= 100) {
+      if (pct >= 100 && this.surrenderHoldTicks >= 3) {
         this.surrenderHolding = false;
         this.surrenderArmedUntil = 0;
+        this.surrenderHoldAccumMs = 0;
         this.surrenderFill.style.width = '0%';
         this.surrenderLabel.textContent = 'SURRENDER';
         this.surrenderBtn.dataset['armed'] = 'false';
+        this.surrenderClickGuardActive = true;
+        this.dossierCard.style.pointerEvents = 'none';
+        releaseClickGuard(2500);
         this.sound.vibrate([40, 30, 65]);
         this.store.surrenderMatch();
         return;
@@ -1914,12 +2356,21 @@ export class UIManager {
       this.surrenderHoldRaf = requestAnimationFrame(tickHold);
     };
 
+    this.surrenderBtn.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+    });
+
     this.surrenderBtn.addEventListener('pointerdown', (ev) => {
       ev.preventDefault();
       this.sound.unlock();
-      const now = performance.now();
+      this.surrenderHoldingPointerId = ev.pointerId;
+      try {
+        this.surrenderBtn.setPointerCapture(ev.pointerId);
+      } catch {
+        // Synthetic test pointer events may not support capture
+      }
 
-      // Step 1: First tap arms the surrender lock for 3.5 seconds so stray thumb brushes never forfeit!
+      const now = performance.now();
       if (now >= this.surrenderArmedUntil) {
         this.surrenderArmedUntil = now + 3500;
         this.surrenderLabel.textContent = 'HOLD TO CONFIRM';
@@ -1934,20 +2385,123 @@ export class UIManager {
         return;
       }
 
-      // Step 2: Press-and-hold fills the brass-crimson confirmation bar!
       this.surrenderHolding = true;
-      this.surrenderHoldStart = now;
+      this.surrenderHoldAccumMs = 0;
+      this.surrenderHoldTicks = 0;
+      this.surrenderLastTickMs = now;
       this.sound.vibrate(14);
       cancelAnimationFrame(this.surrenderHoldRaf);
       this.surrenderHoldRaf = requestAnimationFrame(tickHold);
     });
 
-    window.addEventListener('pointerup', () => {
+    const onRelease = (ev?: PointerEvent) => {
+      if (this.surrenderHoldingPointerId !== null) {
+        try {
+          if (this.surrenderBtn.hasPointerCapture(this.surrenderHoldingPointerId)) {
+            this.surrenderBtn.releasePointerCapture(this.surrenderHoldingPointerId);
+          }
+        } catch {
+          // Ignore
+        }
+        if (!ev || ev.pointerId === this.surrenderHoldingPointerId) {
+          this.surrenderHoldingPointerId = null;
+        }
+      }
       if (this.surrenderHolding) resetHold();
-    });
-    window.addEventListener('pointercancel', () => {
+      if (this.surrenderClickGuardActive) {
+        releaseClickGuard(30);
+      }
+    };
+
+    window.addEventListener('pointerup', onRelease);
+    window.addEventListener('pointercancel', onRelease);
+    window.addEventListener('touchend', () => {
       if (this.surrenderHolding) resetHold();
+      if (this.surrenderClickGuardActive) {
+        releaseClickGuard(30);
+      }
     });
+  }
+
+  private showUpdateToast(message: string, autoDismissMs = 0): void {
+    window.clearTimeout(this.updateToastTimer);
+    this.titleUpdateToast.textContent = message;
+    this.titleUpdateToast.hidden = false;
+    if (autoDismissMs > 0) {
+      this.updateToastTimer = window.setTimeout(() => {
+        this.titleUpdateToast.hidden = true;
+      }, autoDismissMs);
+    }
+  }
+
+  private async checkForUpdates(interactive: boolean): Promise<void> {
+    if (typeof fetch !== 'function') return;
+    if (interactive && this.updateCheckInFlight) return;
+
+    if (interactive) {
+      this.updateCheckInFlight = true;
+      this.titleRefreshBtn.dataset['checking'] = 'true';
+      this.showUpdateToast('CHECKING FOR UPDATES…');
+    }
+
+    try {
+      const res = await fetch(`./version.json?t=${Date.now()}`, {
+        cache: 'no-store',
+        headers: { 'Cache-Control': 'no-cache' },
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const data = (await res.json()) as { buildId?: unknown };
+      const remoteBuildId = typeof data?.buildId === 'string' ? data.buildId : '';
+      if (!remoteBuildId) {
+        throw new Error('Malformed version manifest');
+      }
+
+      if (remoteBuildId === LOCAL_BUILD_ID) {
+        this.titleUpdateDot.hidden = true;
+        if (interactive) {
+          this.showUpdateToast(`UP TO DATE • BUILD ${LOCAL_BUILD_SHORT}`, 3000);
+        }
+        return;
+      }
+
+      this.titleUpdateDot.hidden = false;
+      if (!interactive) {
+        return;
+      }
+
+      this.showUpdateToast('UPDATE AVAILABLE — INSTALLING…');
+
+      // Flush stale Service Worker & CacheStorage entries while preserving 100% of localStorage!
+      if ('serviceWorker' in navigator && typeof navigator.serviceWorker?.getRegistrations === 'function') {
+        const regs = await navigator.serviceWorker.getRegistrations().catch(() => []);
+        await Promise.all(
+          regs.map(async (reg) => {
+            await reg.update().catch(() => {});
+            await reg.unregister().catch(() => {});
+          })
+        );
+      }
+      if ('caches' in window && typeof window.caches?.keys === 'function') {
+        const cacheKeys = await window.caches.keys().catch(() => []);
+        await Promise.all(cacheKeys.map((k) => window.caches.delete(k).catch(() => false)));
+      }
+
+      await fetch(window.location.href, { cache: 'no-store' }).catch(() => {});
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.set('_upd', String(Date.now()));
+      window.location.replace(nextUrl.toString());
+    } catch {
+      if (interactive) {
+        this.showUpdateToast(`OFFLINE • RUNNING BUILD ${LOCAL_BUILD_SHORT}`, 3200);
+      }
+    } finally {
+      if (interactive) {
+        this.updateCheckInFlight = false;
+        this.titleRefreshBtn.dataset['checking'] = 'false';
+      }
+    }
   }
 
   private syncSeg(selector: string, dataKey: string, expected: string): void {

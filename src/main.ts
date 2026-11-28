@@ -1,5 +1,6 @@
 import './styles/shell.css';
 import { SoundDirector } from './audio/SoundDirector';
+import type { QualityTier, TheaterId, ViewportFrameMode } from './core/types';
 import { SceneManager } from './graphics/SceneManager';
 import { GameStore, type ShowcasePreset } from './state/GameStore';
 import { UIManager } from './ui/UIManager';
@@ -22,6 +23,12 @@ const ui = new UIManager(hudRoot, store, sound, {
   onStartCrateDrag: (rank, clientX, clientY) => {
     sceneManager.beginCrateDrag(rank, clientX, clientY);
   },
+  onSkipArbiter: () => {
+    sceneManager.skipArbiterCutscene();
+  },
+  onResetCamera: () => {
+    sceneManager.resetCameraOrbit();
+  },
 });
 
 sceneManager.onOpenSuspectWheel = (pieceId, clientX, clientY) => {
@@ -42,8 +49,34 @@ store.subscribe((view, options) => {
   ui.render(view, options);
 });
 
-sceneManager.snapCameraImmediately();
+const syncBootTheaterLighting = (snapCamera = false): void => {
+  const bootView = store.getVisibleView();
+  const bootOpts = store.getOptions();
+  sceneManager.setTheater(bootView.theaterId);
+  sceneManager.syncFromStore(bootView, bootOpts);
+  if (snapCamera) {
+    sceneManager.snapCameraImmediately();
+  }
+};
+
+syncBootTheaterLighting(true);
 sceneManager.startLoop();
+
+// Re-sync theater lighting once after async GLB/PMREM boot settles for persisted non-default theaters (e.g. PACIFIC_BRIDGE)
+const refreshTitleBootLighting = (): void => {
+  if (store.getVisibleView().phase === 'TITLE') {
+    syncBootTheaterLighting(false);
+  }
+};
+window.setTimeout(refreshTitleBootLighting, 340);
+
+const buildCombinedTelemetry = (): Record<string, unknown> => ({
+  ...sceneManager.getStageTelemetry(),
+  activeChoreography: sceneManager.arbiterStage.getActiveChoreography(),
+  arbiterVisibleFxCount: sceneManager.arbiterStage.getVisibleFxCount(),
+  turnCount: store.getVisibleView().turnCount,
+  audio: sound.getAudioTelemetry(),
+});
 
 // Deterministic Visual QA / Stage Inspection API (never exposes `#truthPieces`)
 declare global {
@@ -55,6 +88,17 @@ declare global {
       poseReplay: () => void;
       poseFieldManual: () => void;
       poseArbiterAct: (preset: ShowcasePreset, actSeconds: number) => void;
+      getTelemetry: () => Record<string, unknown>;
+      getStageTelemetry: () => Record<string, unknown>;
+      getAudioTelemetry: () => ReturnType<SoundDirector['getAudioTelemetry']>;
+      disposeAudio: () => void;
+      skipArbiterCutscene: () => boolean;
+      setTheater: (id: TheaterId) => void;
+      resetCameraOrbit: () => void;
+      setViewportFrameMode: (mode: ViewportFrameMode) => void;
+      setQualityMode: (mode: QualityTier) => void;
+      simulateFrameDt: (dtSec: number) => void;
+      projectBoardCoord: (vCol: number, vRow: number, worldY?: number) => { x: number; y: number } | null;
     };
   }
 }
@@ -101,4 +145,18 @@ window.__WAR_GENERALS_STAGE__ = {
       sceneManager.snapCameraImmediately();
     }
   },
+  getTelemetry: buildCombinedTelemetry,
+  getStageTelemetry: buildCombinedTelemetry,
+  getAudioTelemetry: () => sound.getAudioTelemetry(),
+  disposeAudio: () => {
+    sound.dispose();
+  },
+  skipArbiterCutscene: () => sceneManager.skipArbiterCutscene(),
+  setTheater: (id: TheaterId) => sceneManager.setTheater(id),
+  resetCameraOrbit: () => sceneManager.resetCameraOrbit(),
+  setViewportFrameMode: (mode: ViewportFrameMode) => sceneManager.setViewportFrameMode(mode),
+  setQualityMode: (mode: QualityTier) => sceneManager.setQualityMode(mode),
+  simulateFrameDt: (dtSec: number) => sceneManager.simulateFrameDt(dtSec),
+  projectBoardCoord: (vCol: number, vRow: number, worldY = 0.08) =>
+    sceneManager.projectBoardCoord(vCol, vRow, worldY),
 };

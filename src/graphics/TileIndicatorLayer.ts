@@ -28,23 +28,28 @@ export class TileIndicatorLayer {
   private readonly movePool: THREE.Group[] = [];
   private readonly challengePool: THREE.Group[] = [];
 
-  private readonly cyanFloorFillMat: THREE.MeshBasicMaterial;
-  private readonly cyanBorderMat: THREE.MeshBasicMaterial;
-  private readonly cyanArrowMat: THREE.MeshBasicMaterial;
-  private readonly deployEmptyMat: THREE.MeshBasicMaterial;
-  private readonly deployFilledMat: THREE.MeshBasicMaterial;
-  private readonly hoverGoldMat: THREE.MeshBasicMaterial;
-  private readonly crimsonFloorFillMat: THREE.MeshBasicMaterial;
-  private readonly crimsonBorderMat: THREE.MeshBasicMaterial;
-  private readonly goldSaberMat: THREE.MeshBasicMaterial;
+  private readonly cyanFloorFillMat: THREE.MeshStandardMaterial;
+  private readonly cyanBorderMat: THREE.MeshStandardMaterial;
+  private readonly cyanArrowMat: THREE.MeshStandardMaterial;
+  private readonly deployEmptyMat: THREE.MeshStandardMaterial;
+  private readonly deployFilledMat: THREE.MeshStandardMaterial;
+  private readonly hoverGoldMat: THREE.MeshStandardMaterial;
+  private readonly crimsonFloorFillMat: THREE.MeshStandardMaterial;
+  private readonly crimsonBorderMat: THREE.MeshStandardMaterial;
+  private readonly goldSaberMat: THREE.MeshStandardMaterial;
 
   private readonly floorFillGeo: THREE.BufferGeometry;
   private readonly crispBorderGeo: THREE.BufferGeometry;
   private readonly arrowGeo: THREE.BufferGeometry;
 
   constructor() {
-    this.cyanFloorFillMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(0.06, 0.72, 0.98),
+    this.cyanFloorFillMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#000000'),
+      emissive: new THREE.Color(0.06, 0.72, 0.98),
+      emissiveIntensity: 1.0,
+      roughness: 1.0,
+      metalness: 0.0,
+      envMapIntensity: 0.0,
       transparent: true,
       opacity: 0.14,
       blending: THREE.AdditiveBlending,
@@ -52,8 +57,13 @@ export class TileIndicatorLayer {
       toneMapped: false,
     });
 
-    this.cyanBorderMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(0.28, 1.55, 1.95),
+    this.cyanBorderMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#000000'),
+      emissive: new THREE.Color(0.28, 1.55, 1.95),
+      emissiveIntensity: 1.0,
+      roughness: 1.0,
+      metalness: 0.0,
+      envMapIntensity: 0.0,
       transparent: true,
       opacity: 0.92,
       blending: THREE.AdditiveBlending,
@@ -61,8 +71,13 @@ export class TileIndicatorLayer {
       toneMapped: false,
     });
 
-    this.cyanArrowMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(0.42, 1.65, 2.05),
+    this.cyanArrowMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#000000'),
+      emissive: new THREE.Color(0.42, 1.65, 2.05),
+      emissiveIntensity: 1.0,
+      roughness: 1.0,
+      metalness: 0.0,
+      envMapIntensity: 0.0,
       transparent: true,
       opacity: 0.88,
       side: THREE.DoubleSide,
@@ -71,8 +86,13 @@ export class TileIndicatorLayer {
       toneMapped: false,
     });
 
-    this.deployEmptyMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(0.22, 1.45, 1.95),
+    this.deployEmptyMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#000000'),
+      emissive: new THREE.Color(0.22, 1.45, 1.95),
+      emissiveIntensity: 1.0,
+      roughness: 1.0,
+      metalness: 0.0,
+      envMapIntensity: 0.0,
       transparent: true,
       opacity: 0.78,
       blending: THREE.AdditiveBlending,
@@ -80,8 +100,13 @@ export class TileIndicatorLayer {
       toneMapped: false,
     });
 
-    this.deployFilledMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(0.25, 0.95, 1.35),
+    this.deployFilledMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#000000'),
+      emissive: new THREE.Color(0.25, 0.95, 1.35),
+      emissiveIntensity: 1.0,
+      roughness: 1.0,
+      metalness: 0.0,
+      envMapIntensity: 0.0,
       transparent: true,
       opacity: 0.34,
       blending: THREE.AdditiveBlending,
@@ -89,8 +114,13 @@ export class TileIndicatorLayer {
       toneMapped: false,
     });
 
-    this.hoverGoldMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(2.4, 1.85, 0.55),
+    this.hoverGoldMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#000000'),
+      emissive: new THREE.Color(2.4, 1.85, 0.55),
+      emissiveIntensity: 1.0,
+      roughness: 1.0,
+      metalness: 0.0,
+      envMapIntensity: 0.0,
       transparent: true,
       opacity: 0.95,
       blending: THREE.AdditiveBlending,
@@ -98,8 +128,13 @@ export class TileIndicatorLayer {
       toneMapped: false,
     });
 
-    this.crimsonFloorFillMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(1.25, 0.1, 0.18),
+    this.crimsonFloorFillMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#000000'),
+      emissive: new THREE.Color(1.25, 0.1, 0.18),
+      emissiveIntensity: 1.0,
+      roughness: 1.0,
+      metalness: 0.0,
+      envMapIntensity: 0.0,
       transparent: true,
       opacity: 0.18,
       blending: THREE.AdditiveBlending,
@@ -107,8 +142,13 @@ export class TileIndicatorLayer {
       toneMapped: false,
     });
 
-    this.crimsonBorderMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(1.85, 0.22, 0.3),
+    this.crimsonBorderMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#000000'),
+      emissive: new THREE.Color(1.85, 0.22, 0.3),
+      emissiveIntensity: 1.0,
+      roughness: 1.0,
+      metalness: 0.0,
+      envMapIntensity: 0.0,
       transparent: true,
       opacity: 0.95,
       blending: THREE.AdditiveBlending,
@@ -116,8 +156,13 @@ export class TileIndicatorLayer {
       toneMapped: false,
     });
 
-    this.goldSaberMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(1.9, 1.38, 0.38),
+    this.goldSaberMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#000000'),
+      emissive: new THREE.Color(1.9, 1.38, 0.38),
+      emissiveIntensity: 1.0,
+      roughness: 1.0,
+      metalness: 0.0,
+      envMapIntensity: 0.0,
       transparent: true,
       opacity: 0.95,
       blending: THREE.AdditiveBlending,
@@ -151,8 +196,13 @@ export class TileIndicatorLayer {
 
     // 1. Build 27 Glowing Cyan Deployment Home Squares (`Rows 5..7`, `Cols 0..8`)
     // Positioned at `y = 0.029` cleanly above `board_cabinet.glb` slate tile surface (`y = 0.021`)!
-    const deployPadFillMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(0.08, 0.85, 1.25),
+    const deployPadFillMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#000000'),
+      emissive: new THREE.Color(0.08, 0.85, 1.25),
+      emissiveIntensity: 1.0,
+      roughness: 1.0,
+      metalness: 0.0,
+      envMapIntensity: 0.0,
       transparent: true,
       opacity: 0.12,
       blending: THREE.AdditiveBlending,
@@ -186,8 +236,13 @@ export class TileIndicatorLayer {
     scanGeo.rotateX(-Math.PI / 2);
     this.replayScanBar = new THREE.Mesh(
       scanGeo,
-      new THREE.MeshBasicMaterial({
-        color: new THREE.Color(0.18, 1.35, 2.2),
+      new THREE.MeshStandardMaterial({
+        color: new THREE.Color('#000000'),
+        emissive: new THREE.Color(0.18, 1.35, 2.2),
+        emissiveIntensity: 1.0,
+        roughness: 1.0,
+        metalness: 0.0,
+        envMapIntensity: 0.0,
         transparent: true,
         opacity: 0.22,
         blending: THREE.AdditiveBlending,
@@ -226,6 +281,14 @@ export class TileIndicatorLayer {
     this.selectedOuterGlow.position.y = 0.027;
     this.selectedOuterGlow.visible = false;
     this.root.add(this.selectedOuterGlow);
+
+    this.disableRaycast(this.root);
+  }
+
+  private disableRaycast(obj: THREE.Object3D): void {
+    obj.traverse((child) => {
+      child.raycast = () => {};
+    });
   }
 
   public syncDeploymentGrid(
@@ -325,7 +388,7 @@ export class TileIndicatorLayer {
         indicator.visible = true;
       } else {
         const reticle = this.getOrCreateChallengeReticle(chalIdx++);
-        reticle.position.set(w.x, 0.03, w.z);
+        reticle.position.set(w.x, 0.028, w.z);
         reticle.visible = true;
       }
     }
@@ -353,7 +416,7 @@ export class TileIndicatorLayer {
     if (this.replayScannerGroup.visible) {
       // Smooth tactical radar sweep across the 9x8 board (`z = -2.8 .. +4.5`)!
       const sweepU = (elapsedSec * 0.28) % 1.0;
-      this.replayScanBar.position.set(0, 0.025, -2.85 + sweepU * 7.4);
+      this.replayScanBar.position.set(0, 0.026, -2.85 + sweepU * 7.4);
     }
 
     for (const r of this.challengePool) {
@@ -401,6 +464,7 @@ export class TileIndicatorLayer {
     arrow.position.y = 0.005;
     g.add(arrow);
 
+    this.disableRaycast(g);
     this.root.add(g);
     this.movePool.push(g);
     return g;
@@ -436,6 +500,7 @@ export class TileIndicatorLayer {
     }
 
     g.add(saberRingGroup);
+    this.disableRaycast(g);
     this.root.add(g);
     this.challengePool.push(g);
     return g;

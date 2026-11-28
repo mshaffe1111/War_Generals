@@ -1,5 +1,6 @@
 import { BOARD_COLS, ORDERED_RANKS, RANK_SPECS, type RankId } from '../core/ranks';
 import type { DeploymentSlot } from '../core/RulesEngine';
+import type { AudioEraMode, TheaterId } from '../core/types';
 
 export type CommanderId =
   | 'MILLER'
@@ -104,6 +105,19 @@ export interface CommanderUtilityWeights {
   readonly spyPrivateEscortWeight: number;
 }
 
+export interface CommanderMissionModifier {
+  readonly id: string;
+  readonly label: string;
+  readonly description: string;
+  readonly recommendedEra: AudioEraMode;
+  readonly turnPar: number;
+}
+
+export interface CommanderStarThresholds {
+  readonly threeStarMaxTurns: number;
+  readonly twoStarMaxTurns: number;
+}
+
 export interface CommanderProfile {
   readonly id: CommanderId;
   readonly tier: number; // 1..6
@@ -112,37 +126,13 @@ export interface CommanderProfile {
   readonly rankAbbrev: string;
   readonly accentHex: string;
   readonly summary: string;
+  readonly tacticalBriefing: string;
+  readonly theaterId: TheaterId;
   readonly medalName: string;
-  readonly portraitSvg: string;
+  readonly portraitUrl: string;
+  readonly missionModifier: CommanderMissionModifier;
+  readonly starThresholds: CommanderStarThresholds;
   readonly weights: CommanderUtilityWeights;
-}
-
-function buildCommanderPortraitSvg(
-  kind: CommanderId,
-  accent: string
-): string {
-  const bg = '#0f141c';
-  const brass = '#d8a852';
-  switch (kind) {
-    case 'MILLER':
-      // Cadet chevron cap + textbook compass reticle
-      return `<svg viewBox="0 0 48 48" aria-hidden="true"><rect x="2" y="2" width="44" height="44" rx="10" fill="${bg}" stroke="${accent}" stroke-width="1.5"/><circle cx="24" cy="18" r="7" fill="none" stroke="${brass}" stroke-width="1.8"/><path d="M12 38c2-7 8-11 12-11s10 4 12 11" fill="none" stroke="${brass}" stroke-width="1.8"/><path d="M19 15l5-3 5 3" fill="none" stroke="${accent}" stroke-width="1.8"/></svg>`;
-    case 'MERCER':
-      // Twin overlapping mirage prism masks
-      return `<svg viewBox="0 0 48 48" aria-hidden="true"><rect x="2" y="2" width="44" height="44" rx="10" fill="${bg}" stroke="${accent}" stroke-width="1.5"/><polygon points="21,10 31,24 21,38 11,24" fill="none" stroke="${brass}" stroke-width="1.7"/><polygon points="27,10 37,24 27,38 17,24" fill="none" stroke="${accent}" stroke-width="1.7" stroke-dasharray="3 2"/><circle cx="24" cy="24" r="2.5" fill="${accent}"/></svg>`;
-    case 'STERLING':
-      // Layered Iron Bastion shield + tower crenellations
-      return `<svg viewBox="0 0 48 48" aria-hidden="true"><rect x="2" y="2" width="44" height="44" rx="10" fill="${bg}" stroke="${accent}" stroke-width="1.5"/><path d="M13 13h22v12c0 8-11 13-11 13S13 33 13 25V13Z" fill="none" stroke="${brass}" stroke-width="1.9"/><path d="M17 18h14v7c0 4.5-7 8-7 8s-7-3.5-7-8v-7Z" fill="none" stroke="${accent}" stroke-width="1.5"/></svg>`;
-    case 'REYES':
-      // Crossed covert stilettos ("Shadow Dagger")
-      return `<svg viewBox="0 0 48 48" aria-hidden="true"><rect x="2" y="2" width="44" height="44" rx="10" fill="${bg}" stroke="${accent}" stroke-width="1.5"/><line x1="13" y1="35" x2="35" y2="13" stroke="${brass}" stroke-width="2"/><line x1="35" y1="35" x2="13" y2="13" stroke="${accent}" stroke-width="2"/><circle cx="24" cy="24" r="4" fill="${bg}" stroke="${brass}" stroke-width="1.5"/></svg>`;
-    case 'VANCE':
-      // Triple armored spearhead chevron ("Spearhead")
-      return `<svg viewBox="0 0 48 48" aria-hidden="true"><rect x="2" y="2" width="44" height="44" rx="10" fill="${bg}" stroke="${accent}" stroke-width="1.5"/><polyline points="13,22 24,11 35,22" fill="none" stroke="${accent}" stroke-width="2.2"/><polyline points="13,30 24,19 35,30" fill="none" stroke="${brass}" stroke-width="2"/><polyline points="16,37 24,29 32,37" fill="none" stroke="${brass}" stroke-width="1.6"/></svg>`;
-    case 'HOLLIS':
-      // Five-Star Marshal laurel & Bayesian eye ("Grand Strategist")
-      return `<svg viewBox="0 0 48 48" aria-hidden="true"><rect x="2" y="2" width="44" height="44" rx="10" fill="${bg}" stroke="${accent}" stroke-width="1.6"/><path d="M10 24s6-8 14-8 14 8 14 8-6 8-14 8-14-8-14-8Z" fill="none" stroke="${brass}" stroke-width="1.8"/><circle cx="24" cy="24" r="4" fill="${accent}"/><circle cx="24" cy="11" r="1.6" fill="${brass}"/><circle cx="18" cy="12.5" r="1.3" fill="${brass}"/><circle cx="30" cy="12.5" r="1.3" fill="${brass}"/></svg>`;
-  }
 }
 
 export const COMMANDER_ROSTER: readonly CommanderProfile[] = [
@@ -154,8 +144,19 @@ export const COMMANDER_ROSTER: readonly CommanderProfile[] = [
     rankAbbrev: 'CDT',
     accentHex: '#7cc6fe',
     summary: 'Straightforward frontline probing, balanced defensive Flag cluster, low bluff rate.',
+    tacticalBriefing:
+      'Miller anchors his Flag behind a textbook twin-Private guard on the center files and advances methodically down Columns C–G.',
+    theaterId: 'FIELD_HQ',
     medalName: 'Academy Merit Star',
-    portraitSvg: buildCommanderPortraitSvg('MILLER', '#7cc6fe'),
+    portraitUrl: './portraits/miller.webp',
+    missionModifier: {
+      id: 'TEXTBOOK_DRILL',
+      label: 'Cadet Proving Ground',
+      description: 'Balanced center lanes with predictable back-row Flag discipline.',
+      recommendedEra: '1980s',
+      turnPar: 26,
+    },
+    starThresholds: { threeStarMaxTurns: 20, twoStarMaxTurns: 32 },
     weights: {
       searchDepth: 2,
       worldSamples: 3,
@@ -177,8 +178,19 @@ export const COMMANDER_ROSTER: readonly CommanderProfile[] = [
     rankAbbrev: 'CPT',
     accentHex: '#5ce1e6',
     summary: 'Fakes wing Flag runs with Privates and hides the real Flag on unorthodox Row-2 squares.',
+    tacticalBriefing:
+      'Mercer constructs a decoy fortress around a Private on one flank while slipping Privates and Sergeants down the outer rails.',
+    theaterId: 'PACIFIC_BRIDGE',
     medalName: 'Mirage Cipher Cross',
-    portraitSvg: buildCommanderPortraitSvg('MERCER', '#5ce1e6'),
+    portraitUrl: './portraits/mercer.webp',
+    missionModifier: {
+      id: 'DECOY_SCREEN',
+      label: 'Double-Wing Mirage',
+      description: 'Expect aggressive edge-column bluff sprinters and Row-2 Flag concealment.',
+      recommendedEra: '1980s',
+      turnPar: 30,
+    },
+    starThresholds: { threeStarMaxTurns: 24, twoStarMaxTurns: 36 },
     weights: {
       searchDepth: 2,
       worldSamples: 5,
@@ -200,8 +212,19 @@ export const COMMANDER_ROSTER: readonly CommanderProfile[] = [
     rankAbbrev: 'MAJ',
     accentHex: '#e5b968',
     summary: 'Builds layered Private + Colonel perimeters around the Flag and grinds attrition splits.',
+    tacticalBriefing:
+      'Sterling interlocks Privates and Colonels into a tight corner bastion and welcomes equal-rank mutual eliminations.',
+    theaterId: 'IRON_BUNKER',
     medalName: 'Iron Bastion Shield',
-    portraitSvg: buildCommanderPortraitSvg('STERLING', '#e5b968'),
+    portraitUrl: './portraits/sterling.webp',
+    missionModifier: {
+      id: 'ATTRITION_WALL',
+      label: 'Iron Bastion Perimeter',
+      description: 'Dense anti-Spy Private screens around the Flag; avoid reckless lone General pushes.',
+      recommendedEra: '1970s',
+      turnPar: 34,
+    },
+    starThresholds: { threeStarMaxTurns: 26, twoStarMaxTurns: 40 },
     weights: {
       searchDepth: 2,
       worldSamples: 6,
@@ -223,8 +246,19 @@ export const COMMANDER_ROSTER: readonly CommanderProfile[] = [
     rankAbbrev: 'COL',
     accentHex: '#c77dff',
     summary: 'Uses Captains/Majors as sacrificial probes to unmask player Officers for shadowed Spies.',
+    tacticalBriefing:
+      'Reyes leads with mid-tier Officers directly in front of lurking Spies. Every clash you win on Row 3 paints a target for her Spy counter-strike.',
+    theaterId: 'NIGHT_OPS',
     medalName: 'Obsidian Stiletto',
-    portraitSvg: buildCommanderPortraitSvg('REYES', '#c77dff'),
+    portraitUrl: './portraits/reyes.webp',
+    missionModifier: {
+      id: 'SHADOW_OVERWATCH',
+      label: 'Overwatch Assassination',
+      description: 'Forward Officer probes backed by twin Spy cells waiting on adjacent files.',
+      recommendedEra: '1980s',
+      turnPar: 34,
+    },
+    starThresholds: { threeStarMaxTurns: 26, twoStarMaxTurns: 42 },
     weights: {
       searchDepth: 3,
       worldSamples: 7,
@@ -246,8 +280,19 @@ export const COMMANDER_ROSTER: readonly CommanderProfile[] = [
     rankAbbrev: 'GEN',
     accentHex: '#ff6b7a',
     summary: 'High-tempo blitz—pushes 5★, 4★, and 3★ Generals across Row 3 early to collapse space.',
+    tacticalBriefing:
+      'Vance commits his top three Generals into a narrow armored wedge by Turn 6. Anchor your Spies behind Privates before he reaches Row 5.',
+    theaterId: 'IRON_BUNKER',
     medalName: 'Crimson Spearhead Order',
-    portraitSvg: buildCommanderPortraitSvg('VANCE', '#ff6b7a'),
+    portraitUrl: './portraits/vance.webp',
+    missionModifier: {
+      id: 'ARMORED_BLITZ',
+      label: 'Heavy Wedge Blitz',
+      description: 'Coordinated 5★/4★/3★ forward spearhead punching down central lanes.',
+      recommendedEra: '1980s',
+      turnPar: 32,
+    },
+    starThresholds: { threeStarMaxTurns: 24, twoStarMaxTurns: 38 },
     weights: {
       searchDepth: 3,
       worldSamples: 8,
@@ -269,8 +314,19 @@ export const COMMANDER_ROSTER: readonly CommanderProfile[] = [
     rankAbbrev: 'MSH',
     accentHex: '#ffd166',
     summary: 'Full Sinkhorn Bayesian memory, Spy-Private escorts, bluff detection & adaptive counter-setups.',
+    tacticalBriefing:
+      'Hollis adapts to your historical opening wings, baits with a motionless 5★ decoy, and hunts high-entropy threats with escorted Spies.',
+    theaterId: 'NIGHT_OPS',
     medalName: 'Sovereign Grand Strategist Star',
-    portraitSvg: buildCommanderPortraitSvg('HOLLIS', '#ffd166'),
+    portraitUrl: './portraits/hollis.webp',
+    missionModifier: {
+      id: 'BAYESIAN_SOVEREIGN',
+      label: 'Adaptive Grand Strategy',
+      description: '3-ply Information-Set Expectimax with entropy-targeted Spy-Private cells.',
+      recommendedEra: '1970s',
+      turnPar: 38,
+    },
+    starThresholds: { threeStarMaxTurns: 28, twoStarMaxTurns: 44 },
     weights: {
       searchDepth: 3,
       worldSamples: 10,
@@ -489,6 +545,7 @@ export interface CommanderCampaignRecord {
   losses: number;
   bestTurns: number | null;
   medalEarned: boolean;
+  stars: number; // 0..3
 }
 
 export interface CampaignProgressState {
@@ -504,12 +561,12 @@ function createDefaultCampaignState(): CampaignProgressState {
     totalWins: 0,
     totalLosses: 0,
     records: {
-      MILLER: { wins: 0, losses: 0, bestTurns: null, medalEarned: false },
-      MERCER: { wins: 0, losses: 0, bestTurns: null, medalEarned: false },
-      STERLING: { wins: 0, losses: 0, bestTurns: null, medalEarned: false },
-      REYES: { wins: 0, losses: 0, bestTurns: null, medalEarned: false },
-      VANCE: { wins: 0, losses: 0, bestTurns: null, medalEarned: false },
-      HOLLIS: { wins: 0, losses: 0, bestTurns: null, medalEarned: false },
+      MILLER: { wins: 0, losses: 0, bestTurns: null, medalEarned: false, stars: 0 },
+      MERCER: { wins: 0, losses: 0, bestTurns: null, medalEarned: false, stars: 0 },
+      STERLING: { wins: 0, losses: 0, bestTurns: null, medalEarned: false, stars: 0 },
+      REYES: { wins: 0, losses: 0, bestTurns: null, medalEarned: false, stars: 0 },
+      VANCE: { wins: 0, losses: 0, bestTurns: null, medalEarned: false, stars: 0 },
+      HOLLIS: { wins: 0, losses: 0, bestTurns: null, medalEarned: false, stars: 0 },
     },
   };
 }
@@ -517,6 +574,7 @@ function createDefaultCampaignState(): CampaignProgressState {
 export function loadCampaignProgress(): CampaignProgressState {
   const fallback = createDefaultCampaignState();
   try {
+    if (typeof localStorage === 'undefined') return fallback;
     const raw = localStorage.getItem(CAMPAIGN_STORAGE_KEY);
     if (!raw) return fallback;
     const parsed = JSON.parse(raw) as Partial<CampaignProgressState>;
@@ -529,11 +587,18 @@ export function loadCampaignProgress(): CampaignProgressState {
       for (const c of COMMANDER_ROSTER) {
         const rec = parsed.records[c.id];
         if (rec) {
+          const rawStars = Number(rec.stars);
+          const stars = Number.isFinite(rawStars)
+            ? Math.max(0, Math.min(3, Math.floor(rawStars)))
+            : rec.medalEarned
+              ? 1
+              : 0;
           fallback.records[c.id] = {
             wins: Math.max(0, Number(rec.wins) || 0),
             losses: Math.max(0, Number(rec.losses) || 0),
             bestTurns: typeof rec.bestTurns === 'number' ? rec.bestTurns : null,
             medalEarned: Boolean(rec.medalEarned),
+            stars,
           };
         }
       }
@@ -548,16 +613,24 @@ export function recordCampaignMatchResult(
   commanderId: CommanderId,
   playerWon: boolean,
   turnsElapsed: number
-): { state: CampaignProgressState; newlyEarnedMedal: string | null } {
+): { state: CampaignProgressState; newlyEarnedMedal: string | null; starsEarned: 0 | 1 | 2 | 3 } {
   const state = loadCampaignProgress();
   const profile = getCommanderProfile(commanderId);
   const rec = state.records[commanderId];
   let newlyEarnedMedal: string | null = null;
+  let starsEarned: 0 | 1 | 2 | 3 = 0;
 
   if (playerWon) {
     state.totalWins += 1;
     rec.wins += 1;
     rec.bestTurns = rec.bestTurns === null ? turnsElapsed : Math.min(rec.bestTurns, turnsElapsed);
+    starsEarned =
+      turnsElapsed <= profile.starThresholds.threeStarMaxTurns
+        ? 3
+        : turnsElapsed <= profile.starThresholds.twoStarMaxTurns
+          ? 2
+          : 1;
+    rec.stars = Math.max(rec.stars, starsEarned);
     if (!rec.medalEarned) {
       rec.medalEarned = true;
       newlyEarnedMedal = profile.medalName;
@@ -571,9 +644,11 @@ export function recordCampaignMatchResult(
   }
 
   try {
-    localStorage.setItem(CAMPAIGN_STORAGE_KEY, JSON.stringify(state));
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(CAMPAIGN_STORAGE_KEY, JSON.stringify(state));
+    }
   } catch {
     // Ignore storage quota restrictions
   }
-  return { state, newlyEarnedMedal };
+  return { state, newlyEarnedMedal, starsEarned };
 }

@@ -244,3 +244,103 @@ export function createSoftSmokeTexture(): THREE.CanvasTexture {
   ctx.fillRect(0, 0, size, size);
   return new THREE.CanvasTexture(canvas);
 }
+
+export function createTacticalPhosphorRadarTexture(size = 256): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+  const c = size / 2;
+
+  const bg = ctx.createRadialGradient(c, c, 4, c, c, c);
+  bg.addColorStop(0, '#0c3b28');
+  bg.addColorStop(0.65, '#072418');
+  bg.addColorStop(1, '#03110b');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, size, size);
+
+  ctx.strokeStyle = 'rgba(72, 240, 165, 0.42)';
+  ctx.lineWidth = 1.4;
+  for (const r of [c * 0.28, c * 0.54, c * 0.8]) {
+    ctx.beginPath();
+    ctx.arc(c, c, r, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.beginPath();
+  ctx.moveTo(c, 8);
+  ctx.lineTo(c, size - 8);
+  ctx.moveTo(8, c);
+  ctx.lineTo(size - 8, c);
+  ctx.stroke();
+
+  // Sweep wedge glow
+  const sweep = ctx.createConicGradient ? ctx.createConicGradient(-0.85, c, c) : null;
+  if (sweep) {
+    sweep.addColorStop(0, 'rgba(84, 255, 178, 0.55)');
+    sweep.addColorStop(0.14, 'rgba(62, 224, 148, 0.12)');
+    sweep.addColorStop(0.2, 'rgba(0, 0, 0, 0)');
+    sweep.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = sweep;
+    ctx.beginPath();
+    ctx.arc(c, c, c * 0.82, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Phosphor blips
+  ctx.fillStyle = '#8bffcb';
+  for (const [bx, by, br] of [
+    [c + 34, c - 44, 3.6],
+    [c - 52, c - 26, 2.8],
+    [c + 18, c + 48, 2.5],
+  ] as const) {
+    ctx.beginPath();
+    ctx.arc(bx, by, br, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+export function createNavalCompassDialTexture(size = 256): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+  const c = size / 2;
+
+  const g = ctx.createRadialGradient(c, c, 6, c, c, c * 0.96);
+  g.addColorStop(0, '#102235');
+  g.addColorStop(0.8, '#0b1826');
+  g.addColorStop(1, '#060e18');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(c, c, c * 0.96, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = '#6fe8f0';
+  ctx.lineWidth = 1.6;
+  for (let deg = 0; deg < 360; deg += 10) {
+    const a = (deg * Math.PI) / 180;
+    const major = deg % 30 === 0;
+    ctx.lineWidth = major ? 2.4 : 1.0;
+    ctx.beginPath();
+    ctx.moveTo(c + Math.cos(a) * (major ? 78 : 94), c + Math.sin(a) * (major ? 78 : 94));
+    ctx.lineTo(c + Math.cos(a) * 110, c + Math.sin(a) * 110);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = '#e5b968';
+  ctx.beginPath();
+  ctx.moveTo(c, c - 68);
+  ctx.lineTo(c + 12, c);
+  ctx.lineTo(c, c + 56);
+  ctx.lineTo(c - 12, c);
+  ctx.closePath();
+  ctx.fill();
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}

@@ -115,8 +115,10 @@ export class BeliefMatrixAI {
   private readonly matrix = new Map<string, Float64Array>();
   /** Hard impossibility mask (`0` = mathematically impossible, `1` = plausible) so Sinkhorn never resurrects eliminated ranks */
   private readonly possibleMask = new Map<string, Uint8Array>();
-  /** Remaining unseen Player rank pool `C_r` initialized to `[1,1,1,1,1,1,1,1,1,1,1,1,6,2,1]` */
+  /** Remaining unseen Player rank pool `C_r` initialized to `[1,1,1,1,1,1,1,1,1,1,1,1,6,2,1]` (or Operation subset) */
   private readonly remainingPool = new Float64Array(NUM_RANKS);
+  private readonly initialPoolCounts = new Float64Array(NUM_RANKS);
+  private initialPoolTotal = 21;
   private readonly meta = new Map<string, TrackedPlayerPieceMeta>();
 
   /** Confirmed AI high-officer coordinates that survived a clash (so AI knows the Player knows an AI threat is there!) */
@@ -125,40 +127,58 @@ export class BeliefMatrixAI {
   private designatedBluffRunnerId: string | null = null;
   /** Designated motionless Row-0 `FIVE_STAR` decoy pretending to be the AI Flag */
   private designatedBackRankDecoyId: string | null = null;
-  /** Anti-oscillation origin square memory (`pieceId -> previous square`) to prevent sterile 2-tile shuffling */
-  private readonly lastVacatedSquare = new Map<string, GridCoord>();
+  /** 4-ply per-unit coordinate trail (`pieceId -> last 4 vacated squares`) to prevent sterile 2/3/4-ply loops */
+  private readonly recentUnitTrail = new Map<string, GridCoord[]>();
+  /** Last 8 quiet public board hashes (`id:col,row`) to block multi-piece A<->B shuffles */
+  private readonly recentBoardHashes: string[] = [];
+  private consecutiveQuietPlies = 0;
+  private pendingDecisionHash: { pieceId: string; hash: string } | null = null;
 
   /**
-   * Initializes the `21 × 15` Belief Matrix strictly from public initial coordinates `(row, col)`.
+   * Initializes the Belief Matrix strictly from public initial coordinates `(row, col)`.
+   * Optional `playerRankPoolOverride` supplies public scenario rank totals for Tactical Operations (never per-piece `trueRank`).
    */
   public initializeMatch(
     playerInitialSquares: readonly PublicPlayerInitialSquare[],
-    aiInitialUnits: readonly AIOwnUnitState[] = []
+    aiInitialUnits: readonly AIOwnUnitState[] = [],
+    playerRankPoolOverride?: Partial<Record<RankId, number>>
   ): void {
     this.matrix.clear();
     this.possibleMask.clear();
     this.meta.clear();
     this.exposedAIHighOfficerIds.clear();
-    this.lastVacatedSquare.clear();
+    this.recentUnitTrail.clear();
+    this.recentBoardHashes.length = 0;
+    this.consecutiveQuietPlies = 0;
+    this.pendingDecisionHash = null;
     this.designatedBluffRunnerId = null;
     this.designatedBackRankDecoyId = null;
 
+    let poolTotal = 0;
     for (let r = 0; r < NUM_RANKS; r++) {
-      this.remainingPool[r] = RANK_SPECS[ORDERED_RANKS[r]!].countPerArmy;
+      const rank = ORDERED_RANKS[r]!;
+      const count = playerRankPoolOverride
+        ? Math.max(0, playerRankPoolOverride[rank] ?? 0)
+        : RANK_SPECS[rank].countPerArmy;
+      this.remainingPool[r] = count;
+      this.initialPoolCounts[r] = count;
+      poolTotal += count;
     }
+    this.initialPoolTotal = Math.max(1, poolTotal);
 
     const n = Math.max(1, playerInitialSquares.length);
     for (const sq of playerInitialSquares) {
       const vec = new Float64Array(NUM_RANKS);
       const mask = new Uint8Array(NUM_RANKS);
       for (let r = 0; r < NUM_RANKS; r++) {
-        mask[r] = 1;
-        vec[r] = this.remainingPool[r]! / n;
+        const count = this.remainingPool[r]!;
+        mask[r] = count > 0 ? 1 : 0;
+        vec[r] = count > 0 ? count / n : 0;
       }
       // Subtle opening spatial prior: back-row pieces (`row 7`) have slightly higher initial Flag prior than frontline (`row 5`)
-      if (sq.row === PLAYER_HOME_BACK_ROW) {
+      if (sq.row === PLAYER_HOME_BACK_ROW && mask[RANK_INDEX.FLAG]) {
         vec[RANK_INDEX.FLAG] *= 1.55;
-      } else if (sq.row === 5) {
+      } else if (sq.row === 5 && mask[RANK_INDEX.FLAG]) {
         vec[RANK_INDEX.FLAG] *= 0.45;
       }
 
@@ -239,6 +259,10 @@ export class BeliefMatrixAI {
         if (mask[RANK_INDEX.GEN_5]) vec[RANK_INDEX.GEN_5] *= 1.32;
       }
     }
+
+    // Preserve `consecutiveQuietPlies` and `recentBoardHashes` across alternating quiet moves;
+    // reset them only on match start (`initializeMatch`) or clashes (`recordClashOutcome`).
+    this.pendingDecisionHash = null;
 
     this.applyStationaryBackRankHeuristics(turnNumber);
     this.runSinkhornKnopp();
@@ -332,6 +356,10 @@ export class BeliefMatrixAI {
         }
       }
     }
+
+    this.consecutiveQuietPlies = 0;
+    this.recentBoardHashes.length = 0;
+    this.pendingDecisionHash = null;
 
     this.applyStationaryBackRankHeuristics(turnNumber);
     this.runSinkhornKnopp();
@@ -559,9 +587,9 @@ export class BeliefMatrixAI {
       const vec = this.matrix.get(id)!;
       const mask = this.possibleMask.get(id)!;
       for (let r = 0; r < NUM_RANKS; r++) {
-        const uniformPrior = RANK_SPECS[ORDERED_RANKS[r]!].countPerArmy / 21;
-        if (decayFraction >= 0.35) {
-          // Casual Recruit forgets older eliminations partially too
+        const uniformPrior = this.initialPoolCounts[r]! / this.initialPoolTotal;
+        if (decayFraction >= 0.35 && this.initialPoolCounts[r]! > 0) {
+          // Casual Recruit forgets older eliminations partially too (respecting scenario pool)
           mask[r] = 1;
         }
         if (mask[r]) {
@@ -573,10 +601,44 @@ export class BeliefMatrixAI {
   }
 
   /**
-   * Records the AI's own committed move origin so consecutive turns avoid sterile `A -> B -> A` oscillation.
+   * Records the AI's own committed move origin so consecutive turns avoid 2-, 3-, and 4-ply oscillation.
    */
   public recordOwnMoveOrigin(pieceId: string, from: GridCoord): void {
-    this.lastVacatedSquare.set(pieceId, { col: from.col, row: from.row });
+    const trail = this.recentUnitTrail.get(pieceId) ?? [];
+    trail.push({ col: from.col, row: from.row });
+    if (trail.length > 4) {
+      trail.shift();
+    }
+    this.recentUnitTrail.set(pieceId, trail);
+
+    if (this.pendingDecisionHash && this.pendingDecisionHash.pieceId === pieceId) {
+      this.recentBoardHashes.push(this.pendingDecisionHash.hash);
+      if (this.recentBoardHashes.length > 8) {
+        this.recentBoardHashes.shift();
+      }
+      this.pendingDecisionHash = null;
+    }
+    this.consecutiveQuietPlies += 1;
+  }
+
+  private computePublicBoardHash(
+    aiUnits: readonly AIOwnUnitState[],
+    playerUnits: readonly ObservedPlayerUnitState[],
+    movedId?: string,
+    toCol?: number,
+    toRow?: number
+  ): string {
+    const tokens: string[] = [];
+    for (const a of aiUnits) {
+      const c = a.id === movedId && toCol !== undefined ? toCol : a.col;
+      const r = a.id === movedId && toRow !== undefined ? toRow : a.row;
+      tokens.push(`${a.id}:${c},${r}`);
+    }
+    for (const p of playerUnits) {
+      tokens.push(`${p.id}:${p.col},${p.row}`);
+    }
+    tokens.sort();
+    return tokens.join(';');
   }
 
   /**
@@ -675,10 +737,31 @@ export class BeliefMatrixAI {
     const rootCandidates: Array<{
       decision: AIMoveDecision;
       priorScore: number;
+      postHash: string | null;
     }> = [];
 
+    const antiStallPressure =
+      this.consecutiveQuietPlies >= 6 ? (this.consecutiveQuietPlies - 5) * 4.5 : 0;
+
+    // Precompute public doctrine anchors (zero hidden-truth reads!)
+    const reyesProbePresent =
+      commanderId === 'REYES' &&
+      aiUnits.some(
+        (u) => u.ownRank === 'CAPTAIN' || u.ownRank === 'MAJOR' || u.ownRank === 'LT_1ST'
+      );
+    const vanceAnchorCol =
+      commanderId === 'VANCE'
+        ? (() => {
+            const top = aiUnits.filter(
+              (u) => u.ownRank === 'GEN_5' || u.ownRank === 'GEN_4' || u.ownRank === 'GEN_3'
+            );
+            if (top.length === 0) return 4;
+            return top.reduce((s, u) => s + u.col, 0) / top.length;
+          })()
+        : 4;
+
     for (const unit of aiUnits) {
-      const lastVacated = this.lastVacatedSquare.get(unit.id);
+      const trail = this.recentUnitTrail.get(unit.id) ?? [];
 
       for (const d of dirs) {
         const nc = unit.col + d.dc;
@@ -689,10 +772,37 @@ export class BeliefMatrixAI {
         const targetPlayer = playerByCoord.get(`${nc},${nr}`);
         let prior = (rng() - 0.5) * W.decisionNoise;
         let isBluff = false;
+        let postHash: string | null = null;
 
-        // Prevent sterile 2-square oscillation (`A -> B -> A`) on quiet moves
-        if (!targetPlayer && lastVacated && lastVacated.col === nc && lastVacated.row === nr) {
-          prior -= 18.5;
+        // 4-Ply Loop Prevention & Multi-Piece Board-Hash Anti-Shuffle
+        if (!targetPlayer) {
+          postHash = this.computePublicBoardHash(aiUnits, playerUnits, unit.id, nc, nr);
+          const lastSq = trail[trail.length - 1];
+          if (lastSq && lastSq.col === nc && lastSq.row === nr) {
+            const prevBounce =
+              trail.length >= 3 &&
+              trail[trail.length - 3]!.col === nc &&
+              trail[trail.length - 3]!.row === nr;
+            prior -= prevBounce ? 140 : 48;
+          } else {
+            for (let tIdx = 0; tIdx < trail.length - 1; tIdx++) {
+              const past = trail[tIdx]!;
+              if (past.col === nc && past.row === nr) {
+                prior -= tIdx === trail.length - 2 ? 28 : 20;
+                break;
+              }
+            }
+          }
+
+          let hashMatches = 0;
+          for (const h of this.recentBoardHashes) {
+            if (h === postHash) hashMatches += 1;
+          }
+          if (hashMatches >= 2) {
+            prior -= 240;
+          } else if (hashMatches === 1) {
+            prior -= 110;
+          }
         }
 
         // Psychological Bluff #1: Motionless `FIVE_STAR` parked on own back rank pretending to be Flag!
@@ -726,8 +836,6 @@ export class BeliefMatrixAI {
         }
 
         // Psychological Bluff #3 (Supreme Marshal + 1970s Classic Edition Back-Row Bluff Baiting!):
-        // Intentionally step a `GEN_5` or `GEN_4` onto the opponent's back rank adjacent to an enemy unit,
-        // mimicking a `1970s` deferred Flag arrival so the opponent panics and attacks into a 5★ General!
         if (
           eraMode === '1970s' &&
           difficulty === 'SUPREME_MARSHAL' &&
@@ -752,11 +860,9 @@ export class BeliefMatrixAI {
             (p) => Math.abs(p.col - nc) + Math.abs(p.row - nr) === 1
           );
           if (nr === oppBackRow && !targetPlayer) {
-            // In `1980s` Electronic Mode, stepping onto `oppBackRow` wins INSTANTLY even if `nextAdj` is true!
             if (eraMode === '1980s' || !nextAdj) {
               prior += 900;
             } else if (difficulty === 'SUPREME_MARSHAL' && W.bluffRate > 0.25) {
-              // Bold 1970s deferred Flag bluff when opponent likely fears a 5★ General!
               prior += 42;
             } else {
               prior -= 120;
@@ -769,13 +875,21 @@ export class BeliefMatrixAI {
             prior -= 115 * W.flagSafetyWeight;
           }
         } else if (targetPlayer) {
-          prior += this.evaluateBayesianClashUtility(unit, targetPlayer, commander, aiFlag);
+          prior +=
+            this.evaluateBayesianClashUtility(
+              unit,
+              targetPlayer,
+              commander,
+              aiFlag,
+              aiUnits.length,
+              playerUnits.length
+            ) + antiStallPressure;
         } else {
           if (d.dr === forwardDr) prior += 9.5 * W.aggressionWeight;
           if (d.dr === -forwardDr) prior -= 5.0;
           prior += (4 - Math.abs(nc - 4)) * 0.65;
 
-          // Pull toward nearest opponent units so endgame armies never stall across empty space
+          // Pull toward nearest opponent units + anti-stall progressive contact pressure
           let minEnemyDistNow = 99;
           let minEnemyDistNext = 99;
           for (const p of playerUnits) {
@@ -785,7 +899,7 @@ export class BeliefMatrixAI {
             if (dx < minEnemyDistNext) minEnemyDistNext = dx;
           }
           if (minEnemyDistNext < minEnemyDistNow) {
-            prior += 4.2 * W.aggressionWeight;
+            prior += 4.2 * W.aggressionWeight + antiStallPressure;
           }
 
           if (
@@ -795,6 +909,73 @@ export class BeliefMatrixAI {
             spearheadCrossed(nr)
           ) {
             prior += 18.0 * W.earlySpearheadWeight;
+          }
+
+          // Commander-Specific Public Doctrine Differentiation (Zero hidden-truth reads!)
+          if (commanderId === 'MILLER') {
+            if (nc >= 2 && nc <= 6 && d.dr === forwardDr) {
+              prior += 5.5;
+            }
+          } else if (commanderId === 'MERCER') {
+            if (
+              (unit.ownRank === 'PRIVATE' || unit.ownRank === 'SERGEANT') &&
+              (nc <= 1 || nc >= 7) &&
+              (d.dr === forwardDr || Math.abs(d.dc) === 1)
+            ) {
+              prior += 12.0;
+            }
+          } else if (commanderId === 'STERLING' && aiFlag) {
+            if (
+              unit.ownRank === 'PRIVATE' ||
+              unit.ownRank === 'COLONEL' ||
+              unit.ownRank === 'LT_COLONEL'
+            ) {
+              const flagDistNext = Math.abs(nc - aiFlag.col) + Math.abs(nr - aiFlag.row);
+              if (flagDistNext <= 2) prior += 11.5;
+            }
+          } else if (commanderId === 'REYES' && reyesProbePresent) {
+            if (unit.ownRank === 'SPY') {
+              const shadowingProbe = aiUnits.some(
+                (other) =>
+                  other.id !== unit.id &&
+                  (other.ownRank === 'CAPTAIN' ||
+                    other.ownRank === 'MAJOR' ||
+                    other.ownRank === 'LT_1ST') &&
+                  Math.abs(other.col - nc) <= 1 &&
+                  Math.abs(other.row - nr) <= 2
+              );
+              if (shadowingProbe) prior += 14.5;
+            }
+          } else if (commanderId === 'VANCE' && turnNumber <= 14) {
+            if (
+              unit.ownRank === 'GEN_5' ||
+              unit.ownRank === 'GEN_4' ||
+              unit.ownRank === 'GEN_3' ||
+              unit.ownRank === 'COLONEL'
+            ) {
+              if (d.dr === forwardDr && Math.abs(nc - vanceAnchorCol) <= 2) {
+                prior += 16.0;
+              }
+            }
+          } else if (commanderId === 'HOLLIS') {
+            if (unit.ownRank === 'GEN_5' || unit.ownRank === 'GEN_4') {
+              const adjHighEntropy = playerUnits.some(
+                (p) =>
+                  Math.abs(p.col - nc) + Math.abs(p.row - nr) === 1 &&
+                  !p.hasMoved &&
+                  this.getPieceEntropy(p.id) > 2.1
+              );
+              if (adjHighEntropy) prior -= 12.0;
+            }
+            if (unit.ownRank === 'SPY') {
+              for (const p of playerUnits) {
+                if (this.getOfficerProbability(p.id) > 0.55) {
+                  const dNow = Math.abs(unit.col - p.col) + Math.abs(unit.row - p.row);
+                  const dNext = Math.abs(nc - p.col) + Math.abs(nr - p.row);
+                  if (dNext < dNow) prior += 9.5;
+                }
+              }
+            }
           }
 
           if (unit.ownRank === 'SPY' && difficulty !== 'RECRUIT') {
@@ -846,6 +1027,7 @@ export class BeliefMatrixAI {
             isBluffManeuver: isBluff,
           },
           priorScore: prior,
+          postHash,
         });
       }
     }
@@ -855,7 +1037,11 @@ export class BeliefMatrixAI {
 
     // Recruit (`effDepth === 1`): pure 1-ply decision without multi-ply lookahead!
     if (effDepth === 1) {
-      return rootCandidates[0]!.decision;
+      const top = rootCandidates[0]!;
+      this.pendingDecisionHash = top.postHash
+        ? { pieceId: top.decision.pieceId, hash: top.postHash }
+        : null;
+      return top.decision;
     }
 
     // 2-to-3 Ply Information-Set Expectimax (+ Monte Carlo Rollout Tail on `SUPREME_MARSHAL`)
@@ -865,7 +1051,7 @@ export class BeliefMatrixAI {
       worlds.push(this.samplePlausibleWorld(rng));
     }
 
-    let bestDecision = rootCandidates[0]!.decision;
+    let bestCandidate = rootCandidates[0]!;
     let bestTotalScore = -Infinity;
 
     for (let i = 0; i < beamWidth; i++) {
@@ -890,18 +1076,24 @@ export class BeliefMatrixAI {
 
       if (combinedScore > bestTotalScore) {
         bestTotalScore = combinedScore;
-        bestDecision = cand.decision;
+        bestCandidate = cand;
       }
     }
 
-    return bestDecision;
+    this.pendingDecisionHash = bestCandidate.postHash
+      ? { pieceId: bestCandidate.decision.pieceId, hash: bestCandidate.postHash }
+      : null;
+
+    return bestCandidate.decision;
   }
 
   private evaluateBayesianClashUtility(
     aiUnit: AIOwnUnitState,
     target: ObservedPlayerUnitState,
     commander: CommanderProfile,
-    aiFlag: AIOwnUnitState | undefined
+    aiFlag: AIOwnUnitState | undefined,
+    aiUnitCount: number,
+    playerUnitCount: number
   ): number {
     const W = commander.weights;
     const vec = this.matrix.get(target.id);
@@ -922,7 +1114,8 @@ export class BeliefMatrixAI {
         expectedTrade += p * (pVal * 1.15);
       } else if (res === 'SPLIT') {
         // Maj. Sterling ("Iron Bastion") favors grinding attrition splits when trading equal/mid material
-        const splitBias = commander.id === 'STERLING' ? 6.0 : -2.0;
+        const splitBias =
+          commander.id === 'STERLING' && aiUnitCount >= playerUnitCount ? 6.0 : -2.0;
         expectedTrade += p * splitBias;
       } else {
         expectedTrade -= p * (aiVal * 1.25);
@@ -1114,6 +1307,17 @@ export class BeliefMatrixAI {
     }
 
     return boardDelta;
+  }
+
+  private getPieceEntropy(pieceId: string): number {
+    const vec = this.matrix.get(pieceId);
+    if (!vec) return Math.log(NUM_RANKS);
+    let ent = 0;
+    for (let r = 0; r < NUM_RANKS; r++) {
+      const p = vec[r]!;
+      if (p > 1e-6) ent -= p * Math.log(p);
+    }
+    return ent;
   }
 
   private getRankProbability(pieceId: string, rank: RankId): number {

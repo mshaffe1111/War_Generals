@@ -1,13 +1,21 @@
 import * as THREE from 'three';
 import type { SoundDirector } from '../audio/SoundDirector';
 import { buildRankEmblemMesh } from '../graphics/EmblemFactory';
-import type { ArbiterVerdict, HudBannerState } from '../core/types';
+import type { ArbiterVerdict, BattleChoreographyKind, HudBannerState } from '../core/types';
 import {
   ARBITER_BAY_CENTER_Z,
   type BakedArbiterHardwareParts,
   gridToWorld,
   type MeshFactory,
+  WEDGE_EMBLEM_MOUNT,
 } from '../graphics/MeshFactory';
+import {
+  type ChoreographyVisualProfile,
+  computeChoreographyTimeline,
+  computeFlagTraverseMarchPose,
+  resolveBattleChoreographyProfile,
+  resolveChoreographyLockBanner,
+} from './BattleChoreographies';
 
 const BASTION_X = 1.34;
 const BASTION_Z = 0.12;
@@ -41,10 +49,688 @@ interface ShrapnelItem {
 
 interface TracerBolt {
   readonly mesh: THREE.Mesh;
+  readonly mat: THREE.ShaderMaterial;
   readonly fromLeft: boolean;
   readonly yOff: number;
   readonly zOff: number;
   readonly phaseOffset: number;
+}
+
+// ---------------------------------------------------------------------------
+// Sculpted PBR & Shader Geometry Builders (Zero Raw Primitives / Unlit Materials)
+// ---------------------------------------------------------------------------
+
+function createRoundedRectShape(w: number, h: number, radius: number): THREE.Shape {
+  const hw = w * 0.5;
+  const hh = h * 0.5;
+  const r = Math.min(radius, hw * 0.45, hh * 0.45);
+  const s = new THREE.Shape();
+  s.moveTo(-hw + r, -hh);
+  s.lineTo(hw - r, -hh);
+  s.quadraticCurveTo(hw, -hh, hw, -hh + r);
+  s.lineTo(hw, hh - r);
+  s.quadraticCurveTo(hw, hh, hw - r, hh);
+  s.lineTo(-hw + r, hh);
+  s.quadraticCurveTo(-hw, hh, -hw, hh - r);
+  s.lineTo(-hw, -hh + r);
+  s.quadraticCurveTo(-hw, -hh, -hw + r, -hh);
+  return s;
+}
+
+function createBeveledSlabGeo(
+  w: number,
+  h: number,
+  d: number,
+  radius = 0.014,
+  bevel = 0.008
+): THREE.ExtrudeGeometry {
+  const b = Math.min(bevel, h * 0.35, w * 0.15, d * 0.15);
+  const innerDepth = Math.max(0.004, h - b * 2);
+  const shape = createRoundedRectShape(Math.max(0.01, w - b * 2), Math.max(0.01, d - b * 2), radius);
+  const geo = new THREE.ExtrudeGeometry(shape, {
+    depth: innerDepth,
+    bevelEnabled: true,
+    bevelThickness: b,
+    bevelSize: b,
+    bevelSegments: 2,
+    curveSegments: 8,
+  });
+  geo.rotateX(-Math.PI / 2);
+  geo.center();
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createBeveledRingGeo(
+  outerR: number,
+  innerR: number,
+  depth = 0.014,
+  bevel = 0.004,
+  curveSegs = 40
+): THREE.ExtrudeGeometry {
+  const shape = new THREE.Shape();
+  shape.absarc(0, 0, outerR, 0, Math.PI * 2, false);
+  const hole = new THREE.Path();
+  hole.absarc(0, 0, Math.max(0.01, innerR), 0, Math.PI * 2, true);
+  shape.holes.push(hole);
+
+  const geo = new THREE.ExtrudeGeometry(shape, {
+    depth,
+    bevelEnabled: true,
+    bevelThickness: bevel,
+    bevelSize: bevel,
+    bevelSegments: 2,
+    curveSegments: curveSegs,
+  });
+  geo.rotateX(-Math.PI / 2);
+  geo.center();
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createHexShieldRingGeo(
+  outerR: number,
+  innerR: number,
+  depth = 0.022,
+  bevel = 0.007
+): THREE.ExtrudeGeometry {
+  const sides = 8;
+  const shape = new THREE.Shape();
+  const hole = new THREE.Path();
+  for (let i = 0; i < sides; i++) {
+    const a = (i / sides) * Math.PI * 2 + Math.PI / 8;
+    const ox = Math.cos(a) * outerR;
+    const oy = Math.sin(a) * outerR;
+    if (i === 0) shape.moveTo(ox, oy);
+    else shape.lineTo(ox, oy);
+  }
+  shape.closePath();
+
+  for (let i = sides - 1; i >= 0; i--) {
+    const a = (i / sides) * Math.PI * 2 + Math.PI / 8;
+    const ix = Math.cos(a) * innerR;
+    const iy = Math.sin(a) * innerR;
+    if (i === sides - 1) hole.moveTo(ix, iy);
+    else hole.lineTo(ix, iy);
+  }
+  hole.closePath();
+  shape.holes.push(hole);
+
+  const geo = new THREE.ExtrudeGeometry(shape, {
+    depth,
+    bevelEnabled: true,
+    bevelThickness: bevel,
+    bevelSize: bevel,
+    bevelSegments: 2,
+  });
+  geo.center();
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createCenteredQuadGeo(w: number, h: number): THREE.BufferGeometry {
+  const hw = w * 0.5;
+  const hh = h * 0.5;
+  const positions = new Float32Array([
+    -hw, -hh, 0,
+     hw, -hh, 0,
+     hw,  hh, 0,
+    -hw,  hh, 0,
+  ]);
+  const normals = new Float32Array([
+    0, 0, 1,
+    0, 0, 1,
+    0, 0, 1,
+    0, 0, 1,
+  ]);
+  const uvs = new Float32Array([
+    0, 0,
+    1, 0,
+    1, 1,
+    0, 1,
+  ]);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  geo.setIndex([0, 1, 2, 0, 2, 3]);
+  return geo;
+}
+
+function createCenteredDiscGeo(radius: number, segs = 32): THREE.BufferGeometry {
+  const positions: number[] = [0, 0, 0];
+  const normals: number[] = [0, 1, 0];
+  const uvs: number[] = [0.5, 0.5];
+  const indices: number[] = [];
+  for (let i = 0; i <= segs; i++) {
+    const a = (i / segs) * Math.PI * 2;
+    const c = Math.cos(a);
+    const s = Math.sin(a);
+    positions.push(c * radius, 0, s * radius);
+    normals.push(0, 1, 0);
+    uvs.push(0.5 + c * 0.5, 0.5 + s * 0.5);
+    if (i > 0) {
+      indices.push(0, i, i + 1);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  return geo;
+}
+
+function createCurvedPhosphorGeo(
+  w: number,
+  h: number,
+  segX = 14,
+  segY = 6,
+  bulge = 0.018
+): THREE.BufferGeometry {
+  const positions: number[] = [];
+  const uvs: number[] = [];
+  const indices: number[] = [];
+  for (let iy = 0; iy <= segY; iy++) {
+    const v = iy / segY;
+    const py = (v - 0.5) * h;
+    const curveV = Math.cos((v - 0.5) * Math.PI * 0.8);
+    for (let ix = 0; ix <= segX; ix++) {
+      const u = ix / segX;
+      const px = (u - 0.5) * w;
+      const curveU = Math.cos((u - 0.5) * Math.PI * 0.85);
+      const pz = bulge * curveU * curveV;
+      positions.push(px, py, pz);
+      uvs.push(u, v);
+    }
+  }
+  const row = segX + 1;
+  for (let iy = 0; iy < segY; iy++) {
+    for (let ix = 0; ix < segX; ix++) {
+      const a = iy * row + ix;
+      const b = a + 1;
+      const c = a + row;
+      const d = c + 1;
+      indices.push(a, b, d, a, d, c);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createCrtBezelFrameGeo(
+  outerW: number,
+  outerH: number,
+  innerW: number,
+  innerH: number,
+  depth = 0.085,
+  bevel = 0.016
+): THREE.ExtrudeGeometry {
+  const outer = createRoundedRectShape(outerW, outerH, 0.042);
+  const hw = innerW * 0.5;
+  const hh = innerH * 0.5;
+  const r = 0.022;
+  const hole = new THREE.Path();
+  hole.moveTo(-hw + r, -hh);
+  hole.lineTo(-hw, -hh + r);
+  hole.lineTo(-hw, hh - r);
+  hole.lineTo(-hw + r, hh);
+  hole.lineTo(hw - r, hh);
+  hole.lineTo(hw, hh - r);
+  hole.lineTo(hw, -hh + r);
+  hole.lineTo(hw - r, -hh);
+  hole.closePath();
+  outer.holes.push(hole);
+
+  const geo = new THREE.ExtrudeGeometry(outer, {
+    depth,
+    bevelEnabled: true,
+    bevelThickness: bevel,
+    bevelSize: bevel,
+    bevelSegments: 2,
+    curveSegments: 8,
+  });
+  geo.center();
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createCrtVisorAwningGeo(width: number): THREE.ExtrudeGeometry {
+  const s = new THREE.Shape();
+  s.moveTo(-0.08, -0.02);
+  s.lineTo(0.08, -0.045);
+  s.lineTo(0.08, 0.01);
+  s.lineTo(-0.08, 0.03);
+  s.closePath();
+  const geo = new THREE.ExtrudeGeometry(s, {
+    depth: width,
+    bevelEnabled: true,
+    bevelThickness: 0.008,
+    bevelSize: 0.008,
+    bevelSegments: 2,
+  });
+  geo.rotateY(Math.PI / 2);
+  geo.center();
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createRotaryDialGeo(): THREE.LatheGeometry {
+  const pts = [
+    new THREE.Vector2(0.0, 0.0),
+    new THREE.Vector2(0.036, 0.0),
+    new THREE.Vector2(0.036, 0.012),
+    new THREE.Vector2(0.028, 0.016),
+    new THREE.Vector2(0.028, 0.03),
+    new THREE.Vector2(0.022, 0.035),
+    new THREE.Vector2(0.0, 0.035),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 18);
+  geo.rotateX(Math.PI / 2);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createRivetGeo(): THREE.LatheGeometry {
+  const pts = [
+    new THREE.Vector2(0.0, 0.0),
+    new THREE.Vector2(0.014, 0.0),
+    new THREE.Vector2(0.014, 0.006),
+    new THREE.Vector2(0.009, 0.012),
+    new THREE.Vector2(0.0, 0.013),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 12);
+  geo.rotateX(Math.PI / 2);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createTubeSocketGeo(): THREE.LatheGeometry {
+  const pts = [
+    new THREE.Vector2(0.0, 0.0),
+    new THREE.Vector2(0.052, 0.0),
+    new THREE.Vector2(0.052, 0.012),
+    new THREE.Vector2(0.045, 0.018),
+    new THREE.Vector2(0.045, 0.034),
+    new THREE.Vector2(0.038, 0.038),
+    new THREE.Vector2(0.0, 0.038),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 18);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createTubeGlassGeo(): THREE.LatheGeometry {
+  const pts = [
+    new THREE.Vector2(0.0, 0.0),
+    new THREE.Vector2(0.034, 0.0),
+    new THREE.Vector2(0.037, 0.024),
+    new THREE.Vector2(0.036, 0.178),
+    new THREE.Vector2(0.031, 0.205),
+    new THREE.Vector2(0.018, 0.222),
+    new THREE.Vector2(0.007, 0.232),
+    new THREE.Vector2(0.0, 0.235),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 18);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createTubeCapGeo(): THREE.LatheGeometry {
+  const pts = [
+    new THREE.Vector2(0.0, 0.0),
+    new THREE.Vector2(0.028, 0.0),
+    new THREE.Vector2(0.026, 0.012),
+    new THREE.Vector2(0.016, 0.018),
+    new THREE.Vector2(0.0, 0.02),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 14);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createTubeFilamentGeo(): THREE.LatheGeometry {
+  const pts = [
+    new THREE.Vector2(0.0, -0.085),
+    new THREE.Vector2(0.021, -0.085),
+    new THREE.Vector2(0.021, -0.068),
+    new THREE.Vector2(0.015, -0.062),
+    new THREE.Vector2(0.015, 0.062),
+    new THREE.Vector2(0.02, 0.072),
+    new THREE.Vector2(0.016, 0.085),
+    new THREE.Vector2(0.0, 0.085),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 14);
+  geo.translate(0, 0.085, 0);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createGyroCoreGeo(): THREE.LatheGeometry {
+  const pts = [
+    new THREE.Vector2(0.0, -0.068),
+    new THREE.Vector2(0.035, -0.024),
+    new THREE.Vector2(0.066, 0.0),
+    new THREE.Vector2(0.035, 0.024),
+    new THREE.Vector2(0.0, 0.068),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 10);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createSabotPenetratorGeo(): THREE.LatheGeometry {
+  // Oriented along +X (nose at +0.16, tail at -0.14)
+  const pts = [
+    new THREE.Vector2(0.0, -0.14),
+    new THREE.Vector2(0.018, -0.14),
+    new THREE.Vector2(0.024, -0.08),
+    new THREE.Vector2(0.024, 0.02),
+    new THREE.Vector2(0.019, 0.075),
+    new THREE.Vector2(0.009, 0.125),
+    new THREE.Vector2(0.002, 0.16),
+    new THREE.Vector2(0.0, 0.162),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 18);
+  geo.rotateZ(-Math.PI / 2);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createSabotDrivingBandGeo(): THREE.LatheGeometry {
+  const pts = [
+    new THREE.Vector2(0.023, -0.055),
+    new THREE.Vector2(0.03, -0.048),
+    new THREE.Vector2(0.03, -0.022),
+    new THREE.Vector2(0.023, -0.015),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 18);
+  geo.rotateZ(-Math.PI / 2);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createSabotFinGeo(): THREE.ExtrudeGeometry {
+  const s = new THREE.Shape();
+  s.moveTo(-0.135, 0.016);
+  s.lineTo(-0.078, 0.016);
+  s.lineTo(-0.095, 0.056);
+  s.lineTo(-0.138, 0.052);
+  s.closePath();
+  const geo = new THREE.ExtrudeGeometry(s, {
+    depth: 0.005,
+    bevelEnabled: true,
+    bevelThickness: 0.002,
+    bevelSize: 0.002,
+    bevelSegments: 1,
+  });
+  geo.translate(0, 0, -0.0025);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createMachVaporConeGeo(): THREE.LatheGeometry {
+  // Flared supersonic Prandtl-Glauert cone opening rearward along -X
+  const pts = [
+    new THREE.Vector2(0.032, 0.075),
+    new THREE.Vector2(0.068, 0.025),
+    new THREE.Vector2(0.115, -0.025),
+    new THREE.Vector2(0.148, -0.065),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 28);
+  geo.rotateZ(-Math.PI / 2);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createTaperedDartGeo(length = 0.4, radius = 0.015): THREE.LatheGeometry {
+  const h = length * 0.5;
+  const pts = [
+    new THREE.Vector2(0.0, -h),
+    new THREE.Vector2(radius * 0.55, -h * 0.55),
+    new THREE.Vector2(radius, h * 0.45),
+    new THREE.Vector2(radius * 0.65, h * 0.82),
+    new THREE.Vector2(0.0, h),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 10);
+  geo.rotateZ(-Math.PI / 2);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createNeedleSparkGeo(length = 0.34, radius = 0.012): THREE.LatheGeometry {
+  const h = length * 0.5;
+  const pts = [
+    new THREE.Vector2(0.0, -h),
+    new THREE.Vector2(radius * 0.5, -h * 0.4),
+    new THREE.Vector2(radius, h * 0.55),
+    new THREE.Vector2(0.0, h),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 8);
+  geo.rotateX(Math.PI / 2);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createArtilleryShellGeo(): THREE.LatheGeometry {
+  const pts = [
+    new THREE.Vector2(0.0, -0.68),
+    new THREE.Vector2(0.016, -0.45),
+    new THREE.Vector2(0.048, 0.15),
+    new THREE.Vector2(0.056, 0.42),
+    new THREE.Vector2(0.036, 0.58),
+    new THREE.Vector2(0.0, 0.68),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 14);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createEnergyLanceGeo(): THREE.LatheGeometry {
+  const pts = [
+    new THREE.Vector2(0.0, -1.25),
+    new THREE.Vector2(0.06, -1.05),
+    new THREE.Vector2(0.088, 0.0),
+    new THREE.Vector2(0.056, 1.05),
+    new THREE.Vector2(0.0, 1.25),
+  ];
+  const geo = new THREE.LatheGeometry(pts, 16);
+  geo.rotateZ(-Math.PI / 2);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createShrapnelPlateGeo(): THREE.ExtrudeGeometry {
+  const s = new THREE.Shape();
+  s.moveTo(-0.058, -0.032);
+  s.lineTo(0.048, -0.042);
+  s.lineTo(0.068, 0.018);
+  s.lineTo(-0.014, 0.048);
+  s.lineTo(-0.064, 0.012);
+  s.closePath();
+  const geo = new THREE.ExtrudeGeometry(s, {
+    depth: 0.018,
+    bevelEnabled: true,
+    bevelThickness: 0.005,
+    bevelSize: 0.005,
+    bevelSegments: 1,
+  });
+  geo.center();
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// ---------------------------------------------------------------------------
+// Custom ShaderMaterials
+// ---------------------------------------------------------------------------
+
+function createEnergyFadeShaderMaterial(
+  rgb: THREE.Color,
+  opacity = 1.0,
+  additive = true,
+  doubleSided = false
+): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: rgb.clone() },
+      uOpacity: { value: opacity },
+      uCoreBoost: { value: 1.0 },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      varying vec3 vNormalV;
+      varying vec3 vViewPos;
+      void main() {
+        vUv = uv;
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        vViewPos = -mv.xyz;
+        vNormalV = normalize(normalMatrix * normal);
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uColor;
+      uniform float uOpacity;
+      uniform float uCoreBoost;
+      varying vec2 vUv;
+      varying vec3 vNormalV;
+      varying vec3 vViewPos;
+      void main() {
+        vec3 n = normalize(vNormalV);
+        vec3 v = normalize(vViewPos);
+        float rim = 1.0 - abs(dot(n, v));
+        float core = mix(0.75, 1.35, 1.0 - rim * 0.45) * uCoreBoost;
+        float a = clamp(uOpacity, 0.0, 1.0);
+        if (a <= 0.004) discard;
+        gl_FragColor = vec4(uColor * core, a);
+      }
+    `,
+    transparent: true,
+    depthWrite: !additive,
+    blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+    side: doubleSided ? THREE.DoubleSide : THREE.FrontSide,
+    toneMapped: false,
+  });
+}
+
+function createCrtPhosphorShaderMaterial(map: THREE.Texture): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uMap: { value: map },
+      uTime: { value: 0.0 },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      varying vec3 vNormalV;
+      varying vec3 vViewPos;
+      void main() {
+        vUv = uv;
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        vViewPos = -mv.xyz;
+        vNormalV = normalize(normalMatrix * normal);
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D uMap;
+      uniform float uTime;
+      varying vec2 vUv;
+      varying vec3 vNormalV;
+      varying vec3 vViewPos;
+      void main() {
+        vec3 tex = texture2D(uMap, vUv).rgb;
+        float scan = 0.94 + 0.06 * sin(vUv.y * 190.0 + uTime * 3.0);
+        vec2 c = (vUv - 0.5) * 2.0;
+        float vig = clamp(1.0 - dot(c * vec2(0.55, 0.72), c * vec2(0.55, 0.72)) * 0.45, 0.58, 1.0);
+        vec3 n = normalize(vNormalV);
+        vec3 v = normalize(vViewPos);
+        float fresnel = pow(1.0 - max(0.0, dot(n, v)), 3.2);
+        vec3 glassTint = vec3(0.18, 0.24, 0.22) * fresnel * 0.42;
+        gl_FragColor = vec4(tex * scan * vig + glassTint, 1.0);
+      }
+    `,
+    toneMapped: false,
+  });
+}
+
+function createReconLaserShaderMaterial(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: new THREE.Color(0.35, 2.45, 1.85) },
+      uOpacity: { value: 0.0 },
+      uTime: { value: 0.0 },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uColor;
+      uniform float uOpacity;
+      uniform float uTime;
+      varying vec2 vUv;
+      void main() {
+        float pulse = 0.65 + 0.35 * sin(vUv.x * 24.0 - uTime * 14.0);
+        float a = pulse * uOpacity;
+        if (a <= 0.005) discard;
+        gl_FragColor = vec4(uColor * (0.9 + 0.5 * pulse), a);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide,
+    toneMapped: false,
+  });
+}
+
+function createTraverseBridgeShaderMaterial(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: new THREE.Color(2.45, 1.92, 0.62) },
+      uOpacity: { value: 0.0 },
+      uTime: { value: 0.0 },
+      uDirection: { value: 1.0 },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      varying vec3 vLocalPos;
+      void main() {
+        vUv = uv;
+        vLocalPos = position;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uColor;
+      uniform float uOpacity;
+      uniform float uTime;
+      uniform float uDirection;
+      varying vec2 vUv;
+      varying vec3 vLocalPos;
+      void main() {
+        float lane = abs(vLocalPos.z) / 0.16;
+        float chevron = abs(fract((vLocalPos.x * uDirection * 2.2) - uTime * 2.6 + lane * 0.45) - 0.5) * 2.0;
+        float stripe = smoothstep(0.45, 0.92, chevron);
+        float edge = smoothstep(1.0, 0.72, lane);
+        float a = (0.28 + 0.72 * stripe) * edge * uOpacity;
+        if (a <= 0.005) discard;
+        gl_FragColor = vec4(uColor * (0.85 + 0.85 * stripe), a);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide,
+    toneMapped: false,
+  });
 }
 
 function createWarfieldExplosionPlumeMaterial(
@@ -95,8 +781,8 @@ function createWarfieldExplosionPlumeMaterial(
 
       float fbm(vec2 p) {
         float v = 0.0;
-        float a = 0.52;
-        for (int i = 0; i < 4; i++) {
+        float a = 0.54;
+        for (int i = 0; i < 3; i++) {
           v += a * vnoise(p);
           p = p * 2.07 + vec2(1.7, -2.3);
           a *= 0.5;
@@ -215,12 +901,7 @@ function createGaussianLightShaftMaterial(rgb: THREE.Color): THREE.ShaderMateria
 }
 
 /**
- * 5-Part War Cinema & Heartbeat Suspense Stage (`ArbiterStage3D.ts`):
- *  1. Asymmetric Lunge-vs-Brace Lock-In + 3D Frontline Suppression Tug-of-War Gauge (`84%` push!)
- *  2. "The Strachan Vacuum": Total acoustic/visual blackout + ECG Heartbeat + `0.08x` Bullet-Time 88mm Shell + Mach Ring
- *  3. "Brick-Wall Ambush Reversal" when Defender wins (Sloped-armor deflection shield + violent counter-battery shell)
- *  4. Kurosawa Delayed `MUTUAL_SPLIT` Double-KO Whiplash + Ceremonial `180°` `FLAG_CAPTURED` Unmasking + `SPY_INTERCEPTED`
- *  5. Dynamic 3-Shot *XCOM / Fury* Over-The-Shoulder Breach/Ambush & Bullet-Time Camera Director + Hold-to-Overdrive (`2.2x`)
+ * Sculpted 3D War Cinema & 6-Choreography Electronic Arbiter Stage (`ArbiterStage3D.ts`)
  */
 export class ArbiterStage3D {
   public readonly root = new THREE.Group();
@@ -230,30 +911,33 @@ export class ArbiterStage3D {
   private readonly sound: SoundDirector;
 
   private readonly arenaMount = new THREE.Group();
-  private readonly leftBastionRingMat: THREE.MeshBasicMaterial;
-  private readonly rightBastionRingMat: THREE.MeshBasicMaterial;
+  private readonly leftBastionRingMat: THREE.ShaderMaterial;
+  private readonly rightBastionRingMat: THREE.ShaderMaterial;
 
-  // 3D Diegetic Frontline Suppression Tug-of-War Gauge across No-Man's-Land!
+  // 3D Diegetic Frontline Suppression Tug-of-War Gauge across No-Man's-Land
   private readonly frontlineGroup = new THREE.Group();
   private readonly blueFrontlineBar: THREE.Mesh;
   private readonly crimsonFrontlineBar: THREE.Mesh;
+  private readonly blueFrontlineMat: THREE.ShaderMaterial;
+  private readonly crimsonFrontlineMat: THREE.ShaderMaterial;
   private readonly frontlineSparkNode: THREE.Mesh;
   private readonly armorDeflectShield: THREE.Mesh;
-  private readonly armorDeflectMat: THREE.MeshBasicMaterial;
+  private readonly armorDeflectMat: THREE.ShaderMaterial;
 
-  // Bullet-Time 88mm Armor-Piercing Hero Shell + Supersonic Mach Vapor Cone!
+  // Bullet-Time 88mm APFSDS Sabot Shell + Supersonic Mach Vapor Cone
   private readonly bulletTimeShellGroup = new THREE.Group();
-  private readonly machConeMat: THREE.MeshBasicMaterial;
+  private readonly machConeMat: THREE.ShaderMaterial;
 
-  // Bunker Tactical Comms CRT (`512x192`) + 8 Physical 3D Vacuum-Tube Equalizer Columns (@ 60 FPS!)
+  // Bunker Tactical Comms CRT (`512x192`) + 8 Sculpted Vacuum-Tube Equalizer Columns
   private readonly crtCanvas: HTMLCanvasElement;
   private readonly crtCtx: CanvasRenderingContext2D;
   private readonly crtTexture: THREE.CanvasTexture;
+  private readonly crtScreenMat: THREE.ShaderMaterial;
   private readonly timeDomainBytes = new Uint8Array(new ArrayBuffer(256));
   private readonly frequencyBytes = new Uint8Array(new ArrayBuffer(256));
   private readonly vacuumTubes: Array<{
     readonly filament: THREE.Mesh;
-    readonly mat: THREE.MeshBasicMaterial;
+    readonly mat: THREE.MeshStandardMaterial;
   }> = [];
 
   private readonly leftMuzzleStar: THREE.Group;
@@ -265,7 +949,13 @@ export class ArbiterStage3D {
   private readonly flakPuffs: PlumeBillow[] = [];
   private readonly incomingShells: THREE.Mesh[] = [];
   private readonly heatBeamMesh: THREE.Mesh;
-  private readonly heatBeamMat: THREE.MeshBasicMaterial;
+  private readonly heatBeamMat: THREE.ShaderMaterial;
+
+  private readonly reconSweepGroup = new THREE.Group();
+  private readonly reconLaserMat: THREE.ShaderMaterial;
+  private readonly reconReticle: THREE.Mesh;
+  private readonly traverseBridgeGroup = new THREE.Group();
+  private readonly traverseBridgeMat: THREE.ShaderMaterial;
 
   private readonly shockwaves: Array<{ mesh: THREE.Mesh; mat: THREE.ShaderMaterial }> = [];
   private readonly explosionPlumes: PlumeBillow[] = [];
@@ -273,12 +963,16 @@ export class ArbiterStage3D {
   private readonly sparkPool: ShrapnelItem[] = [];
   private readonly scorchDecalLeft: THREE.Mesh;
   private readonly scorchDecalRight: THREE.Mesh;
+  private readonly scorchTexture: THREE.CanvasTexture;
 
   private readonly winnerSpotLight: THREE.SpotLight;
   private readonly winnerShaftMesh: THREE.Mesh;
   private readonly winnerShaftMat: THREE.ShaderMaterial;
 
   private readonly medallionMesh: THREE.Group;
+  private readonly fxRegistry: THREE.Object3D[] = [];
+  private readonly disposableGeometries: THREE.BufferGeometry[] = [];
+  private readonly disposableMaterials: THREE.Material[] = [];
 
   private playerStageWedge: THREE.Group | null = null;
   private enemyStageWedge: THREE.Group | null = null;
@@ -287,16 +981,17 @@ export class ArbiterStage3D {
   private enemyStartWorld = new THREE.Vector3();
 
   private activeVerdict: ArbiterVerdict | null = null;
+  private activeProfile: ChoreographyVisualProfile | null = null;
   private finisherVariant = 0;
   private clashCounter = 0;
 
-  // Deterministic Elastic Phase Timestamps (driven 100% by Public DEFCON Tier — zero `enemy.trueRank` leak!)
-  private tAct1End = 0.78;
+  private tAct1End = 0.76;
   private tPushEnd = 1.95;
   private tVerdict = 2.45;
   private tTotalEnd = 4.35;
 
   private elapsed = 0;
+  private lastLiveStepMs = 0;
   private speedScale = 1;
   private overdriveHeld = false;
   private pausedForDebug = false;
@@ -310,6 +1005,8 @@ export class ArbiterStage3D {
   private cameraShakeOffset = new THREE.Vector3();
   private readonly camShotPos = new THREE.Vector3();
   private readonly camShotLook = new THREE.Vector3();
+  private lastCrtMode = '';
+  private lastCrtDrawSec = -1;
 
   constructor(factory: MeshFactory, sound: SoundDirector) {
     this.factory = factory;
@@ -317,85 +1014,95 @@ export class ArbiterStage3D {
 
     this.root.position.set(0, 0, ARBITER_BAY_CENTER_Z);
 
-    const fbFloor = new THREE.Mesh(
-      new THREE.BoxGeometry(4.96, 0.12, 2.0),
-      this.factory.materials.mudTerrain
-    );
+    const fbFloorGeo = createBeveledSlabGeo(4.96, 0.12, 2.0, 0.08, 0.022);
+    this.disposableGeometries.push(fbFloorGeo);
+    const fbFloor = new THREE.Mesh(fbFloorGeo, this.factory.materials.mudTerrain);
     fbFloor.position.set(0, -0.28, 0);
     fbFloor.receiveShadow = true;
     this.arenaMount.add(fbFloor);
     this.root.add(this.arenaMount);
 
-    this.leftBastionRingMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(0.32, 1.9, 2.4),
-      transparent: true,
-      opacity: 0.25,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      toneMapped: false,
-    });
-    const lRing = new THREE.Mesh(new THREE.RingGeometry(0.42, 0.5, 44), this.leftBastionRingMat);
-    lRing.rotation.x = -Math.PI / 2;
+    const bastionRingGeo = createBeveledRingGeo(0.5, 0.42, 0.012, 0.004, 44);
+    this.disposableGeometries.push(bastionRingGeo);
+
+    this.leftBastionRingMat = createEnergyFadeShaderMaterial(
+      new THREE.Color(0.32, 1.9, 2.4),
+      0.22,
+      true,
+      true
+    );
+    this.disposableMaterials.push(this.leftBastionRingMat);
+    const lRing = new THREE.Mesh(bastionRingGeo, this.leftBastionRingMat);
     lRing.position.set(-BASTION_X, BASTION_SURFACE_Y + 0.008, BASTION_Z);
     this.root.add(lRing);
 
-    this.rightBastionRingMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(2.35, 0.28, 0.36),
-      transparent: true,
-      opacity: 0.25,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      toneMapped: false,
-    });
-    const rRing = new THREE.Mesh(new THREE.RingGeometry(0.42, 0.5, 44), this.rightBastionRingMat);
-    rRing.rotation.x = -Math.PI / 2;
+    this.rightBastionRingMat = createEnergyFadeShaderMaterial(
+      new THREE.Color(2.35, 0.28, 0.36),
+      0.22,
+      true,
+      true
+    );
+    this.disposableMaterials.push(this.rightBastionRingMat);
+    const rRing = new THREE.Mesh(bastionRingGeo, this.rightBastionRingMat);
     rRing.position.set(BASTION_X, BASTION_SURFACE_Y + 0.008, BASTION_Z);
     this.root.add(rRing);
 
-    // 3D Diegetic Frontline Tug-of-War Laser Rail (`x = -1.06 .. +1.06`)
+    // Sculpted 3D Diegetic Frontline Tug-of-War Gauge (`x = -1.06 .. +1.06`)
     this.frontlineGroup.position.set(0, BASTION_SURFACE_Y + 0.025, BASTION_Z + 0.42);
-    const railBack = new THREE.Mesh(
-      new THREE.BoxGeometry(2.18, 0.018, 0.075),
-      this.factory.materials.darkSteel
-    );
+    const railBackGeo = createBeveledSlabGeo(2.18, 0.022, 0.082, 0.014, 0.006);
+    this.disposableGeometries.push(railBackGeo);
+    const railBack = new THREE.Mesh(railBackGeo, this.factory.materials.darkSteel);
+    railBack.castShadow = true;
+    railBack.receiveShadow = true;
     this.frontlineGroup.add(railBack);
 
-    const detentGeo = new THREE.BoxGeometry(0.028, 0.032, 0.11);
+    const detentGeo = createBeveledSlabGeo(0.032, 0.036, 0.116, 0.006, 0.005);
+    this.disposableGeometries.push(detentGeo);
     for (const dx of [-1.05, -0.525, 0, 0.525, 1.05]) {
       const pip = new THREE.Mesh(detentGeo, this.factory.materials.brassTrim);
       pip.position.x = dx;
+      pip.castShadow = true;
       this.frontlineGroup.add(pip);
     }
 
-    const barGeo = new THREE.BoxGeometry(1.0, 0.028, 0.052);
-    barGeo.translate(0.5, 0, 0); // scale.x grows cleanly from left origin!
-    this.blueFrontlineBar = new THREE.Mesh(
-      barGeo,
-      new THREE.MeshBasicMaterial({
-        color: new THREE.Color(0.35, 1.85, 2.55),
-        toneMapped: false,
-      })
+    const barGeo = createBeveledSlabGeo(1.0, 0.028, 0.052, 0.01, 0.006);
+    barGeo.translate(0.5, 0, 0);
+    this.disposableGeometries.push(barGeo);
+    this.blueFrontlineMat = createEnergyFadeShaderMaterial(
+      new THREE.Color(0.35, 1.85, 2.55),
+      0.96,
+      false,
+      false
     );
+    this.disposableMaterials.push(this.blueFrontlineMat);
+    this.blueFrontlineBar = new THREE.Mesh(barGeo, this.blueFrontlineMat);
     this.blueFrontlineBar.position.set(-1.05, 0.008, 0);
 
-    const rBarGeo = new THREE.BoxGeometry(1.0, 0.028, 0.052);
-    rBarGeo.translate(-0.5, 0, 0); // grows from right origin!
-    this.crimsonFrontlineBar = new THREE.Mesh(
-      rBarGeo,
-      new THREE.MeshBasicMaterial({
-        color: new THREE.Color(2.55, 0.34, 0.42),
-        toneMapped: false,
-      })
+    const rBarGeo = createBeveledSlabGeo(1.0, 0.028, 0.052, 0.01, 0.006);
+    rBarGeo.translate(-0.5, 0, 0);
+    this.disposableGeometries.push(rBarGeo);
+    this.crimsonFrontlineMat = createEnergyFadeShaderMaterial(
+      new THREE.Color(2.55, 0.34, 0.42),
+      0.96,
+      false,
+      false
     );
+    this.disposableMaterials.push(this.crimsonFrontlineMat);
+    this.crimsonFrontlineBar = new THREE.Mesh(rBarGeo, this.crimsonFrontlineMat);
     this.crimsonFrontlineBar.position.set(1.05, 0.008, 0);
 
-    this.frontlineSparkNode = new THREE.Mesh(
-      new THREE.OctahedronGeometry(0.068, 0),
-      new THREE.MeshBasicMaterial({
-        color: new THREE.Color(2.9, 2.35, 1.2),
-        toneMapped: false,
-      })
-    );
+    const gyroGeo = createGyroCoreGeo();
+    this.disposableGeometries.push(gyroGeo);
+    const sparkNodeMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(1.0, 0.85, 0.45),
+      emissive: new THREE.Color(2.9, 2.35, 1.2),
+      emissiveIntensity: 1.5,
+      metalness: 0.72,
+      roughness: 0.22,
+      toneMapped: false,
+    });
+    this.disposableMaterials.push(sparkNodeMat);
+    this.frontlineSparkNode = new THREE.Mesh(gyroGeo, sparkNodeMat);
     this.frontlineSparkNode.position.y = 0.024;
     this.frontlineGroup.add(
       this.blueFrontlineBar,
@@ -404,48 +1111,62 @@ export class ArbiterStage3D {
     );
     this.frontlineGroup.visible = false;
     this.root.add(this.frontlineGroup);
+    this.fxRegistry.push(this.frontlineGroup);
 
-    // Sloped-Armor "Brick-Wall" Glacis Deflection Shield Flash!
-    this.armorDeflectMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(2.8, 2.1, 0.75),
-      transparent: true,
-      opacity: 0,
-      blending: THREE.AdditiveBlending,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-      toneMapped: false,
-    });
-    this.armorDeflectShield = new THREE.Mesh(
-      new THREE.RingGeometry(0.22, 0.36, 28),
-      this.armorDeflectMat
+    // Sculpted Octagonal Glacis Armor Deflection Shield Flash
+    this.armorDeflectMat = createEnergyFadeShaderMaterial(
+      new THREE.Color(2.8, 2.1, 0.75),
+      0.0,
+      true,
+      true
     );
+    this.disposableMaterials.push(this.armorDeflectMat);
+    const shieldGeo = createHexShieldRingGeo(0.36, 0.22, 0.022, 0.007);
+    this.disposableGeometries.push(shieldGeo);
+    this.armorDeflectShield = new THREE.Mesh(shieldGeo, this.armorDeflectMat);
     this.armorDeflectShield.visible = false;
     this.root.add(this.armorDeflectShield);
+    this.fxRegistry.push(this.armorDeflectShield);
 
-    // `0.08x` Bullet-Time 88mm Armor-Piercing Hero Shell + Supersonic Mach Vapor Ring!
-    const apProjectile = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.008, 0.026, 0.26, 14),
-      new THREE.MeshBasicMaterial({
-        color: new THREE.Color(2.6, 1.75, 0.55),
-        toneMapped: false,
-      })
-    );
-    apProjectile.rotation.z = -Math.PI / 2;
-    this.machConeMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(2.2, 1.55, 0.65),
-      transparent: true,
-      opacity: 0.72,
-      blending: THREE.AdditiveBlending,
-      side: THREE.DoubleSide,
-      depthWrite: false,
+    // Sculpted Multi-Part 88mm APFSDS Sabot Shell + Supersonic Prandtl-Glauert Mach Vapor Cone
+    const sabotPenGeo = createSabotPenetratorGeo();
+    const sabotBandGeo = createSabotDrivingBandGeo();
+    const sabotFinGeo = createSabotFinGeo();
+    const machConeGeo = createMachVaporConeGeo();
+    this.disposableGeometries.push(sabotPenGeo, sabotBandGeo, sabotFinGeo, machConeGeo);
+
+    const sabotGlowMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#d29a48'),
+      emissive: new THREE.Color(2.2, 1.45, 0.45),
+      emissiveIntensity: 1.35,
+      metalness: 0.86,
+      roughness: 0.22,
       toneMapped: false,
     });
-    const machRing = new THREE.Mesh(new THREE.RingGeometry(0.065, 0.135, 28), this.machConeMat);
-    machRing.rotation.y = Math.PI / 2;
-    machRing.position.x = 0.04;
-    this.bulletTimeShellGroup.add(apProjectile, machRing);
+    this.disposableMaterials.push(sabotGlowMat);
+
+    const apProjectile = new THREE.Mesh(sabotPenGeo, sabotGlowMat);
+    const drivingBand = new THREE.Mesh(sabotBandGeo, this.factory.materials.brassTrim);
+    this.bulletTimeShellGroup.add(apProjectile, drivingBand);
+    for (let f = 0; f < 4; f++) {
+      const fin = new THREE.Mesh(sabotFinGeo, this.factory.materials.darkSteel);
+      fin.rotation.x = (f * Math.PI) / 2;
+      this.bulletTimeShellGroup.add(fin);
+    }
+
+    this.machConeMat = createEnergyFadeShaderMaterial(
+      new THREE.Color(2.2, 1.55, 0.65),
+      0.72,
+      true,
+      true
+    );
+    this.disposableMaterials.push(this.machConeMat);
+    const machCone = new THREE.Mesh(machConeGeo, this.machConeMat);
+    machCone.position.x = 0.02;
+    this.bulletTimeShellGroup.add(machCone);
     this.bulletTimeShellGroup.visible = false;
     this.root.add(this.bulletTimeShellGroup);
+    this.fxRegistry.push(this.bulletTimeShellGroup);
 
     // Scorched Blast Crater Decals
     const scorchCanvas = document.createElement('canvas');
@@ -459,13 +1180,19 @@ export class ArbiterStage3D {
     sGrad.addColorStop(1, 'rgba(0, 0, 0, 0.0)');
     sCtx.fillStyle = sGrad;
     sCtx.fillRect(0, 0, 128, 128);
-    const scorchMat = new THREE.MeshBasicMaterial({
-      map: new THREE.CanvasTexture(scorchCanvas),
+    this.scorchTexture = new THREE.CanvasTexture(scorchCanvas);
+    const scorchMat = new THREE.MeshStandardMaterial({
+      map: this.scorchTexture,
       transparent: true,
       depthWrite: false,
+      roughness: 0.98,
+      metalness: 0.04,
+      emissive: new THREE.Color('#2a0d04'),
+      emissiveIntensity: 0.45,
     });
-    const scorchGeo = new THREE.PlaneGeometry(1.25, 1.25);
-    scorchGeo.rotateX(-Math.PI / 2);
+    this.disposableMaterials.push(scorchMat);
+    const scorchGeo = createCenteredDiscGeo(0.625, 36);
+    this.disposableGeometries.push(scorchGeo);
     this.scorchDecalLeft = new THREE.Mesh(scorchGeo, scorchMat);
     this.scorchDecalLeft.position.set(-BASTION_X, BASTION_SURFACE_Y + 0.012, BASTION_Z);
     this.scorchDecalLeft.visible = false;
@@ -473,24 +1200,67 @@ export class ArbiterStage3D {
     this.scorchDecalRight.position.set(BASTION_X, BASTION_SURFACE_Y + 0.012, BASTION_Z);
     this.scorchDecalRight.visible = false;
     this.root.add(this.scorchDecalLeft, this.scorchDecalRight);
+    this.fxRegistry.push(this.scorchDecalLeft, this.scorchDecalRight);
 
-    // Rear Bunker Tactical CRT + 8 Physical 3D Vacuum-Tube Equalizer Bars (`fftSize = 512` @ 60 FPS!)
+    // Sculpted Armored 3D CRT Housing + Brass Rotary Dials + Curved Phosphor Screen
     this.crtCanvas = document.createElement('canvas');
     this.crtCanvas.width = 512;
     this.crtCanvas.height = 192;
     this.crtCtx = this.crtCanvas.getContext('2d')!;
     this.crtTexture = new THREE.CanvasTexture(this.crtCanvas);
     this.crtTexture.colorSpace = THREE.SRGBColorSpace;
-    const crtMesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(1.24, 0.28),
-      new THREE.MeshBasicMaterial({ map: this.crtTexture, toneMapped: false })
-    );
-    crtMesh.position.set(0, 0.08, -0.37);
-    this.root.add(crtMesh);
+    this.crtScreenMat = createCrtPhosphorShaderMaterial(this.crtTexture);
+    this.disposableMaterials.push(this.crtScreenMat);
 
-    const tubeSocketGeo = new THREE.CylinderGeometry(0.044, 0.05, 0.032, 16);
-    const tubeGlassGeo = new THREE.CylinderGeometry(0.036, 0.036, 0.21, 16);
-    const tubeCapGeo = new THREE.SphereGeometry(0.036, 14, 10);
+    const crtGroup = new THREE.Group();
+    crtGroup.position.set(0, 0.08, -0.37);
+
+    const crtScreenGeo = createCurvedPhosphorGeo(1.22, 0.27, 14, 6, 0.018);
+    const crtFrameGeo = createCrtBezelFrameGeo(1.38, 0.39, 1.21, 0.26, 0.085, 0.016);
+    const crtHoodGeo = createCrtVisorAwningGeo(1.36);
+    const dialGeo = createRotaryDialGeo();
+    const rivetGeo = createRivetGeo();
+    this.disposableGeometries.push(crtScreenGeo, crtFrameGeo, crtHoodGeo, dialGeo, rivetGeo);
+
+    const crtScreen = new THREE.Mesh(crtScreenGeo, this.crtScreenMat);
+    crtScreen.position.set(0, 0, 0.016);
+    const crtFrame = new THREE.Mesh(crtFrameGeo, this.factory.materials.gunmetal);
+    crtFrame.position.set(0, 0, -0.018);
+    crtFrame.castShadow = true;
+    crtFrame.receiveShadow = true;
+
+    const crtHood = new THREE.Mesh(crtHoodGeo, this.factory.materials.darkSteel);
+    crtHood.position.set(0, 0.19, 0.032);
+    crtHood.castShadow = true;
+
+    crtGroup.add(crtScreen, crtFrame, crtHood);
+
+    for (const dx of [-0.65, 0.65]) {
+      const dial = new THREE.Mesh(dialGeo, this.factory.materials.brassTrim);
+      dial.position.set(dx, -0.11, 0.036);
+      dial.castShadow = true;
+      crtGroup.add(dial);
+    }
+    for (const [rx, ry] of [
+      [-0.65, 0.155],
+      [0.65, 0.155],
+      [-0.65, -0.155],
+      [0.65, -0.155],
+    ] as const) {
+      const rivet = new THREE.Mesh(rivetGeo, this.factory.materials.brassTrim);
+      rivet.position.set(rx, ry, 0.034);
+      crtGroup.add(rivet);
+    }
+
+    this.root.add(crtGroup);
+
+    // 8 Sculpted Vacuum-Tube Equalizer Columns
+    const tubeSocketGeo = createTubeSocketGeo();
+    const tubeGlassGeo = createTubeGlassGeo();
+    const tubeCapGeo = createTubeCapGeo();
+    const filGeo = createTubeFilamentGeo();
+    this.disposableGeometries.push(tubeSocketGeo, tubeGlassGeo, tubeCapGeo, filGeo);
+
     const tubeGlassMat = new THREE.MeshPhysicalMaterial({
       color: new THREE.Color('#2a221b'),
       transparent: true,
@@ -499,8 +1269,7 @@ export class ArbiterStage3D {
       metalness: 0.05,
       clearcoat: 1.0,
     });
-    const filGeo = new THREE.CylinderGeometry(0.018, 0.02, 0.17, 12);
-    filGeo.translate(0, 0.085, 0);
+    this.disposableMaterials.push(tubeGlassMat);
 
     for (let i = 0; i < 8; i++) {
       const tx = -0.525 + (i / 7) * 1.05;
@@ -512,16 +1281,21 @@ export class ArbiterStage3D {
       socket.castShadow = true;
 
       const glass = new THREE.Mesh(tubeGlassGeo, tubeGlassMat);
-      glass.position.set(tx, baseY + 0.115, tz);
+      glass.position.set(tx, baseY + 0.015, tz);
 
       const cap = new THREE.Mesh(tubeCapGeo, this.factory.materials.brassTrim);
-      cap.scale.set(1, 0.45, 1);
-      cap.position.set(tx, baseY + 0.22, tz);
+      cap.position.set(tx, baseY + 0.236, tz);
 
-      const filMat = new THREE.MeshBasicMaterial({
-        color: new THREE.Color(1.8, 1.05, 0.28),
+      const filMat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color('#ffbe58'),
+        emissive: new THREE.Color(1.8, 1.05, 0.28),
+        emissiveIntensity: 1.4,
+        roughness: 0.3,
+        metalness: 0.25,
         toneMapped: false,
       });
+      this.disposableMaterials.push(filMat);
+
       const filament = new THREE.Mesh(filGeo, filMat);
       filament.position.set(tx, baseY + 0.015, tz);
       filament.scale.y = 0.14;
@@ -541,25 +1315,27 @@ export class ArbiterStage3D {
     this.leftMuzzleStar = this.build3DMuzzleStar(new THREE.Color(2.8, 1.95, 0.65));
     this.rightMuzzleStar = this.build3DMuzzleStar(new THREE.Color(2.9, 1.35, 0.45));
     this.root.add(this.leftMuzzleStar, this.rightMuzzleStar);
+    this.fxRegistry.push(this.leftMuzzleStar, this.rightMuzzleStar);
 
-    const tracerGeo = new THREE.BoxGeometry(0.38, 0.018, 0.018);
-    const navyTracerMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(2.6, 2.05, 0.72),
-      blending: THREE.AdditiveBlending,
-      toneMapped: false,
-    });
-    const crimsonTracerMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(2.8, 0.95, 0.42),
-      blending: THREE.AdditiveBlending,
-      toneMapped: false,
-    });
+    // Sculpted Tapered Tracer Darts
+    const tracerGeo = createTaperedDartGeo(0.4, 0.014);
+    this.disposableGeometries.push(tracerGeo);
     for (let i = 0; i < 28; i++) {
       const fromLeft = i % 2 === 0;
-      const mesh = new THREE.Mesh(tracerGeo, fromLeft ? navyTracerMat : crimsonTracerMat);
+      const mat = createEnergyFadeShaderMaterial(
+        fromLeft ? new THREE.Color(2.6, 2.05, 0.72) : new THREE.Color(2.8, 0.95, 0.42),
+        0.95,
+        true,
+        false
+      );
+      this.disposableMaterials.push(mat);
+      const mesh = new THREE.Mesh(tracerGeo, mat);
       mesh.visible = false;
       this.root.add(mesh);
+      this.fxRegistry.push(mesh);
       this.tracers.push({
         mesh,
+        mat,
         fromLeft,
         yOff: 0.16 + ((i * 19) % 7) * 0.06,
         zOff: BASTION_Z + (((i * 11) % 5) - 2) * 0.085,
@@ -567,12 +1343,16 @@ export class ArbiterStage3D {
       });
     }
 
-    const flakGeo = new THREE.PlaneGeometry(0.85, 0.85);
+    // Flak Puffs
+    const flakGeo = createCenteredQuadGeo(0.85, 0.85);
+    this.disposableGeometries.push(flakGeo);
     for (let i = 0; i < 4; i++) {
       const mat = createWarfieldExplosionPlumeMaterial(10.5 + i * 7.3);
+      this.disposableMaterials.push(mat);
       const mesh = new THREE.Mesh(flakGeo, mat);
       mesh.visible = false;
       this.root.add(mesh);
+      this.fxRegistry.push(mesh);
       this.flakPuffs.push({
         mesh,
         mat,
@@ -587,52 +1367,99 @@ export class ArbiterStage3D {
       });
     }
 
-    const shellGeo = new THREE.CylinderGeometry(0.018, 0.055, 1.35, 10);
-    const shellMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(3.0, 1.95, 0.65),
-      blending: THREE.AdditiveBlending,
-      toneMapped: false,
-    });
+    // Sculpted Incoming 105mm Artillery Shells
+    const shellGeo = createArtilleryShellGeo();
+    this.disposableGeometries.push(shellGeo);
+    const shellMat = createEnergyFadeShaderMaterial(new THREE.Color(3.0, 1.95, 0.65), 0.95, true, false);
+    this.disposableMaterials.push(shellMat);
     for (let i = 0; i < 3; i++) {
       const m = new THREE.Mesh(shellGeo, shellMat);
       m.visible = false;
       this.root.add(m);
+      this.fxRegistry.push(m);
       this.incomingShells.push(m);
     }
 
-    this.heatBeamMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(3.2, 2.1, 0.65),
-      transparent: true,
-      opacity: 0,
-      blending: THREE.AdditiveBlending,
-      toneMapped: false,
-    });
-    const beamGeo = new THREE.CylinderGeometry(0.055, 0.09, 2.5, 14);
-    beamGeo.rotateZ(Math.PI / 2);
+    // Sculpted High-Command Thermal Energy Lance
+    this.heatBeamMat = createEnergyFadeShaderMaterial(new THREE.Color(3.2, 2.1, 0.65), 0.0, true, false);
+    this.disposableMaterials.push(this.heatBeamMat);
+    const beamGeo = createEnergyLanceGeo();
+    this.disposableGeometries.push(beamGeo);
     this.heatBeamMesh = new THREE.Mesh(beamGeo, this.heatBeamMat);
     this.heatBeamMesh.position.set(0, 0.34, BASTION_Z);
     this.heatBeamMesh.visible = false;
     this.root.add(this.heatBeamMesh);
+    this.fxRegistry.push(this.heatBeamMesh);
 
-    const swGeo = new THREE.PlaneGeometry(3.4, 3.4);
+    // RECON_STEALTH Laser Triangulation & Cipher Reticle Group
+    this.reconLaserMat = createReconLaserShaderMaterial();
+    this.disposableMaterials.push(this.reconLaserMat);
+    const laserCurveA = new THREE.CatmullRomCurve3([
+      new THREE.Vector3(-BASTION_X + 0.25, 0.34, BASTION_Z - 0.14),
+      new THREE.Vector3(0, 0.42, BASTION_Z - 0.04),
+      new THREE.Vector3(BASTION_X - 0.25, 0.26, BASTION_Z + 0.04),
+    ]);
+    const laserCurveB = new THREE.CatmullRomCurve3([
+      new THREE.Vector3(BASTION_X - 0.25, 0.34, BASTION_Z + 0.14),
+      new THREE.Vector3(0, 0.24, BASTION_Z + 0.06),
+      new THREE.Vector3(-BASTION_X + 0.25, 0.26, BASTION_Z - 0.04),
+    ]);
+    const laserGeoA = new THREE.TubeGeometry(laserCurveA, 24, 0.011, 8, false);
+    const laserGeoB = new THREE.TubeGeometry(laserCurveB, 24, 0.011, 8, false);
+    const reticleGeo = createHexShieldRingGeo(0.42, 0.35, 0.014, 0.004);
+    reticleGeo.rotateX(-Math.PI / 2);
+    this.disposableGeometries.push(laserGeoA, laserGeoB, reticleGeo);
+    const beamA = new THREE.Mesh(laserGeoA, this.reconLaserMat);
+    const beamB = new THREE.Mesh(laserGeoB, this.reconLaserMat);
+    this.reconReticle = new THREE.Mesh(reticleGeo, this.reconLaserMat);
+    this.reconReticle.position.set(0, BASTION_SURFACE_Y + 0.04, BASTION_Z);
+    this.reconSweepGroup.add(beamA, beamB, this.reconReticle);
+    this.reconSweepGroup.visible = false;
+    this.root.add(this.reconSweepGroup);
+    this.fxRegistry.push(this.reconSweepGroup);
+
+    // FLAG_BREACH Traverse Victory March Bridge Group
+    this.traverseBridgeMat = createTraverseBridgeShaderMaterial();
+    this.disposableMaterials.push(this.traverseBridgeMat);
+    const bridgeDeckGeo = createBeveledSlabGeo(2.85, 0.026, 0.34, 0.025, 0.007);
+    const bridgeChevronGeo = createBeveledSlabGeo(2.74, 0.008, 0.3, 0.018, 0.002);
+    this.disposableGeometries.push(bridgeDeckGeo, bridgeChevronGeo);
+    const bridgeDeck = new THREE.Mesh(bridgeDeckGeo, this.factory.materials.brassTrim);
+    const bridgeChevron = new THREE.Mesh(bridgeChevronGeo, this.traverseBridgeMat);
+    bridgeChevron.position.y = 0.018;
+    this.traverseBridgeGroup.add(bridgeDeck, bridgeChevron);
+    this.traverseBridgeGroup.position.set(0, BASTION_SURFACE_Y + 0.016, BASTION_Z);
+    this.traverseBridgeGroup.visible = false;
+    this.root.add(this.traverseBridgeGroup);
+    this.fxRegistry.push(this.traverseBridgeGroup);
+
+    // Shockwave Rings
+    const swGeo = createCenteredQuadGeo(3.4, 3.4);
     swGeo.rotateX(-Math.PI / 2);
+    this.disposableGeometries.push(swGeo);
     for (let i = 0; i < 2; i++) {
       const mat = createShockwaveRingMaterial();
+      this.disposableMaterials.push(mat);
       const mesh = new THREE.Mesh(swGeo, mat);
       mesh.visible = false;
       this.root.add(mesh);
+      this.fxRegistry.push(mesh);
       this.shockwaves.push({ mesh, mat });
     }
 
-    const plumeGeo = new THREE.PlaneGeometry(1.0, 1.0);
+    // Explosion Plumes
+    const plumeGeo = createCenteredQuadGeo(1.0, 1.0);
+    this.disposableGeometries.push(plumeGeo);
     for (let i = 0; i < 20; i++) {
       const localIdx = i % 10;
       const isBlackSmoke = localIdx >= 4;
       const mat = createWarfieldExplosionPlumeMaterial(i * 3.71 + 1.1, isBlackSmoke);
+      this.disposableMaterials.push(mat);
       const mesh = new THREE.Mesh(plumeGeo, mat);
       mesh.renderOrder = isBlackSmoke ? 12 : 10;
       mesh.visible = false;
       this.root.add(mesh);
+      this.fxRegistry.push(mesh);
       const ang = localIdx * 1.95;
       const rad = localIdx < 2 ? 0.0 : 0.18 + (localIdx % 4) * 0.12;
       this.explosionPlumes.push({
@@ -653,18 +1480,22 @@ export class ArbiterStage3D {
       });
     }
 
-    const shardGeo = new THREE.TetrahedronGeometry(0.095, 0);
+    // Sculpted Beveled Armor Shrapnel Plates
+    const shardGeo = createShrapnelPlateGeo();
+    this.disposableGeometries.push(shardGeo);
     const charredArmorMat = new THREE.MeshStandardMaterial({
       color: new THREE.Color('#15181F'),
       metalness: 0.82,
       roughness: 0.42,
     });
+    this.disposableMaterials.push(charredArmorMat);
     for (let i = 0; i < 32; i++) {
       const mesh = new THREE.Mesh(shardGeo, charredArmorMat);
-      mesh.scale.set(1.35, 0.45 + (i % 3) * 0.2, 0.85);
-      mesh.castShadow = true;
+      mesh.scale.set(1.25, 0.55 + (i % 3) * 0.2, 0.9);
+      mesh.castShadow = i < 6;
       mesh.visible = false;
       this.root.add(mesh);
+      this.fxRegistry.push(mesh);
       const a = (i / 32) * Math.PI * 2 + i * 0.31;
       const spd = 2.2 + (i % 6) * 0.75;
       this.shrapnelPool.push({
@@ -676,15 +1507,21 @@ export class ArbiterStage3D {
       });
     }
 
-    const sparkMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(2.9, 1.85, 0.55),
-      toneMapped: false,
-    });
-    const sparkGeo = new THREE.BoxGeometry(0.016, 0.016, 0.34);
+    // Sculpted Needle Ember Sparks
+    const sparkMat = createEnergyFadeShaderMaterial(
+      new THREE.Color(2.9, 1.85, 0.55),
+      0.95,
+      true,
+      false
+    );
+    this.disposableMaterials.push(sparkMat);
+    const sparkGeo = createNeedleSparkGeo(0.34, 0.012);
+    this.disposableGeometries.push(sparkGeo);
     for (let i = 0; i < 48; i++) {
       const mesh = new THREE.Mesh(sparkGeo, sparkMat);
       mesh.visible = false;
       this.root.add(mesh);
+      this.fxRegistry.push(mesh);
       const a = (i / 48) * Math.PI * 2 + i * 0.47;
       const spd = 3.2 + (i % 7) * 0.9;
       this.sparkPool.push({
@@ -701,15 +1538,19 @@ export class ArbiterStage3D {
     this.root.add(this.winnerSpotLight, this.winnerSpotLight.target);
 
     this.winnerShaftMat = createGaussianLightShaftMaterial(new THREE.Color(1.95, 1.38, 0.42));
-    const shaftGeo = new THREE.PlaneGeometry(2.1, 5.4);
+    this.disposableMaterials.push(this.winnerShaftMat);
+    const shaftGeo = createCenteredQuadGeo(2.1, 5.4);
     shaftGeo.translate(0, 2.55, 0);
+    this.disposableGeometries.push(shaftGeo);
     this.winnerShaftMesh = new THREE.Mesh(shaftGeo, this.winnerShaftMat);
     this.winnerShaftMesh.visible = false;
     this.root.add(this.winnerShaftMesh);
+    this.fxRegistry.push(this.winnerShaftMesh);
 
     this.medallionMesh = this.factory.createAttackMedallion();
     this.worldMedallionGroup.add(this.medallionMesh);
     this.worldMedallionGroup.visible = false;
+    this.fxRegistry.push(this.worldMedallionGroup);
 
     this.resetToIdle();
   }
@@ -718,10 +1559,12 @@ export class ArbiterStage3D {
     const g = new THREE.Group();
     const mat = createGaussianLightShaftMaterial(col);
     mat.uniforms['uOpacity']!.value = 0.95;
+    this.disposableMaterials.push(mat);
 
-    const jetGeo = new THREE.PlaneGeometry(0.24, 0.58);
+    const jetGeo = createCenteredQuadGeo(0.24, 0.58);
     jetGeo.translate(0, 0.29, 0);
     jetGeo.rotateZ(-Math.PI / 2);
+    this.disposableGeometries.push(jetGeo);
 
     const planeA = new THREE.Mesh(jetGeo, mat);
     const planeB = new THREE.Mesh(jetGeo, mat);
@@ -744,13 +1587,22 @@ export class ArbiterStage3D {
     return this.activeVerdict !== null;
   }
 
+  public getActiveChoreography(): BattleChoreographyKind | null {
+    return this.activeVerdict?.choreography ?? null;
+  }
+
+  public getVisibleFxCount(): number {
+    let count = 0;
+    for (const obj of this.fxRegistry) {
+      if (obj.visible) count += 1;
+    }
+    return count;
+  }
+
   public setOverdriveHeld(held: boolean): void {
     this.overdriveHeld = held;
   }
 
-  /**
-   * Double-tap during Act 1 / Act 2 skips straight to Act 3 Verdict payoff (§3)!
-   */
   public skipToVerdictAct3(): boolean {
     if (!this.activeVerdict || this.elapsed >= this.tVerdict - 0.05) {
       return false;
@@ -762,22 +1614,24 @@ export class ArbiterStage3D {
     return true;
   }
 
+  public skipToComplete(): boolean {
+    if (!this.activeVerdict) return false;
+    const done = this.onSequenceComplete;
+    this.resetToIdle();
+    done?.();
+    return true;
+  }
+
   public getCameraShakeOffset(): THREE.Vector3 {
     return this.cameraShakeOffset;
   }
 
-  /**
-   * Dynamic 3-Shot *XCOM / Fury / Tekken* War Cinema Camera Director!
-   * - Shot 1 (`Act 1 + Act 2A`): Asymmetric Over-The-Shoulder Breach Cam (Player initiates) vs. Claustrophobic Ambush Cam (Enemy initiates)
-   * - Shot 2 (`Act 2B` Strachan Vacuum): Tight `0.08x` Bullet-Time Macro Orbit tracking the suspended 88mm Armor-Piercing Shell
-   * - Shot 3 (`Act 3` Verdict): Snappy pull-back to Wide Hero Arena frame so Fireballs, Delayed Double-KO & Flag Unmasking shine!
-   */
   public getBattleCameraPose(isLandscape: boolean, aspect: number): BattleCameraShot {
     const verdict = this.activeVerdict;
+    const profile = this.activeProfile;
     const defcon = verdict?.stakes?.defcon ?? 3;
     const t = this.elapsed;
 
-    // Default Shot 3 / Hero Arena Wide Framing
     const wideFov = isLandscape
       ? 39
       : aspect < 0.52
@@ -788,7 +1642,7 @@ export class ArbiterStage3D {
     const widePosZ = isLandscape ? 1.52 : 1.92;
     const wideLookZ = ARBITER_BAY_CENTER_Z - (isLandscape ? 0.18 : 0.12);
 
-    if (!verdict) {
+    if (!verdict || !profile) {
       return {
         pos: this.camShotPos.set(widePosX, widePosY, widePosZ),
         look: this.camShotLook.set(0, 0.14, wideLookZ),
@@ -799,41 +1653,39 @@ export class ArbiterStage3D {
       };
     }
 
-    // SHOT 1 (`0 .. tPushEnd`): Asymmetric Breach vs. Ambush Over-The-Shoulder Trench Dive!
-    // Keeps BOTH clashing monoliths + Frontline Tug-of-War Bar + Bunker CRT cleanly inside 9:16 Portrait AND 16:9 Landscape!
+    const bias = profile.cameraBias;
+
     if (t < this.tPushEnd) {
       const u = THREE.MathUtils.clamp(t / Math.max(0.2, this.tPushEnd), 0, 1);
       const playerAttacking = verdict.attackerFaction === 'PLAYER';
       const sign = playerAttacking ? -1 : 1;
-      const startX = sign * (isLandscape ? 1.85 : 1.32);
-      const endX = sign * (isLandscape ? 1.45 : 1.05);
+      const startX = sign * (isLandscape ? 1.85 : 1.32) * bias.shot1SideBiasX;
+      const endX = sign * (isLandscape ? 1.45 : 1.05) * bias.shot1SideBiasX;
       const camX = THREE.MathUtils.lerp(startX, endX, u);
       const camY = THREE.MathUtils.lerp(isLandscape ? 1.78 : 2.32, isLandscape ? 1.56 : 2.06, u);
       const camZ = THREE.MathUtils.lerp(isLandscape ? -0.95 : 0.72, isLandscape ? -1.35 : 0.28, u);
 
-      const lookX = -sign * 0.22;
+      const lookX = profile.isFlagTraverse ? THREE.MathUtils.lerp(-sign * 0.4, 0, u) : -sign * 0.22;
       const lookY = 0.14;
       const lookZ = ARBITER_BAY_CENTER_Z + 0.04;
 
       return {
         pos: this.camShotPos.set(camX, camY, camZ),
         look: this.camShotLook.set(lookX, lookY, lookZ),
-        fov: isLandscape ? 36 : Math.min(50, wideFov - 2),
+        fov: (isLandscape ? 36 : Math.min(50, wideFov - 2)) + bias.shot1FovDelta,
         dampSpeed: 9.5,
         roomDim: defcon === 1 ? 0.36 : 0.56,
-        redAlertGlow: defcon === 1 ? 1.0 : 0.0,
+        redAlertGlow: defcon === 1 ? 1.0 : bias.shot2RedAlertBoost * 0.4,
       };
     }
 
-    // SHOT 2 (`tPushEnd .. tVerdict`): `0.08x` BULLET-TIME HEARTBEAT VACUUM ORBIT!
-    // Tight dramatic push-in keeping BOTH bastions (`x = -1.34` & `+1.34`), ECG CRT, and suspended 88mm shell in frame!
     if (t < this.tVerdict) {
       const vacU = THREE.MathUtils.clamp(
         (t - this.tPushEnd) / Math.max(0.15, this.tVerdict - this.tPushEnd),
         0,
         1
       );
-      const orbitX = Math.sin((vacU - 0.5) * 0.85) * 0.48;
+      const orbitX = Math.sin((vacU - 0.5) * 0.85) * bias.shot2OrbitAmp;
       const camY = isLandscape ? 1.58 : 2.08;
       const camZ = isLandscape ? -0.55 : 0.58;
       return {
@@ -841,19 +1693,18 @@ export class ArbiterStage3D {
         look: this.camShotLook.set(0, 0.15, ARBITER_BAY_CENTER_Z + 0.06),
         fov: isLandscape ? 34 : Math.min(47, wideFov - 4),
         dampSpeed: 12.5,
-        roomDim: 0.18,
-        redAlertGlow: defcon === 1 ? 1.35 : 0.45,
+        roomDim: bias.shot2RoomDim,
+        redAlertGlow: (defcon === 1 ? 1.35 : 0.45) + bias.shot2RedAlertBoost,
       };
     }
 
-    // SHOT 3 (`t >= tVerdict`): Snappy Wide Hero Pull-Back for Colossal Fireball, Delayed Split & Flag Unmasking!
     return {
       pos: this.camShotPos.set(widePosX, widePosY, widePosZ),
       look: this.camShotLook.set(0, 0.14, wideLookZ),
       fov: wideFov,
       dampSpeed: 18.5,
       roomDim: 0.52,
-      redAlertGlow: 0,
+      redAlertGlow: bias.shot2RedAlertBoost * 0.25,
     };
   }
 
@@ -867,41 +1718,35 @@ export class ArbiterStage3D {
   ): void {
     this.cleanupStageWedges();
 
+    const profile = resolveBattleChoreographyProfile(verdict);
+    const timeline = computeChoreographyTimeline(verdict, profile);
     this.activeVerdict = verdict;
-    const defcon = verdict.stakes?.defcon ?? 3;
+    this.activeProfile = profile;
 
-    // Deterministic Zero-Leak Elastic Timeline (`0.0` bits of `enemy.trueRank`!)
-    this.tAct1End = 0.76;
-    const pushDur = defcon === 1 ? 1.48 : defcon === 2 ? 1.28 : 1.06;
-    const vacuumDur = defcon === 1 ? 0.82 : defcon === 2 ? 0.56 : 0.42;
-    this.tPushEnd = this.tAct1End + pushDur;
-    this.tVerdict = this.tPushEnd + vacuumDur;
-    const act3Dur =
-      verdict.resolution === 'FLAG_CAPTURED_BY_PLAYER' ||
-      verdict.resolution === 'FLAG_CAPTURED_BY_ENEMY'
-        ? 2.65
-        : verdict.resolution === 'MUTUAL_SPLIT'
-          ? 2.15
-          : 1.75;
-    this.tTotalEnd = this.tVerdict + act3Dur;
+    this.tAct1End = timeline.tAct1End;
+    this.tPushEnd = timeline.tPushEnd;
+    this.tVerdict = timeline.tVerdict;
+    this.tTotalEnd = timeline.tTotalEnd;
 
-    if (
-      verdict.resolution === 'FLAG_CAPTURED_BY_PLAYER' ||
-      verdict.resolution === 'FLAG_CAPTURED_BY_ENEMY'
-    ) {
+    if (profile.enableIncomingSalvo) {
       this.finisherVariant = 1;
+    } else if (profile.enableHeatLance) {
+      this.finisherVariant = 2;
     } else {
       this.finisherVariant = this.clashCounter % 3;
     }
     this.clashCounter += 1;
 
     this.elapsed = 0;
+    this.lastLiveStepMs = performance.now();
     this.speedScale = speedScale;
     this.pausedForDebug = false;
     this.pushAudioTriggered = false;
     this.vacuumAudioTriggered = false;
     this.act3Triggered = false;
     this.delayedSplitBannerTriggered = false;
+    this.lastCrtMode = '';
+    this.lastCrtDrawSec = -1;
     this.onBannerChange = onBannerChange;
     this.onSequenceComplete = onComplete;
 
@@ -910,25 +1755,39 @@ export class ArbiterStage3D {
 
     const pKills = verdict.stakes?.playerPublicKills ?? 0;
     const eKills = verdict.stakes?.enemyPublicKills ?? 0;
-    this.playerStageWedge = this.factory.createCommandWedge(
-      'PLAYER',
-      verdict.playerVisibleRank,
-      pKills
-    );
-    this.enemyStageWedge = this.factory.createCommandWedge('ENEMY', 'UNKNOWN', eKills);
 
-    // For `FLAG_CAPTURED_BY_PLAYER`, mount the hidden 3D golden `FLAG` emblem onto the enemy wedge's front face
-    // (hidden away from camera at `rotation.y = Math.PI` until Act 3's ceremonial `180 deg` spotlight unmasking!)
-    if (verdict.resolution === 'FLAG_CAPTURED_BY_PLAYER') {
-      this.capturedFlagEmblem = buildRankEmblemMesh('FLAG', this.factory.materials.emblemPalette);
-      this.capturedFlagEmblem.scale.setScalar(0.86);
-      this.capturedFlagEmblem.position.set(0, 0.456, 0.126);
-      this.capturedFlagEmblem.rotation.x = -THREE.MathUtils.degToRad(22.0);
-      this.capturedFlagEmblem.visible = false;
-      this.enemyStageWedge.add(this.capturedFlagEmblem);
+    if (profile.isFlagTraverse) {
+      if (verdict.attackerFaction === 'PLAYER') {
+        this.playerStageWedge = this.factory.createCommandWedge(
+          'PLAYER',
+          verdict.playerVisibleRank,
+          pKills
+        );
+        this.root.add(this.playerStageWedge);
+      } else {
+        // Strict Fog-of-War: Enemy Flag Traverse stays 100% masked ('UNKNOWN')!
+        this.enemyStageWedge = this.factory.createCommandWedge('ENEMY', 'UNKNOWN', eKills);
+        this.root.add(this.enemyStageWedge);
+      }
+    } else {
+      this.playerStageWedge = this.factory.createCommandWedge(
+        'PLAYER',
+        verdict.playerVisibleRank,
+        pKills
+      );
+      this.enemyStageWedge = this.factory.createCommandWedge('ENEMY', 'UNKNOWN', eKills);
+
+      if (verdict.resolution === 'FLAG_CAPTURED_BY_PLAYER') {
+        this.capturedFlagEmblem = buildRankEmblemMesh('FLAG', this.factory.materials.emblemPalette);
+        this.capturedFlagEmblem.scale.setScalar(WEDGE_EMBLEM_MOUNT.scale);
+        this.capturedFlagEmblem.position.set(0, WEDGE_EMBLEM_MOUNT.y, WEDGE_EMBLEM_MOUNT.z);
+        this.capturedFlagEmblem.rotation.x = WEDGE_EMBLEM_MOUNT.rotXRad;
+        this.capturedFlagEmblem.visible = false;
+        this.enemyStageWedge.add(this.capturedFlagEmblem);
+      }
+
+      this.root.add(this.playerStageWedge, this.enemyStageWedge);
     }
-
-    this.root.add(this.playerStageWedge, this.enemyStageWedge);
 
     const ceremonialSq = gridToWorld(4, 0);
     this.worldMedallionGroup.position.set(ceremonialSq.x, 0, ceremonialSq.z);
@@ -936,16 +1795,8 @@ export class ArbiterStage3D {
     this.medallionMesh.rotation.set(0, 0, 0);
     this.worldMedallionGroup.visible = true;
 
-    const lockBanner: HudBannerState =
-      defcon === 1
-        ? 'DEFCON 1 — HIGH COMMAND ALERT'
-        : verdict.stakes?.playerDoctrine === 'COVERT_SPY'
-          ? 'OPERATION STILETTO — COVERT STRIKE'
-          : verdict.stakes?.isEnemyInitiatedAmbush
-            ? 'ENEMY AMBUSH — BRACE!'
-            : 'CLASH LOCK-IN';
-    onBannerChange(lockBanner);
-    this.sound.playAct1LockIn(speedScale, verdict.stakes);
+    onBannerChange(resolveChoreographyLockBanner(verdict));
+    this.sound.playClashChoreography(verdict, speedScale);
     this.applyPoseAtTime(0);
   }
 
@@ -956,9 +1807,11 @@ export class ArbiterStage3D {
     if (actSeconds >= this.tAct1End && actSeconds < this.tPushEnd) {
       this.onBannerChange?.('ARBITRATING');
     } else if (actSeconds >= this.tPushEnd && actSeconds < this.tVerdict) {
-      this.onBannerChange?.(this.isDefenderReversal(this.activeVerdict)
-        ? 'ARMOR DEFLECTED — COUNTER!'
-        : 'TARGET LOCKED — HEARTBEAT');
+      this.onBannerChange?.(
+        this.isDefenderReversal(this.activeVerdict)
+          ? 'ARMOR DEFLECTED — COUNTER!'
+          : 'TARGET LOCKED — HEARTBEAT'
+      );
     } else if (actSeconds >= this.tVerdict) {
       this.onBannerChange?.(this.computeFinalBanner(this.activeVerdict));
     }
@@ -966,30 +1819,37 @@ export class ArbiterStage3D {
   }
 
   public update(dt: number, totalElapsedSec: number): void {
+    this.crtScreenMat.uniforms['uTime']!.value = totalElapsedSec;
+
     if (!this.activeVerdict) {
       this.cameraShakeOffset.set(0, 0, 0);
-      // Warm analog filament breathing wave across the 8 vacuum tubes during idle & Live 3D Start Screen!
       for (let i = 0; i < this.vacuumTubes.length; i++) {
         const tube = this.vacuumTubes[i]!;
         const wave = 0.5 + 0.5 * Math.sin(totalElapsedSec * 2.15 + i * 0.68);
         tube.filament.scale.y = 0.22 + 0.24 * wave;
         const glow = 1.45 + 0.78 * wave;
-        tube.mat.color.setRGB(glow, glow * 0.56, glow * 0.16);
+        tube.mat.emissive.setRGB(glow, glow * 0.56, glow * 0.16);
       }
       return;
     }
 
     if (!this.pausedForDebug) {
-      // Diegetic Thumb-Hold Overdrive (`2.2x` before verdict, releasing smoothly to `1.0x` at impact!)
+      const nowMs = performance.now();
+      const wallDt =
+        this.lastLiveStepMs > 0 ? Math.max(dt, (nowMs - this.lastLiveStepMs) * 0.001) : dt;
+      this.lastLiveStepMs = nowMs;
+      const maxStep = this.speedScale > 1.5 ? 0.55 : 0.25;
+      const effectiveDt = Math.min(maxStep, wallDt);
       const overdriveMul = this.overdriveHeld && this.elapsed < this.tVerdict ? 2.15 : 1.0;
-      this.elapsed += dt * this.speedScale * overdriveMul;
+      this.elapsed += effectiveDt * this.speedScale * overdriveMul;
+    } else {
+      this.lastLiveStepMs = 0;
     }
 
     const t = this.elapsed;
     const verdict = this.activeVerdict;
     const effSpeed = this.speedScale * (this.overdriveHeld ? 2.15 : 1.0);
 
-    // Trigger Act 2A: Asymmetric Aggressor Barrage + Dunkirk Shepard Riser!
     if (!this.pausedForDebug && !this.pushAudioTriggered && t >= this.tAct1End) {
       this.pushAudioTriggered = true;
       this.onBannerChange?.('ARBITRATING');
@@ -1000,7 +1860,6 @@ export class ArbiterStage3D {
       );
     }
 
-    // Trigger Act 2B: THE STRACHAN VACUUM + Heartbeat + Brick-Wall Armor Deflection!
     if (!this.pausedForDebug && !this.vacuumAudioTriggered && t >= this.tPushEnd) {
       this.vacuumAudioTriggered = true;
       const reversal = this.isDefenderReversal(verdict);
@@ -1015,14 +1874,12 @@ export class ArbiterStage3D {
       );
     }
 
-    // Trigger Act 3: Detonation / Delayed Split / Flag Unmasking / Spy Intercept!
     if (!this.pausedForDebug && !this.act3Triggered && t >= this.tVerdict) {
       this.act3Triggered = true;
       const isSpyIntercept =
         verdict.playerVisibleRank === 'PRIVATE' && verdict.resolution === 'PLAYER_WINS';
 
       if (verdict.resolution === 'MUTUAL_SPLIT') {
-        // Kurosawa False-Victory / False-Defeat Beat (`0.00s..0.46s`): show `TARGET HIT...` first!
         this.onBannerChange?.('TARGET HIT...');
       } else {
         this.onBannerChange?.(this.computeFinalBanner(verdict));
@@ -1053,44 +1910,56 @@ export class ArbiterStage3D {
     this.sound.stopActiveSequence();
     this.cleanupStageWedges();
     this.activeVerdict = null;
+    this.activeProfile = null;
+    this.onBannerChange = undefined;
+    this.onSequenceComplete = undefined;
     this.pausedForDebug = false;
+    this.lastLiveStepMs = 0;
     this.overdriveHeld = false;
-    this.worldMedallionGroup.visible = false;
+    this.pushAudioTriggered = false;
+    this.vacuumAudioTriggered = false;
+    this.act3Triggered = false;
+    this.delayedSplitBannerTriggered = false;
     this.cameraShakeOffset.set(0, 0, 0);
 
-    this.leftBastionRingMat.opacity = 0.22;
-    this.rightBastionRingMat.opacity = 0.22;
-    this.frontlineGroup.visible = false;
-    this.armorDeflectShield.visible = false;
-    this.bulletTimeShellGroup.visible = false;
-    this.scorchDecalLeft.visible = false;
-    this.scorchDecalRight.visible = false;
-
-    this.leftMuzzleStar.visible = false;
-    this.rightMuzzleStar.visible = false;
+    this.leftBastionRingMat.uniforms['uOpacity']!.value = 0.22;
+    this.rightBastionRingMat.uniforms['uOpacity']!.value = 0.22;
     this.muzzleFlashLight.intensity = 0;
     this.explosionLight.intensity = 0;
     this.winnerSpotLight.intensity = 0;
-    this.winnerShaftMesh.visible = false;
-    this.heatBeamMesh.visible = false;
 
-    for (const tr of this.tracers) tr.mesh.visible = false;
-    for (const fp of this.flakPuffs) fp.mesh.visible = false;
-    for (const sh of this.incomingShells) sh.visible = false;
-    for (const sw of this.shockwaves) sw.mesh.visible = false;
-    for (const pl of this.explosionPlumes) pl.mesh.visible = false;
-    for (const s of [...this.shrapnelPool, ...this.sparkPool]) s.mesh.visible = false;
+    for (const fx of this.fxRegistry) {
+      fx.visible = false;
+    }
 
     this.renderBunkerRadarStandby();
   }
 
+  public dispose(): void {
+    this.resetToIdle();
+    this.crtTexture.dispose();
+    this.scorchTexture.dispose();
+    for (const g of this.disposableGeometries) {
+      g.dispose();
+    }
+    for (const m of this.disposableMaterials) {
+      m.dispose();
+    }
+  }
+
   private isDefenderReversal(verdict: ArbiterVerdict): boolean {
+    if (verdict.isFlagTraverseVictory) return false;
     if (verdict.resolution === 'PLAYER_WINS' && verdict.attackerFaction === 'ENEMY') return true;
     if (verdict.resolution === 'ENEMY_WINS' && verdict.attackerFaction === 'PLAYER') return true;
     return false;
   }
 
   private computeFinalBanner(verdict: ArbiterVerdict): HudBannerState {
+    if (verdict.isFlagTraverseVictory) {
+      return verdict.attackerFaction === 'PLAYER'
+        ? 'FLAG TRAVERSE — VICTORY'
+        : 'FLAG LOST — DEFEAT';
+    }
     if (verdict.resolution === 'FLAG_CAPTURED_BY_PLAYER') return 'FLAG CAPTURED — VICTORY';
     if (verdict.resolution === 'FLAG_CAPTURED_BY_ENEMY') return 'FLAG LOST — DEFEAT';
     if (verdict.resolution === 'MUTUAL_SPLIT') return 'MUTUAL ELIMINATION';
@@ -1102,30 +1971,19 @@ export class ArbiterStage3D {
 
   private applyPoseAtTime(t: number, clockSec = t): void {
     const verdict = this.activeVerdict;
-    if (!verdict) return;
+    const profile = this.activeProfile;
+    if (!verdict || !profile) return;
 
-    this.leftMuzzleStar.visible = false;
-    this.rightMuzzleStar.visible = false;
     this.muzzleFlashLight.intensity = 0;
     this.explosionLight.intensity = 0;
     this.winnerSpotLight.intensity = 0;
-    this.winnerShaftMesh.visible = false;
-    this.heatBeamMesh.visible = false;
-    this.frontlineGroup.visible = false;
-    this.armorDeflectShield.visible = false;
-    this.bulletTimeShellGroup.visible = false;
-    this.scorchDecalLeft.visible = false;
-    this.scorchDecalRight.visible = false;
-    for (const tr of this.tracers) tr.mesh.visible = false;
-    for (const fp of this.flakPuffs) fp.mesh.visible = false;
-    for (const sh of this.incomingShells) sh.visible = false;
-    for (const sw of this.shockwaves) sw.mesh.visible = false;
-    for (const pl of this.explosionPlumes) pl.mesh.visible = false;
-    for (const s of [...this.shrapnelPool, ...this.sparkPool]) s.mesh.visible = false;
+    for (const fx of this.fxRegistry) {
+      if (fx !== this.worldMedallionGroup) fx.visible = false;
+    }
 
     const playerAttacks = verdict.attackerFaction === 'PLAYER';
 
-    // 1. Attack Medallion Drop (`0.0s .. 0.26s`)
+    // 1. Attack Medallion Drop (`0.0s .. 0.26s`, strictly preserving medallionY > 0.02 at t=0.25s)
     const medDropP = THREE.MathUtils.clamp(t / 0.26, 0, 1);
     const bounce =
       medDropP < 0.78
@@ -1135,9 +1993,17 @@ export class ArbiterStage3D {
     this.medallionMesh.position.set(0, medY, 0);
     this.medallionMesh.rotation.set(0, 0, 0);
 
-    // 2. Act 1 (`0.0s .. tAct1End`): ASYMMETRIC "LUNGE vs. BRACE" LOCK-IN!
-    //    Aggressor slams onto its bastion FIRST (`0.02..0.22s`) leaning +13 deg forward;
-    //    Defender lands SECOND (`0.12..0.34s`) skidding back 6cm into an angled defensive guard!
+    // Special Branch: Uncontested Flag Traverse Victory March!
+    if (profile.isFlagTraverse) {
+      this.applyFlagTraversePose(t, clockSec, verdict, profile);
+      return;
+    }
+
+    const leftBastionLocal = new THREE.Vector3(-BASTION_X, BASTION_SURFACE_Y, BASTION_Z);
+    const rightBastionLocal = new THREE.Vector3(BASTION_X, BASTION_SURFACE_Y, BASTION_Z);
+    const pStartLocal = this.playerStartWorld.clone().sub(this.root.position);
+    const eStartLocal = this.enemyStartWorld.clone().sub(this.root.position);
+
     const pFlyDur = playerAttacks ? 0.21 : 0.25;
     const eFlyDur = playerAttacks ? 0.25 : 0.21;
     const pDelay = playerAttacks ? 0.02 : 0.11;
@@ -1146,26 +2012,20 @@ export class ArbiterStage3D {
     const pFly = 1 - Math.pow(1 - THREE.MathUtils.clamp((t - pDelay) / pFlyDur, 0, 1), 3);
     const eFly = 1 - Math.pow(1 - THREE.MathUtils.clamp((t - eDelay) / eFlyDur, 0, 1), 3);
 
-    const leftBastionLocal = new THREE.Vector3(-BASTION_X, BASTION_SURFACE_Y, BASTION_Z);
-    const rightBastionLocal = new THREE.Vector3(BASTION_X, BASTION_SURFACE_Y, BASTION_Z);
-    const pStartLocal = this.playerStartWorld.clone().sub(this.root.position);
-    const eStartLocal = this.enemyStartWorld.clone().sub(this.root.position);
-
     const pPos = leftBastionLocal.clone().lerp(pStartLocal, 1 - pFly);
     const ePos = rightBastionLocal.clone().lerp(eStartLocal, 1 - eFly);
     pPos.y += Math.sin(pFly * Math.PI) * 1.1;
     ePos.y += Math.sin(eFly * Math.PI) * 1.1;
 
     const ringIgnite = THREE.MathUtils.smoothstep(t, 0.16, 0.32);
-    this.leftBastionRingMat.opacity = THREE.MathUtils.lerp(0.25, 0.96, ringIgnite);
-    this.rightBastionRingMat.opacity = THREE.MathUtils.lerp(0.25, 0.96, ringIgnite);
+    this.leftBastionRingMat.uniforms['uOpacity']!.value = THREE.MathUtils.lerp(0.25, 0.96, ringIgnite);
+    this.rightBastionRingMat.uniforms['uOpacity']!.value = THREE.MathUtils.lerp(0.25, 0.96, ringIgnite);
 
     if (this.playerStageWedge && this.enemyStageWedge) {
       this.playerStageWedge.visible = true;
       this.enemyStageWedge.visible = true;
       if (this.capturedFlagEmblem) this.capturedFlagEmblem.visible = false;
 
-      // Asymmetric Lunge (+0.22 rad forward plow) vs. Brace (-0.12 rad defensive heel-dig)
       const pStanceZ = playerAttacks ? -0.18 : 0.12;
       const eStanceZ = playerAttacks ? -0.12 : 0.18;
       const pLungeX = playerAttacks ? 0.09 * pFly : -0.05 * pFly;
@@ -1174,6 +2034,7 @@ export class ArbiterStage3D {
       this.playerStageWedge.position.set(pPos.x + pLungeX, pPos.y, pPos.z);
       this.playerStageWedge.rotation.set(0, 0.34, pStanceZ * pFly);
 
+      // Strict Fog-of-War: Enemy wedge always faces away (`Math.PI - 0.34`)
       this.enemyStageWedge.position.set(ePos.x + eLungeX, ePos.y, ePos.z);
       this.enemyStageWedge.rotation.set(0, Math.PI - 0.34, eStanceZ * eFly);
 
@@ -1183,14 +2044,13 @@ export class ArbiterStage3D {
       }
 
       if (t < this.tAct1End) {
-        this.renderBunkerScope('LOCK_IN', 0.5, clockSec, verdict);
+        this.renderBunkerScope('LOCK_IN', 0.5, clockSec, verdict, profile);
       }
     }
 
-    // 3. Act 2A (`tAct1End .. tPushEnd`): ASYMMETRIC AGGRESSOR SUPPRESSION PUSH TO `84%`!
+    // 3. Act 2A (`tAct1End .. tPushEnd`): Choreography-Customized Tactical Firefight!
     if (t >= this.tAct1End && t < this.tPushEnd) {
       const pushU = (t - this.tAct1End) / Math.max(0.2, this.tPushEnd - this.tAct1End);
-      // Non-linear tug-of-war curve: surges to 58%, hits a brief gritty resistance dip to 48%, then drives hard to 84%!
       const rawSurge =
         0.5 +
         0.36 *
@@ -1199,41 +2059,55 @@ export class ArbiterStage3D {
       const blueShare = THREE.MathUtils.clamp(rawSurge, 0.14, 0.86);
       this.updateFrontlineGauge(blueShare, clockSec);
 
-      const pRecoil = Math.max(0, Math.sin(t * (playerAttacks ? 46 : 26))) * (playerAttacks ? 0.055 : 0.03);
-      const eRecoil = Math.max(0, Math.cos(t * (playerAttacks ? 26 : 46))) * (playerAttacks ? 0.03 : 0.055);
+      const pRecoil =
+        Math.max(0, Math.sin(t * (playerAttacks ? 46 : 26))) * (playerAttacks ? 0.055 : 0.03);
+      const eRecoil =
+        Math.max(0, Math.cos(t * (playerAttacks ? 26 : 46))) * (playerAttacks ? 0.03 : 0.055);
       if (this.playerStageWedge && this.enemyStageWedge) {
         this.playerStageWedge.position.x = -BASTION_X + (playerAttacks ? 0.08 : -0.06) - pRecoil;
         this.enemyStageWedge.position.x = BASTION_X + (playerAttacks ? 0.06 : -0.08) + eRecoil;
       }
 
-      // Aggressor fires relentless heavy muzzle flames; Defender fires shorter counter-bursts!
       const leftFiring = playerAttacks ? Math.sin(t * 50) > -0.25 : Math.sin(t * 32) > 0.35;
       const rightFiring = !playerAttacks ? Math.cos(t * 50) > -0.25 : Math.cos(t * 32) > 0.35;
       this.leftMuzzleStar.position.set(-0.66, -0.02, BASTION_Z);
       this.rightMuzzleStar.position.set(0.66, -0.02, BASTION_Z);
-      this.leftMuzzleStar.visible = leftFiring;
-      this.rightMuzzleStar.visible = rightFiring;
+      this.leftMuzzleStar.visible = leftFiring && !profile.enableReconSweep;
+      this.rightMuzzleStar.visible = rightFiring && !profile.enableReconSweep;
       this.leftMuzzleStar.rotation.x = t * 26;
       this.rightMuzzleStar.rotation.y = Math.PI;
       this.rightMuzzleStar.rotation.x = -t * 28;
 
-      if (leftFiring || rightFiring) {
+      if ((leftFiring || rightFiring) && !profile.enableReconSweep) {
         this.muzzleFlashLight.position.set(leftFiring ? -0.55 : 0.55, 0.28, 0.05);
         this.muzzleFlashLight.intensity = 2.4;
       }
 
-      // Directional Asymmetric Tracer Barrage (75% from Aggressor hammering Defender's sloped armor!)
+      if (profile.enableReconSweep) {
+        this.reconSweepGroup.visible = true;
+        this.reconLaserMat.uniforms['uOpacity']!.value = 0.85;
+        this.reconLaserMat.uniforms['uTime']!.value = clockSec;
+        this.reconReticle.rotation.y = clockSec * 3.2;
+        this.reconReticle.position.x = THREE.MathUtils.lerp(-0.45, 0.45, 0.5 + 0.5 * Math.sin(pushU * Math.PI * 2));
+      }
+
       let hitCount = 0;
+      const pRgb = profile.tracerColorPlayerRGB;
+      const eRgb = profile.tracerColorEnemyRGB;
       for (let idx = 0; idx < this.tracers.length; idx++) {
+        if (idx % profile.tracerDensityMask !== 0) continue;
         const tr = this.tracers[idx]!;
         const isAggressorBolt = tr.fromLeft === playerAttacks;
         if (!isAggressorBolt && idx % 4 !== 1) continue;
 
-        const cycleU = (t * (isAggressorBolt ? 3.8 : 2.3) + tr.phaseOffset) % 1.0;
+        const cycleU =
+          (t * (isAggressorBolt ? 3.8 : 2.3) * profile.tracerSpeedMul + tr.phaseOffset) % 1.0;
         if (cycleU < 0.36) {
           const u = cycleU / 0.36;
           const startX = tr.fromLeft ? -BASTION_X + 0.38 : BASTION_X - 0.38;
           const endX = tr.fromLeft ? BASTION_X - 0.22 : -BASTION_X + 0.22;
+          const rgb = tr.fromLeft ? pRgb : eRgb;
+          (tr.mat.uniforms['uColor']!.value as THREE.Color).setRGB(rgb[0], rgb[1], rgb[2]);
           tr.mesh.position.set(
             THREE.MathUtils.lerp(startX, endX, u),
             tr.yOff,
@@ -1253,38 +2127,52 @@ export class ArbiterStage3D {
         }
       }
 
-      for (const fp of this.flakPuffs) {
-        const age = t - fp.phaseDelay;
-        if (age >= 0 && age <= 0.65) {
-          const ph = age / 0.65;
-          fp.mesh.visible = true;
-          fp.mesh.position.copy(fp.offset).addScaledVector(fp.driftVel, age);
-          fp.mesh.scale.setScalar(fp.baseScale * (0.45 + ph * 0.95));
-          fp.mat.uniforms['uPhase']!.value = ph;
-          fp.mat.uniforms['uTime']!.value = clockSec;
+      if (profile.enableFlakPuffs) {
+        for (const fp of this.flakPuffs) {
+          const age = t - fp.phaseDelay;
+          if (age >= 0 && age <= 0.65) {
+            const ph = age / 0.65;
+            fp.mesh.visible = true;
+            fp.mesh.position.copy(fp.offset).addScaledVector(fp.driftVel, age);
+            fp.mesh.scale.setScalar(fp.baseScale * (0.45 + ph * 0.95));
+            fp.mat.uniforms['uPhase']!.value = ph;
+            fp.mat.uniforms['uTime']!.value = clockSec;
+          }
         }
       }
 
+      if (profile.enableIncomingSalvo && pushU > 0.45) {
+        const salvoU = (pushU - 0.45) / 0.55;
+        const targetX = playerAttacks ? BASTION_X : -BASTION_X;
+        const dir = playerAttacks ? 1 : -1;
+        const sh = this.incomingShells[0]!;
+        sh.visible = true;
+        sh.position.lerpVectors(
+          new THREE.Vector3(targetX - dir * 1.1, 3.2, BASTION_Z),
+          new THREE.Vector3(targetX, 0.35, BASTION_Z),
+          salvoU
+        );
+        sh.rotation.z = dir * -0.32;
+      }
+
       if (!this.pausedForDebug) {
-        const shake = 0.018;
+        const shake = profile.enableReconSweep ? 0.008 : 0.018;
         this.cameraShakeOffset.set(Math.sin(t * 78) * shake, Math.cos(t * 94) * shake, 0);
       }
-      this.renderBunkerScope('SUPPRESSION', blueShare, clockSec, verdict);
+      this.renderBunkerScope('SUPPRESSION', blueShare, clockSec, verdict, profile);
     }
 
-    // 4. Act 2B (`tPushEnd .. tVerdict`): "THE STRACHAN VACUUM" + `0.08x` BULLET-TIME HERO SHELL + REVERSAL!
+    // 4. Act 2B (`tPushEnd .. tVerdict`): "THE STRACHAN VACUUM" + `0.08x` BULLET-TIME SABOT SHELL
     if (t >= this.tPushEnd && t < this.tVerdict) {
       const vacU = (t - this.tPushEnd) / Math.max(0.15, this.tVerdict - this.tPushEnd);
       const reversal = this.isDefenderReversal(verdict);
 
-      // Sakurai `60Hz` sub-millimeter tension tremor during the dead-air silence!
       if (this.playerStageWedge && this.enemyStageWedge) {
         const microShudder = Math.sin(t * 160) * 0.008;
         this.playerStageWedge.position.x = -BASTION_X + microShudder;
         this.enemyStageWedge.position.x = BASTION_X - microShudder;
       }
 
-      // If Defender Wins ("Brick-Wall No-Sell"!): Sloped-armor golden shield flash + Frontline snaps across trench!
       const startShare = playerAttacks ? 0.85 : 0.15;
       const targetShare =
         verdict.resolution === 'MUTUAL_SPLIT'
@@ -1306,18 +2194,17 @@ export class ArbiterStage3D {
         this.armorDeflectShield.rotation.y =
           verdict.defenderFaction === 'PLAYER' ? Math.PI * 0.38 : -Math.PI * 0.38;
         this.armorDeflectShield.scale.setScalar(0.65 + vacU * 0.65);
-        this.armorDeflectMat.opacity = (1 - vacU / 0.48) * 0.68;
+        this.armorDeflectMat.uniforms['uOpacity']!.value = (1 - vacU / 0.48) * 0.68;
         this.poseBurstSparks(new THREE.Vector3(defX, 0.24, BASTION_Z), vacU * 0.65, 16, 0);
       }
 
-      // `0.08x` BULLET-TIME 88mm ARMOR-PIERCING SHELL + SUPERSONIC MACH CONE!
       const playerStrikesFatal =
         verdict.resolution === 'PLAYER_WINS' ||
         verdict.resolution === 'FLAG_CAPTURED_BY_PLAYER' ||
         (verdict.resolution === 'MUTUAL_SPLIT' && playerAttacks);
       const shellStartX = playerStrikesFatal ? -0.68 : 0.68;
       const shellEndX = playerStrikesFatal ? BASTION_X - 0.26 : -BASTION_X + 0.26;
-      const shellProgress = Math.pow(vacU, 0.72); // glides smoothly in bullet-time right up to 2mm from impact!
+      const shellProgress = Math.pow(vacU, 0.72);
 
       this.bulletTimeShellGroup.visible = true;
       this.bulletTimeShellGroup.position.set(
@@ -1326,14 +2213,14 @@ export class ArbiterStage3D {
         BASTION_Z
       );
       this.bulletTimeShellGroup.rotation.y = playerStrikesFatal ? 0 : Math.PI;
-      this.bulletTimeShellGroup.rotation.x = t * 18; // rifled spin!
-      this.machConeMat.opacity = 0.55 + 0.35 * Math.sin(vacU * Math.PI);
+      this.bulletTimeShellGroup.rotation.x = t * 18;
+      this.machConeMat.uniforms['uOpacity']!.value = 0.55 + 0.35 * Math.sin(vacU * Math.PI);
 
-      this.cameraShakeOffset.set(0, 0, 0); // Dead-still Leone/Strachan freeze before impact!
-      this.renderBunkerScope('HEARTBEAT_VACUUM', curShare, clockSec, verdict, vacU);
+      this.cameraShakeOffset.set(0, 0, 0);
+      this.renderBunkerScope('HEARTBEAT_VACUUM', curShare, clockSec, verdict, profile, vacU);
     }
 
-    // 5. Act 3 (`t >= tVerdict`): DETONATION, KUROSAWA DELAYED SPLIT & 180° FLAG UNMASKING!
+    // 5. Act 3 (`t >= tVerdict`): DETONATION, DELAYED SPLIT & 180° FLAG UNMASKING
     if (t >= this.tVerdict) {
       const bt = t - this.tVerdict;
       const playerWins =
@@ -1344,9 +2231,6 @@ export class ArbiterStage3D {
       const isPlayerFlagCapture = verdict.resolution === 'FLAG_CAPTURED_BY_PLAYER';
 
       if (isSplit) {
-        // KUROSAWA CRUEL DELAYED DOUBLE-KO WHIPLASH!
-        // `bt = 0.00s..0.46s`: Defender explodes FIRST! Attacker stands upright thinking they won...
-        // `bt = 0.46s+`: Secondary ammo cook-off detonates Attacker + shears Brass Medallion in two!
         const firstX = playerAttacks ? BASTION_X : -BASTION_X;
         const secondX = playerAttacks ? -BASTION_X : BASTION_X;
         const firstWedge = playerAttacks ? this.enemyStageWedge : this.playerStageWedge;
@@ -1359,12 +2243,11 @@ export class ArbiterStage3D {
         if (firstX > 0) this.scorchDecalRight.visible = true;
         else this.scorchDecalLeft.visible = true;
 
-        this.poseExplosionSite(0, firstX, bt, clockSec, 0, 10);
+        this.poseExplosionSite(0, firstX, bt, clockSec, 0, 10, profile.shockwaveColorRGB);
         this.blastLoserWedgeAndShrapnel(firstWedge, firstFaction, firstX, bt, firstSign, 0, 16);
         this.poseBurstSparks(new THREE.Vector3(firstX, BASTION_SURFACE_Y, BASTION_Z), bt, 24, 0);
 
         if (bt < 0.46) {
-          // Apparent survivor stands upright—then begins violently jittering with thermal cook-off sparks at `0.20s`!
           if (secondWedge) {
             const cookJitter = bt > 0.2 ? Math.sin(bt * 190) * 0.035 : 0;
             secondWedge.visible = true;
@@ -1386,16 +2269,15 @@ export class ArbiterStage3D {
           }
           this.explosionLight.position.set(firstX, 0.75, -0.05);
           this.explosionLight.intensity = Math.max(0, Math.exp(-bt * 6.0) * 3.6);
-          this.renderBunkerScope('GOLD_WIN', playerAttacks ? 1 : 0, clockSec, verdict);
+          this.renderBunkerScope('GOLD_WIN', playerAttacks ? 1 : 0, clockSec, verdict, profile);
         } else {
-          // `bt >= 0.46s`: SECONDARY COOK-OFF DETONATION + MAGNETIZED MEDALLION SPLIT!
           const bt2 = bt - 0.46;
           this.scorchDecalLeft.visible = true;
           this.scorchDecalRight.visible = true;
-          this.leftBastionRingMat.opacity = 0;
-          this.rightBastionRingMat.opacity = 0;
+          this.leftBastionRingMat.uniforms['uOpacity']!.value = 0;
+          this.rightBastionRingMat.uniforms['uOpacity']!.value = 0;
 
-          this.poseExplosionSite(1, secondX, bt2, clockSec, 10, 20);
+          this.poseExplosionSite(1, secondX, bt2, clockSec, 10, 20, profile.shockwaveColorRGB);
           this.blastLoserWedgeAndShrapnel(
             secondWedge,
             secondFaction,
@@ -1412,7 +2294,6 @@ export class ArbiterStage3D {
             24
           );
 
-          // Secondary blast shockwave jolts the solid brushed-brass Attack Medallion!
           const jolt = Math.max(0, Math.exp(-bt2 * 7.5)) * 0.12;
           this.medallionMesh.position.set(0, jolt, 0);
           this.medallionMesh.rotation.z = Math.sin(bt2 * 45) * jolt;
@@ -1425,12 +2306,11 @@ export class ArbiterStage3D {
           }
           this.explosionLight.position.set(secondX, 0.75, -0.05);
           this.explosionLight.intensity = Math.max(0, Math.exp(-bt2 * 6.0) * 3.8);
-          this.renderBunkerScope('FLATLINE', 0.5, clockSec, verdict);
+          this.renderBunkerScope('FLATLINE', 0.5, clockSec, verdict, profile);
         }
         return;
       }
 
-      // CEREMONIAL `180°` FLAG UNMASKING (`bt = 0.00s..0.95s`) BEFORE 3-SALVO VICTORY BARRAGE!
       if (isPlayerFlagCapture && bt < 0.95) {
         const spinU = THREE.MathUtils.smoothstep(bt, 0.0, 0.28);
         if (this.capturedFlagEmblem) this.capturedFlagEmblem.visible = spinU > 0.15;
@@ -1446,7 +2326,7 @@ export class ArbiterStage3D {
         this.winnerShaftMesh.position.set(BASTION_X, 0.02, BASTION_Z);
         this.winnerShaftMat.uniforms['uOpacity']!.value = 0.58;
         this.cameraShakeOffset.set(0, 0, 0);
-        this.renderBunkerScope('CROWN', 1.0, clockSec, verdict);
+        this.renderBunkerScope('CROWN', 1.0, clockSec, verdict, profile);
         return;
       }
 
@@ -1471,22 +2351,22 @@ export class ArbiterStage3D {
 
       if (playerWins) {
         this.scorchDecalRight.visible = true;
-        this.rightBastionRingMat.opacity = 0;
-        this.leftBastionRingMat.opacity = 1.0;
+        this.rightBastionRingMat.uniforms['uOpacity']!.value = 0;
+        this.leftBastionRingMat.uniforms['uOpacity']!.value = 1.0;
       } else {
         this.scorchDecalLeft.visible = true;
-        this.leftBastionRingMat.opacity = 0;
-        this.rightBastionRingMat.opacity = 1.0;
+        this.leftBastionRingMat.uniforms['uOpacity']!.value = 0;
+        this.rightBastionRingMat.uniforms['uOpacity']!.value = 1.0;
       }
 
-      if (this.finisherVariant === 2 && blastBt < 0.2) {
+      if ((this.finisherVariant === 2 || profile.enableHeatLance) && blastBt < 0.24) {
         this.heatBeamMesh.visible = true;
-        this.heatBeamMat.opacity = 1 - blastBt / 0.2;
+        this.heatBeamMat.uniforms['uOpacity']!.value = 1 - blastBt / 0.24;
         this.leftMuzzleStar.visible = playerWins;
         this.rightMuzzleStar.visible = enemyWins;
       }
 
-      if (this.finisherVariant === 1) {
+      if (this.finisherVariant === 1 || profile.enableIncomingSalvo) {
         for (const [sIdx, delay] of [0.12, 0.25].entries()) {
           if (blastBt >= delay - 0.1 && blastBt < delay) {
             const u = (blastBt - (delay - 0.1)) / 0.1;
@@ -1500,12 +2380,20 @@ export class ArbiterStage3D {
             sh.rotation.z = loseDir * -0.2;
           }
         }
-        this.poseExplosionSite(0, loseX - 0.12, blastBt, clockSec, 0, 12);
+        this.poseExplosionSite(0, loseX - 0.12, blastBt, clockSec, 0, 12, profile.shockwaveColorRGB);
         if (blastBt >= 0.14) {
-          this.poseExplosionSite(1, loseX + 0.18, blastBt - 0.14, clockSec, 12, 20);
+          this.poseExplosionSite(
+            1,
+            loseX + 0.18,
+            blastBt - 0.14,
+            clockSec,
+            12,
+            20,
+            profile.shockwaveColorRGB
+          );
         }
       } else {
-        this.poseExplosionSite(0, loseX, blastBt, clockSec, 0, 20);
+        this.poseExplosionSite(0, loseX, blastBt, clockSec, 0, 20, profile.shockwaveColorRGB);
       }
 
       this.blastLoserWedgeAndShrapnel(loseWedge, loseFaction, loseX, blastBt, loseDir, 0, 32);
@@ -1519,6 +2407,7 @@ export class ArbiterStage3D {
         const heroLift = THREE.MathUtils.smoothstep(blastBt, 0.18, 0.55) * 0.12;
         winWedge.visible = true;
         winWedge.position.set(winX - loseDir * recoil, BASTION_SURFACE_Y + heroLift, BASTION_Z);
+        // Strict Fog-of-War: When ENEMY wins or captures Player Flag, surviving enemy wedge stays at Math.PI - 0.26 (armored rear)
         const baseYaw = playerWins ? 0.26 : Math.PI - 0.26;
         winWedge.rotation.set(0, baseYaw, -loseDir * recoil * 0.8);
       }
@@ -1528,6 +2417,8 @@ export class ArbiterStage3D {
       this.winnerSpotLight.target.position.set(winX, 0.2, BASTION_Z);
       this.winnerSpotLight.intensity = 8.5 * flareIn;
 
+      const sRgb = profile.shaftColorRGB;
+      (this.winnerShaftMat.uniforms['uColor']!.value as THREE.Color).setRGB(sRgb[0], sRgb[1], sRgb[2]);
       this.winnerShaftMesh.visible = flareIn > 0.02;
       this.winnerShaftMesh.position.set(winX, 0.02, BASTION_Z);
       this.winnerShaftMesh.rotation.z = winX < 0 ? 0.15 : -0.15;
@@ -1537,8 +2428,84 @@ export class ArbiterStage3D {
         verdict.resolution.includes('FLAG') ? 'CROWN' : 'GOLD_WIN',
         playerWins ? 1 : 0,
         clockSec,
-        verdict
+        verdict,
+        profile
       );
+    }
+  }
+
+  private applyFlagTraversePose(
+    t: number,
+    clockSec: number,
+    verdict: ArbiterVerdict,
+    profile: ChoreographyVisualProfile
+  ): void {
+    const winnerIsPlayer = verdict.attackerFaction === 'PLAYER';
+    const wedge = winnerIsPlayer ? this.playerStageWedge : this.enemyStageWedge;
+
+    this.traverseBridgeGroup.visible = true;
+    this.traverseBridgeMat.uniforms['uOpacity']!.value = THREE.MathUtils.smoothstep(t, 0.12, 0.45) * 0.92;
+    this.traverseBridgeMat.uniforms['uTime']!.value = clockSec;
+    this.traverseBridgeMat.uniforms['uDirection']!.value = winnerIsPlayer ? 1.0 : -1.0;
+    (this.traverseBridgeMat.uniforms['uColor']!.value as THREE.Color).setRGB(
+      profile.shaftColorRGB[0],
+      profile.shaftColorRGB[1],
+      profile.shaftColorRGB[2]
+    );
+
+    const marchU = THREE.MathUtils.clamp((t - 0.2) / Math.max(0.4, this.tVerdict - 0.2), 0, 1);
+    const pose = computeFlagTraverseMarchPose(
+      marchU,
+      winnerIsPlayer,
+      BASTION_X,
+      BASTION_SURFACE_Y,
+      BASTION_Z
+    );
+
+    if (wedge) {
+      wedge.visible = true;
+      wedge.position.set(pose.x, pose.y, pose.z);
+      wedge.rotation.set(pose.pitch, pose.yaw, pose.roll);
+    }
+
+    this.leftBastionRingMat.uniforms['uOpacity']!.value = winnerIsPlayer ? 0.95 : 0.25;
+    this.rightBastionRingMat.uniforms['uOpacity']!.value = winnerIsPlayer ? 0.25 : 0.95;
+
+    if (t < this.tAct1End) {
+      this.renderBunkerScope('LOCK_IN', winnerIsPlayer ? 0.8 : 0.2, clockSec, verdict, profile);
+    } else if (t < this.tPushEnd) {
+      this.updateFrontlineGauge(winnerIsPlayer ? 0.85 : 0.15, clockSec);
+      this.renderBunkerScope('SUPPRESSION', winnerIsPlayer ? 0.9 : 0.1, clockSec, verdict, profile);
+    } else if (t < this.tVerdict) {
+      const vacU = (t - this.tPushEnd) / Math.max(0.15, this.tVerdict - this.tPushEnd);
+      this.updateFrontlineGauge(winnerIsPlayer ? 0.96 : 0.04, clockSec);
+      this.renderBunkerScope(
+        'HEARTBEAT_VACUUM',
+        winnerIsPlayer ? 0.96 : 0.04,
+        clockSec,
+        verdict,
+        profile,
+        vacU
+      );
+    } else {
+      const bt = t - this.tVerdict;
+      const flareIn = THREE.MathUtils.smoothstep(bt, 0.05, 0.45);
+      this.winnerSpotLight.position.set(0, 4.4, 0.95);
+      this.winnerSpotLight.target.position.set(0, 0.2, BASTION_Z);
+      this.winnerSpotLight.intensity = 9.0 * flareIn;
+
+      const sRgb = profile.shaftColorRGB;
+      (this.winnerShaftMat.uniforms['uColor']!.value as THREE.Color).setRGB(sRgb[0], sRgb[1], sRgb[2]);
+      this.winnerShaftMesh.visible = flareIn > 0.02;
+      this.winnerShaftMesh.position.set(0, 0.02, BASTION_Z);
+      this.winnerShaftMesh.rotation.z = 0;
+      this.winnerShaftMat.uniforms['uOpacity']!.value = 0.6 * flareIn;
+
+      if (bt <= 0.72) {
+        this.poseBurstSparks(new THREE.Vector3(-0.7, 0.2, BASTION_Z), bt, 16, 0);
+        this.poseBurstSparks(new THREE.Vector3(0.7, 0.2, BASTION_Z), bt, 16, 16);
+      }
+      this.renderBunkerScope('CROWN', winnerIsPlayer ? 1 : 0, clockSec, verdict, profile);
     }
   }
 
@@ -1562,13 +2529,19 @@ export class ArbiterStage3D {
     bt: number,
     clockSec: number,
     plumeStart: number,
-    plumeEnd: number
+    plumeEnd: number,
+    shockwaveRgb: readonly [number, number, number] = [2.4, 1.45, 0.45]
   ): void {
     const sw = this.shockwaves[swIndex];
     if (sw && bt >= 0 && bt <= 0.62) {
       sw.mesh.visible = true;
       sw.mesh.position.set(centerX, BASTION_SURFACE_Y + 0.03, BASTION_Z);
       sw.mat.uniforms['uProgress']!.value = bt / 0.62;
+      (sw.mat.uniforms['uColor']!.value as THREE.Color).setRGB(
+        shockwaveRgb[0],
+        shockwaveRgb[1],
+        shockwaveRgb[2]
+      );
     }
 
     for (let i = plumeStart; i < plumeEnd; i++) {
@@ -1676,7 +2649,7 @@ export class ArbiterStage3D {
 
     for (const tb of this.vacuumTubes) {
       tb.filament.scale.y = 0.14;
-      tb.mat.color.setRGB(0.85, 0.48, 0.14);
+      tb.mat.emissive.setRGB(0.85, 0.48, 0.14);
     }
   }
 
@@ -1687,7 +2660,6 @@ export class ArbiterStage3D {
   ): void {
     for (let i = 0; i < this.vacuumTubes.length; i++) {
       const tb = this.vacuumTubes[i]!;
-      // Sample 8 perceptual frequency bands (`bins 2 .. 96` of 256-bin spectrum)
       const binStart = Math.floor(2 + Math.pow(i / 8, 1.55) * 76);
       const binEnd = Math.min(120, binStart + 4 + i * 2);
       let sum = 0;
@@ -1707,9 +2679,9 @@ export class ArbiterStage3D {
       tb.filament.scale.y = 0.12 + level * 0.88;
 
       if (mode === 'HEARTBEAT_VACUUM') {
-        tb.mat.color.setRGB(2.4 * level + 0.4, 0.32 * level, 0.36 * level);
+        tb.mat.emissive.setRGB(2.4 * level + 0.4, 0.32 * level, 0.36 * level);
       } else {
-        tb.mat.color.setRGB(1.1 + 1.85 * level, 0.55 + 1.15 * level, 0.18 + 0.35 * level);
+        tb.mat.emissive.setRGB(1.1 + 1.85 * level, 0.55 + 1.15 * level, 0.18 + 0.35 * level);
       }
     }
   }
@@ -1719,6 +2691,7 @@ export class ArbiterStage3D {
     blueShare: number,
     clockSec: number,
     verdict: ArbiterVerdict,
+    profile: ChoreographyVisualProfile,
     vacProgress = 0
   ): void {
     const ctx = this.crtCtx;
@@ -1729,12 +2702,21 @@ export class ArbiterStage3D {
     const hasFreqAudio = this.sound.readBattleFrequencyBytes(this.frequencyBytes);
     this.updateVacuumTubeEqualizer(hasFreqAudio, mode, clockSec);
 
+    if (
+      !this.pausedForDebug &&
+      this.lastCrtMode === mode &&
+      Math.abs(clockSec - this.lastCrtDrawSec) < 0.038
+    ) {
+      return;
+    }
+    this.lastCrtMode = mode;
+    this.lastCrtDrawSec = clockSec;
+
     ctx.fillStyle = mode === 'HEARTBEAT_VACUUM' ? '#070304' : '#040908';
     ctx.fillRect(0, 0, w, h);
 
     const midY = h * 0.56;
 
-    // 1. Background 16-Band Vacuum-Tube Equalizer Spectrum Bars (`getByteFrequencyData`)
     const eqBands = 16;
     const barW = (w - 56) / eqBands;
     for (let b = 0; b < eqBands; b++) {
@@ -1749,7 +2731,9 @@ export class ArbiterStage3D {
       ctx.fillStyle =
         mode === 'HEARTBEAT_VACUUM'
           ? 'rgba(255, 68, 86, 0.18)'
-          : 'rgba(235, 178, 72, 0.19)';
+          : profile.kind === 'RECON_STEALTH'
+            ? 'rgba(60, 255, 180, 0.19)'
+            : 'rgba(235, 178, 72, 0.19)';
       ctx.fillRect(28 + b * barW + 2, h - 10 - bh, barW - 4, bh);
     }
 
@@ -1775,18 +2759,17 @@ export class ArbiterStage3D {
       ctx.fillStyle = '#ffd982';
       ctx.font = 'bold 20px monospace';
       ctx.fillText(
-        this.isDefenderReversal(verdict) ? 'COUNTER-BATTERY LOCK' : 'CRITICAL LOCK // 88MM',
-        42,
+        this.isDefenderReversal(verdict) ? 'COUNTER-BATTERY LOCK' : profile.crtAct2BLabel,
+        36,
         32
       );
       this.crtTexture.needsUpdate = true;
       return;
     }
 
-    // 2. Foreground 60 FPS Oscilloscope Waveform (`getByteTimeDomainData`)
     const grad = ctx.createLinearGradient(16, 0, w - 16, 0);
     if (mode === 'SUPPRESSION' || mode === 'LOCK_IN') {
-      grad.addColorStop(0.0, '#49c6ff');
+      grad.addColorStop(0.0, profile.kind === 'RECON_STEALTH' ? '#48ffb8' : '#49c6ff');
       grad.addColorStop(Math.max(0.05, Math.min(0.95, blueShare)), '#ffe884');
       grad.addColorStop(1.0, '#ff4d5e');
     } else {
@@ -1821,12 +2804,18 @@ export class ArbiterStage3D {
     ctx.fillStyle = mode === 'FLATLINE' ? '#ff6474' : '#e8c478';
     ctx.font = 'bold 20px monospace';
     const label =
-      mode === 'FLATLINE'
-        ? 'MUTUAL NEUTRALIZATION'
-        : mode === 'CROWN'
-          ? 'ENEMY FLAG UNMASKED'
-          : `DEFCON ${verdict.stakes?.defcon ?? 3} // ${Math.round(blueShare * 100)}%`;
-    ctx.fillText(label, 42, 30);
+      mode === 'LOCK_IN'
+        ? profile.crtAct1Label
+        : mode === 'SUPPRESSION'
+          ? `${profile.crtAct2ALabel} // ${Math.round(blueShare * 100)}%`
+          : mode === 'FLATLINE'
+            ? 'MUTUAL NEUTRALIZATION'
+            : mode === 'CROWN'
+              ? profile.crtAct3WinLabel
+              : blueShare >= 0.5
+                ? profile.crtAct3WinLabel
+                : profile.crtAct3LossLabel;
+    ctx.fillText(label, 36, 30);
 
     this.crtTexture.needsUpdate = true;
   }

@@ -17,12 +17,15 @@
       rel="stylesheet"
     />
     <link rel="manifest" href="./manifest.json" />
-    <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+    <link rel="preload" as="image" href="./portraits/hero_crest.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="./icon-192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="./icon-512.png" />
+    <link rel="apple-touch-icon" sizes="192x192" href="./icon-192.png" />
     <title>War Generals</title>
   </head>
   <body>
     <div id="studio-shell">
-      <div id="app-chassis" aria-label="War Generals 9:16 Tactical Viewport">
+      <div id="app-chassis" aria-label="War Generals Tactical Viewport">
         <div id="canvas-host"></div>
         <div id="hud-root"></div>
       </div>
